@@ -55,7 +55,6 @@ chrono-tz = "0.10"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 # Database
-rusqlite = { version = "0.31", features = ["bundled", "serde_json"] }
 surrealdb = { version = "2", features = ["kv-surrealkv", "kv-mem"], default-features = false }
 
 # CLI
