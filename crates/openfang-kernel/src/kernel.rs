@@ -504,13 +504,13 @@ fn gethostname() -> Option<String> {
 
 impl OpenFangKernel {
     /// Boot the kernel with configuration from the given path.
-    pub fn boot(config_path: Option<&Path>) -> KernelResult<Self> {
+    pub async fn boot(config_path: Option<&Path>) -> KernelResult<Self> {
         let config = load_config(config_path);
-        Self::boot_with_config(config)
+        Self::boot_with_config(config).await
     }
 
     /// Boot the kernel with an explicit configuration.
-    pub fn boot_with_config(mut config: KernelConfig) -> KernelResult<Self> {
+    pub async fn boot_with_config(mut config: KernelConfig) -> KernelResult<Self> {
         use openfang_types::config::KernelMode;
 
         // Env var overrides — useful for Docker where config.toml is baked in.
@@ -562,7 +562,8 @@ impl OpenFangKernel {
             .clone()
             .unwrap_or_else(|| config.data_dir.join("openfang.db"));
         let memory = Arc::new(
-            MemorySubstrate::open(&db_path, config.memory.decay_rate)
+            MemorySubstrate::open(&db_path)
+                .await
                 .map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))?,
         );
 
@@ -715,9 +716,9 @@ impl OpenFangKernel {
             Arc::new(StubDriver) as Arc<dyn LlmDriver>
         };
 
-        // Initialize metering engine (shares the same SQLite connection as the memory substrate)
+        // Initialize metering engine (shares the SurrealDB handle)
         let metering = Arc::new(MeteringEngine::new(Arc::new(
-            openfang_memory::usage::UsageStore::new(memory.usage_conn()),
+            openfang_memory::usage::UsageStore::new(memory.db_handle()),
         )));
 
         let supervisor = Supervisor::new();
@@ -923,59 +924,8 @@ impl OpenFangKernel {
         let tts_engine = openfang_runtime::tts::TtsEngine::new(config.tts.clone());
         let mut pairing = crate::pairing::PairingManager::new(config.pairing.clone());
 
-        // Load paired devices from database and set up persistence callback
-        if config.pairing.enabled {
-            match memory.load_paired_devices() {
-                Ok(rows) => {
-                    let devices: Vec<crate::pairing::PairedDevice> = rows
-                        .into_iter()
-                        .filter_map(|row| {
-                            Some(crate::pairing::PairedDevice {
-                                device_id: row["device_id"].as_str()?.to_string(),
-                                display_name: row["display_name"].as_str()?.to_string(),
-                                platform: row["platform"].as_str()?.to_string(),
-                                paired_at: chrono::DateTime::parse_from_rfc3339(
-                                    row["paired_at"].as_str()?,
-                                )
-                                .ok()?
-                                .with_timezone(&chrono::Utc),
-                                last_seen: chrono::DateTime::parse_from_rfc3339(
-                                    row["last_seen"].as_str()?,
-                                )
-                                .ok()?
-                                .with_timezone(&chrono::Utc),
-                                push_token: row["push_token"].as_str().map(String::from),
-                            })
-                        })
-                        .collect();
-                    pairing.load_devices(devices);
-                }
-                Err(e) => {
-                    warn!("Failed to load paired devices from database: {e}");
-                }
-            }
-
-            let persist_memory = Arc::clone(&memory);
-            pairing.set_persist(Box::new(move |device, op| match op {
-                crate::pairing::PersistOp::Save => {
-                    if let Err(e) = persist_memory.save_paired_device(
-                        &device.device_id,
-                        &device.display_name,
-                        &device.platform,
-                        &device.paired_at.to_rfc3339(),
-                        &device.last_seen.to_rfc3339(),
-                        device.push_token.as_deref(),
-                    ) {
-                        tracing::warn!("Failed to persist paired device: {e}");
-                    }
-                }
-                crate::pairing::PersistOp::Remove => {
-                    if let Err(e) = persist_memory.remove_paired_device(&device.device_id) {
-                        tracing::warn!("Failed to remove paired device from DB: {e}");
-                    }
-                }
-            }));
-        }
+        // TODO: Port pairing device persistence to SurrealDB
+        // Pairing persistence was backed by rusqlite; skipped until audit.rs is ported.
 
         // Initialize cron scheduler
         let cron_scheduler =
@@ -1010,7 +960,8 @@ impl OpenFangKernel {
             workflows: WorkflowEngine::new(),
             triggers: TriggerEngine::new(),
             background,
-            audit_log: Arc::new(AuditLog::with_db(memory.usage_conn())),
+            // TODO: Port AuditLog to SurrealDB (currently in-memory only)
+            audit_log: Arc::new(AuditLog::new()),
             metering,
             default_driver: driver,
             wasm_sandbox,
@@ -1052,7 +1003,7 @@ impl OpenFangKernel {
         };
 
         // Restore persisted agents from SQLite
-        match kernel.memory.load_all_agents() {
+        match kernel.memory.load_all_agents().await {
             Ok(agents) => {
                 let count = agents.len();
                 for entry in agents {
@@ -1097,7 +1048,7 @@ impl OpenFangKernel {
                                             );
                                             entry.manifest = disk_manifest;
                                             // Persist the update back to DB
-                                            if let Err(e) = kernel.memory.save_agent(&entry) {
+                                            if let Err(e) = kernel.memory.save_agent(&entry).await {
                                                 warn!(
                                                     agent = %name,
                                                     "Failed to persist TOML update: {e}"
@@ -1246,12 +1197,15 @@ impl OpenFangKernel {
 
     /// Spawn a new agent from a manifest, optionally linking to a parent agent.
     pub fn spawn_agent(&self, manifest: AgentManifest) -> KernelResult<AgentId> {
-        self.spawn_agent_with_parent(manifest, None, None)
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(self.spawn_agent_with_parent(manifest, None, None))
+        })
     }
 
     /// Spawn a new agent with an optional parent for lineage tracking.
     /// If fixed_id is provided, use it instead of generating a new UUID.
-    pub fn spawn_agent_with_parent(
+    pub async fn spawn_agent_with_parent(
         &self,
         manifest: AgentManifest,
         parent: Option<AgentId>,
@@ -1267,6 +1221,7 @@ impl OpenFangKernel {
         let session = self
             .memory
             .create_session(agent_id)
+            .await
             .map_err(KernelError::OpenFang)?;
         let session_id = session.id;
 
@@ -1393,6 +1348,7 @@ impl OpenFangKernel {
         // Persist agent to SQLite so it survives restarts
         self.memory
             .save_agent(&entry)
+            .await
             .map_err(KernelError::OpenFang)?;
 
         info!(agent = %name, id = %agent_id, "Agent spawned");
@@ -1622,7 +1578,7 @@ impl OpenFangKernel {
     ///
     /// WASM and Python agents don't support true streaming — they execute
     /// synchronously and emit a single `TextDelta` + `ContentComplete` pair.
-    pub fn send_message_streaming(
+    pub async fn send_message_streaming(
         self: &Arc<Self>,
         agent_id: AgentId,
         message: &str,
@@ -1701,6 +1657,7 @@ impl OpenFangKernel {
         let mut session = self
             .memory
             .get_session(entry.session_id)
+            .await
             .map_err(KernelError::OpenFang)?
             .unwrap_or_else(|| openfang_memory::session::Session {
                 id: entry.session_id,
@@ -1807,9 +1764,10 @@ impl OpenFangKernel {
             let user_name = self
                 .memory
                 .structured_get(shared_id, "user_name")
+                .await
                 .ok()
                 .flatten()
-                .and_then(|v| v.as_str().map(String::from));
+                .and_then(|v: serde_json::Value| v.as_str().map(String::from));
 
             let peer_agents: Vec<(String, String, String)> = self
                 .registry
@@ -1831,7 +1789,10 @@ impl OpenFangKernel {
                 granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
                 recalled_memories: vec![],
                 skill_summary: Self::build_skill_summary_from(&skill_snapshot, &manifest.skills),
-                skill_prompt_context: Self::collect_prompt_context_from(&skill_snapshot, &manifest.skills),
+                skill_prompt_context: Self::collect_prompt_context_from(
+                    &skill_snapshot,
+                    &manifest.skills,
+                ),
                 mcp_summary: if mcp_tool_count > 0 {
                     self.build_mcp_summary(&manifest.mcp_servers)
                 } else {
@@ -1853,6 +1814,7 @@ impl OpenFangKernel {
                 canonical_context: self
                     .memory
                     .canonical_context(agent_id, None)
+                    .await
                     .ok()
                     .and_then(|(s, _)| s),
                 user_name,
@@ -1930,7 +1892,7 @@ impl OpenFangKernel {
                     Ok(msg) => {
                         info!(agent_id = %agent_id, "{msg}");
                         // Reload the session after compaction
-                        if let Ok(Some(reloaded)) = memory.get_session(session.id) {
+                        if let Ok(Some(reloaded)) = memory.get_session(session.id).await {
                             session = reloaded;
                         }
                     }
@@ -2014,7 +1976,8 @@ impl OpenFangKernel {
                     // Append new messages to canonical session for cross-channel memory
                     if session.messages.len() > messages_before {
                         let new_messages = session.messages[messages_before..].to_vec();
-                        if let Err(e) = memory.append_canonical(agent_id, &new_messages, None) {
+                        if let Err(e) = memory.append_canonical(agent_id, &new_messages, None).await
+                        {
                             warn!(agent_id = %agent_id, "Failed to update canonical session (streaming): {e}");
                         }
                     }
@@ -2034,22 +1997,29 @@ impl OpenFangKernel {
                         .scheduler
                         .record_usage(agent_id, &result.total_usage);
 
-                    // Persist usage to database (same as non-streaming path)
+                    // Persist usage to database
                     let model = &manifest.model.model;
                     let cost = MeteringEngine::estimate_cost_with_catalog(
-                        &kernel_clone.model_catalog.read().unwrap_or_else(|e| e.into_inner()),
+                        &kernel_clone
+                            .model_catalog
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner()),
                         model,
                         result.total_usage.input_tokens,
                         result.total_usage.output_tokens,
                     );
-                    let _ = kernel_clone.metering.record(&openfang_memory::usage::UsageRecord {
-                        agent_id,
-                        model: model.clone(),
-                        input_tokens: result.total_usage.input_tokens,
-                        output_tokens: result.total_usage.output_tokens,
-                        cost_usd: cost,
-                        tool_calls: result.iterations.saturating_sub(1),
-                    });
+                    let _ = kernel_clone
+                        .metering
+                        .record(
+                            agent_id,
+                            &manifest.model.provider,
+                            model,
+                            result.total_usage.input_tokens,
+                            result.total_usage.output_tokens,
+                            cost,
+                            "llm_call",
+                        )
+                        .await;
 
                     let _ = kernel_clone
                         .registry
@@ -2251,11 +2221,13 @@ impl OpenFangKernel {
         // Check metering quota before starting
         self.metering
             .check_quota(agent_id, &entry.manifest.resources)
+            .await
             .map_err(KernelError::OpenFang)?;
 
         let mut session = self
             .memory
             .get_session(entry.session_id)
+            .await
             .map_err(KernelError::OpenFang)?
             .unwrap_or_else(|| openfang_memory::session::Session {
                 id: entry.session_id,
@@ -2290,7 +2262,7 @@ impl OpenFangKernel {
                 match self.compact_agent_session(agent_id).await {
                     Ok(msg) => {
                         info!(agent_id = %agent_id, "{msg}");
-                        if let Ok(Some(reloaded)) = self.memory.get_session(session.id) {
+                        if let Ok(Some(reloaded)) = self.memory.get_session(session.id).await {
                             session = reloaded;
                         }
                     }
@@ -2360,6 +2332,7 @@ impl OpenFangKernel {
             let user_name = self
                 .memory
                 .structured_get(shared_id, "user_name")
+                .await
                 .ok()
                 .flatten()
                 .and_then(|v| v.as_str().map(String::from));
@@ -2384,7 +2357,10 @@ impl OpenFangKernel {
                 granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
                 recalled_memories: vec![], // Recalled in agent_loop, not here
                 skill_summary: Self::build_skill_summary_from(&skill_snapshot, &manifest.skills),
-                skill_prompt_context: Self::collect_prompt_context_from(&skill_snapshot, &manifest.skills),
+                skill_prompt_context: Self::collect_prompt_context_from(
+                    &skill_snapshot,
+                    &manifest.skills,
+                ),
                 mcp_summary: if mcp_tool_count > 0 {
                     self.build_mcp_summary(&manifest.mcp_servers)
                 } else {
@@ -2406,6 +2382,7 @@ impl OpenFangKernel {
                 canonical_context: self
                     .memory
                     .canonical_context(agent_id, None)
+                    .await
                     .ok()
                     .and_then(|(s, _)| s),
                 user_name,
@@ -2566,7 +2543,11 @@ impl OpenFangKernel {
         // Append new messages to canonical session for cross-channel memory
         if session.messages.len() > messages_before {
             let new_messages = session.messages[messages_before..].to_vec();
-            if let Err(e) = self.memory.append_canonical(agent_id, &new_messages, None) {
+            if let Err(e) = self
+                .memory
+                .append_canonical(agent_id, &new_messages, None)
+                .await
+            {
                 warn!("Failed to update canonical session: {e}");
             }
         }
@@ -2591,14 +2572,18 @@ impl OpenFangKernel {
             result.total_usage.input_tokens,
             result.total_usage.output_tokens,
         );
-        let _ = self.metering.record(&openfang_memory::usage::UsageRecord {
-            agent_id,
-            model: model.clone(),
-            input_tokens: result.total_usage.input_tokens,
-            output_tokens: result.total_usage.output_tokens,
-            cost_usd: cost,
-            tool_calls: result.iterations.saturating_sub(1),
-        });
+        let _ = self
+            .metering
+            .record(
+                agent_id,
+                &manifest.model.provider,
+                model,
+                result.total_usage.input_tokens,
+                result.total_usage.output_tokens,
+                cost,
+                "llm_call",
+            )
+            .await;
 
         // Populate cost on the result based on usage_footer mode
         let mut result = result;
@@ -2634,13 +2619,13 @@ impl OpenFangKernel {
 
     /// Reset an agent's session — auto-saves a summary to memory, then clears messages
     /// and creates a fresh session ID.
-    pub fn reset_session(&self, agent_id: AgentId) -> KernelResult<()> {
+    pub async fn reset_session(&self, agent_id: AgentId) -> KernelResult<()> {
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
 
         // Auto-save session context to workspace memory before clearing
-        if let Ok(Some(old_session)) = self.memory.get_session(entry.session_id) {
+        if let Ok(Some(old_session)) = self.memory.get_session(entry.session_id).await {
             if old_session.messages.len() >= 2 {
                 self.save_session_summary(agent_id, &entry, &old_session);
             }
@@ -2653,6 +2638,7 @@ impl OpenFangKernel {
         let new_session = self
             .memory
             .create_session(agent_id)
+            .await
             .map_err(KernelError::OpenFang)?;
 
         // Update registry with new session ID
@@ -2670,7 +2656,7 @@ impl OpenFangKernel {
     /// Clear ALL conversation history for an agent (sessions + canonical).
     ///
     /// Creates a fresh empty session afterward so the agent is still usable.
-    pub fn clear_agent_history(&self, agent_id: AgentId) -> KernelResult<()> {
+    pub async fn clear_agent_history(&self, agent_id: AgentId) -> KernelResult<()> {
         let _entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
@@ -2685,6 +2671,7 @@ impl OpenFangKernel {
         let new_session = self
             .memory
             .create_session(agent_id)
+            .await
             .map_err(KernelError::OpenFang)?;
 
         // Update registry with new session ID
@@ -2697,7 +2684,10 @@ impl OpenFangKernel {
     }
 
     /// List all sessions for a specific agent.
-    pub fn list_agent_sessions(&self, agent_id: AgentId) -> KernelResult<Vec<serde_json::Value>> {
+    pub async fn list_agent_sessions(
+        &self,
+        agent_id: AgentId,
+    ) -> KernelResult<Vec<serde_json::Value>> {
         // Verify agent exists
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
@@ -2706,6 +2696,7 @@ impl OpenFangKernel {
         let mut sessions = self
             .memory
             .list_agent_sessions(agent_id)
+            .await
             .map_err(KernelError::OpenFang)?;
 
         // Mark the active session
@@ -2713,7 +2704,7 @@ impl OpenFangKernel {
             if let Some(obj) = s.as_object_mut() {
                 let is_active = obj
                     .get("session_id")
-                    .and_then(|v| v.as_str())
+                    .and_then(|v: &serde_json::Value| v.as_str())
                     .map(|sid| sid == entry.session_id.0.to_string())
                     .unwrap_or(false);
                 obj.insert("active".to_string(), serde_json::json!(is_active));
@@ -2724,7 +2715,7 @@ impl OpenFangKernel {
     }
 
     /// Create a new named session for an agent.
-    pub fn create_agent_session(
+    pub async fn create_agent_session(
         &self,
         agent_id: AgentId,
         label: Option<&str>,
@@ -2737,6 +2728,7 @@ impl OpenFangKernel {
         let session = self
             .memory
             .create_session_with_label(agent_id, label)
+            .await
             .map_err(KernelError::OpenFang)?;
 
         // Switch to the new session
@@ -2753,7 +2745,7 @@ impl OpenFangKernel {
     }
 
     /// Switch an agent to an existing session by session ID.
-    pub fn switch_agent_session(
+    pub async fn switch_agent_session(
         &self,
         agent_id: AgentId,
         session_id: SessionId,
@@ -2767,6 +2759,7 @@ impl OpenFangKernel {
         let session = self
             .memory
             .get_session(session_id)
+            .await
             .map_err(KernelError::OpenFang)?
             .ok_or_else(|| {
                 KernelError::OpenFang(OpenFangError::Internal("Session not found".to_string()))
@@ -3041,7 +3034,7 @@ impl OpenFangKernel {
     }
 
     /// Get session token usage and estimated cost for an agent.
-    pub fn session_usage_cost(&self, agent_id: AgentId) -> KernelResult<(u64, u64, f64)> {
+    pub async fn session_usage_cost(&self, agent_id: AgentId) -> KernelResult<(u64, u64, f64)> {
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
@@ -3049,6 +3042,7 @@ impl OpenFangKernel {
         let session = self
             .memory
             .get_session(entry.session_id)
+            .await
             .map_err(KernelError::OpenFang)?;
 
         let (input_tokens, output_tokens) = session
@@ -3105,6 +3099,7 @@ impl OpenFangKernel {
         let session = self
             .memory
             .get_session(entry.session_id)
+            .await
             .map_err(KernelError::OpenFang)?
             .unwrap_or_else(|| openfang_memory::session::Session {
                 id: entry.session_id,
@@ -3134,6 +3129,7 @@ impl OpenFangKernel {
         // Store the LLM summary in the canonical session
         self.memory
             .store_llm_summary(agent_id, &result.summary, result.kept_messages.clone())
+            .await
             .map_err(KernelError::OpenFang)?;
 
         // Post-compaction audit: validate and repair the kept messages
@@ -3145,6 +3141,7 @@ impl OpenFangKernel {
         updated_session.messages = repaired_messages;
         self.memory
             .save_session(&updated_session)
+            .await
             .map_err(KernelError::OpenFang)?;
 
         // Build result message with audit summary
@@ -3174,7 +3171,7 @@ impl OpenFangKernel {
     }
 
     /// Generate a context window usage report for an agent.
-    pub fn context_report(
+    pub async fn context_report(
         &self,
         agent_id: AgentId,
     ) -> KernelResult<openfang_runtime::compactor::ContextReport> {
@@ -3187,6 +3184,7 @@ impl OpenFangKernel {
         let session = self
             .memory
             .get_session(entry.session_id)
+            .await
             .map_err(KernelError::OpenFang)?
             .unwrap_or_else(|| openfang_memory::session::Session {
                 id: entry.session_id,
@@ -3408,7 +3406,13 @@ impl OpenFangKernel {
         // Spawn the agent with a fixed ID based on hand_id for stable identity across restarts.
         // This ensures triggers and cron jobs continue to work after daemon restart.
         let fixed_agent_id = AgentId::from_string(hand_id);
-        let agent_id = self.spawn_agent_with_parent(manifest, None, Some(fixed_agent_id))?;
+        let agent_id = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.spawn_agent_with_parent(
+                manifest,
+                None,
+                Some(fixed_agent_id),
+            ))
+        })?;
 
         // Restore triggers from the old agent under the new agent ID (#519).
         if !saved_triggers.is_empty() {
@@ -3967,7 +3971,7 @@ impl OpenFangKernel {
                     if kernel.supervisor.is_shutting_down() {
                         break;
                     }
-                    match kernel.metering.cleanup(90) {
+                    match kernel.metering.cleanup(90).await {
                         Ok(removed) if removed > 0 => {
                             info!("Metering cleanup: removed {removed} old usage records");
                         }
@@ -5744,6 +5748,7 @@ async fn cron_deliver_response(
             match kernel
                 .memory
                 .structured_get(agent_id, "delivery.last_channel")
+                .await
             {
                 Ok(Some(val)) => {
                     let channel = val["channel"].as_str().unwrap_or("");
@@ -5807,6 +5812,7 @@ impl KernelHandle for OpenFangKernel {
         let parent = parent_id.and_then(|pid| pid.parse::<AgentId>().ok());
         let id = self
             .spawn_agent_with_parent(manifest, parent, None)
+            .await
             .map_err(|e| format!("Spawn failed: {e}"))?;
         Ok((id.to_string(), name))
     }
@@ -5854,16 +5860,19 @@ impl KernelHandle for OpenFangKernel {
 
     fn memory_store(&self, key: &str, value: serde_json::Value) -> Result<(), String> {
         let agent_id = shared_memory_agent_id();
-        self.memory
-            .structured_set(agent_id, key, value)
-            .map_err(|e| format!("Memory store failed: {e}"))
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(self.memory.structured_set(agent_id, key, value))
+        })
+        .map_err(|e| format!("Memory store failed: {e}"))
     }
 
     fn memory_recall(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
         let agent_id = shared_memory_agent_id();
-        self.memory
-            .structured_get(agent_id, key)
-            .map_err(|e| format!("Memory recall failed: {e}"))
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.memory.structured_get(agent_id, key))
+        })
+        .map_err(|e| format!("Memory recall failed: {e}"))
     }
 
     fn find_agents(&self, query: &str) -> Vec<kernel_handle::AgentInfo> {

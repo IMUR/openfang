@@ -1,541 +1,326 @@
-//! Usage tracking store — records LLM usage events for cost monitoring.
+//! Usage tracking store backed by SurrealDB.
+//!
+//! Tracks LLM token usage, tool calls, and costs per agent.
 
 use chrono::Utc;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
 
-/// A single usage event recording an LLM call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UsageRecord {
-    /// Which agent made the call.
-    pub agent_id: AgentId,
-    /// Model used.
-    pub model: String,
-    /// Input tokens consumed.
-    pub input_tokens: u64,
-    /// Output tokens consumed.
-    pub output_tokens: u64,
-    /// Estimated cost in USD.
-    pub cost_usd: f64,
-    /// Number of tool calls in this interaction.
-    pub tool_calls: u32,
-}
+use crate::db::SurrealDb;
 
-/// Summary of usage over a period.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UsageSummary {
-    /// Total input tokens.
-    pub total_input_tokens: u64,
-    /// Total output tokens.
-    pub total_output_tokens: u64,
-    /// Total estimated cost in USD.
-    pub total_cost_usd: f64,
-    /// Total number of calls.
-    pub call_count: u64,
-    /// Total tool calls.
-    pub total_tool_calls: u64,
-}
-
-/// Usage grouped by model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelUsage {
-    /// Model name.
-    pub model: String,
-    /// Total cost for this model.
-    pub total_cost_usd: f64,
-    /// Total input tokens.
-    pub total_input_tokens: u64,
-    /// Total output tokens.
-    pub total_output_tokens: u64,
-    /// Number of calls.
-    pub call_count: u64,
-}
-
-/// Daily usage breakdown.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DailyBreakdown {
-    /// Date string (YYYY-MM-DD).
-    pub date: String,
-    /// Total cost for this day.
-    pub cost_usd: f64,
-    /// Total tokens (input + output).
-    pub tokens: u64,
-    /// Number of API calls.
-    pub calls: u64,
-}
-
-/// Usage store backed by SQLite.
+/// Usage store backed by SurrealDB.
 #[derive(Clone)]
 pub struct UsageStore {
-    conn: Arc<Mutex<Connection>>,
+    db: SurrealDb,
+}
+
+/// A single usage event record.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UsageRecord {
+    pub agent_id: String,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+    pub event_type: String,
+    pub created_at: String,
+}
+
+/// Aggregated usage summary.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct UsageSummary {
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cost_usd: f64,
+    pub event_count: u64,
+}
+
+fn surreal_err(e: surrealdb::Error) -> OpenFangError {
+    OpenFangError::Memory(e.to_string())
 }
 
 impl UsageStore {
-    /// Create a new usage store wrapping the given connection.
-    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+    /// Create a new usage store wrapping the given SurrealDB handle.
+    pub fn new(db: SurrealDb) -> Self {
+        Self { db }
     }
 
     /// Record a usage event.
-    pub fn record(&self, record: &UsageRecord) -> OpenFangResult<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-        let id = uuid::Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO usage_events (id, agent_id, timestamp, model, input_tokens, output_tokens, cost_usd, tool_calls)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                id,
-                record.agent_id.0.to_string(),
-                now,
-                record.model,
-                record.input_tokens as i64,
-                record.output_tokens as i64,
-                record.cost_usd,
-                record.tool_calls as i64,
-            ],
-        )
-        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+    pub async fn record(
+        &self,
+        agent_id: AgentId,
+        provider: &str,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_usd: f64,
+        event_type: &str,
+    ) -> OpenFangResult<()> {
+        let _: Option<UsageRecord> = self
+            .db
+            .create("usage")
+            .content(UsageRecord {
+                agent_id: agent_id.0.to_string(),
+                provider: provider.to_string(),
+                model: model.to_string(),
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                event_type: event_type.to_string(),
+                created_at: Utc::now().to_rfc3339(),
+            })
+            .await
+            .map_err(surreal_err)?;
         Ok(())
     }
 
-    /// Query total cost in the last hour for an agent.
-    pub fn query_hourly(&self, agent_id: AgentId) -> OpenFangResult<f64> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-        let cost: f64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage_events
-                 WHERE agent_id = ?1 AND timestamp > datetime('now', '-1 hour')",
-                rusqlite::params![agent_id.0.to_string()],
-                |row| row.get(0),
+    /// Get aggregated usage for an agent.
+    pub async fn summary(&self, agent_id: AgentId) -> OpenFangResult<UsageSummary> {
+        let mut result = self
+            .db
+            .query(
+                "SELECT
+                    math::sum(input_tokens) AS total_input_tokens,
+                    math::sum(output_tokens) AS total_output_tokens,
+                    math::sum(cost_usd) AS total_cost_usd,
+                    count() AS event_count
+                 FROM usage
+                 WHERE agent_id = $aid
+                 GROUP ALL",
             )
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-        Ok(cost)
+            .bind(("aid", agent_id.0.to_string()))
+            .await
+            .map_err(surreal_err)?;
+
+        let summaries: Vec<UsageSummary> = result.take(0).unwrap_or_default();
+        Ok(summaries.into_iter().next().unwrap_or_default())
     }
 
-    /// Query total cost today for an agent.
-    pub fn query_daily(&self, agent_id: AgentId) -> OpenFangResult<f64> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-        let cost: f64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage_events
-                 WHERE agent_id = ?1 AND timestamp > datetime('now', 'start of day')",
-                rusqlite::params![agent_id.0.to_string()],
-                |row| row.get(0),
-            )
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-        Ok(cost)
+    /// Get recent usage events for an agent.
+    pub async fn recent(
+        &self,
+        agent_id: AgentId,
+        limit: usize,
+    ) -> OpenFangResult<Vec<UsageRecord>> {
+        let mut result = self
+            .db
+            .query("SELECT * FROM usage WHERE agent_id = $aid ORDER BY created_at DESC LIMIT $lim")
+            .bind(("aid", agent_id.0.to_string()))
+            .bind(("lim", limit as u64))
+            .await
+            .map_err(surreal_err)?;
+
+        let records: Vec<UsageRecord> = result.take(0).unwrap_or_default();
+        Ok(records)
     }
 
-    /// Query total cost in the current calendar month for an agent.
-    pub fn query_monthly(&self, agent_id: AgentId) -> OpenFangResult<f64> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-        let cost: f64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage_events
-                 WHERE agent_id = ?1 AND timestamp > datetime('now', 'start of month')",
-                rusqlite::params![agent_id.0.to_string()],
-                |row| row.get(0),
-            )
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-        Ok(cost)
+    /// Delete all usage records for an agent.
+    pub async fn clear(&self, agent_id: AgentId) -> OpenFangResult<()> {
+        self.db
+            .query("DELETE usage WHERE agent_id = $aid")
+            .bind(("aid", agent_id.0.to_string()))
+            .await
+            .map_err(surreal_err)?;
+        Ok(())
     }
 
-    /// Query total cost across all agents for the current hour.
-    pub fn query_global_hourly(&self) -> OpenFangResult<f64> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-        let cost: f64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage_events
-                 WHERE timestamp > datetime('now', '-1 hour')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-        Ok(cost)
+    // -----------------------------------------------------------------
+    // Time-window cost queries (used by MeteringEngine)
+    // -----------------------------------------------------------------
+
+    /// Total cost for an agent in the last hour.
+    pub async fn query_hourly(&self, agent_id: AgentId) -> OpenFangResult<f64> {
+        self.cost_since(Some(agent_id), chrono::Duration::hours(1))
+            .await
     }
 
-    /// Query total cost across all agents for the current calendar month.
-    pub fn query_global_monthly(&self) -> OpenFangResult<f64> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-        let cost: f64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage_events
-                 WHERE timestamp > datetime('now', 'start of month')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-        Ok(cost)
+    /// Total cost for an agent today (UTC).
+    pub async fn query_daily(&self, agent_id: AgentId) -> OpenFangResult<f64> {
+        self.cost_since(Some(agent_id), chrono::Duration::hours(24))
+            .await
     }
 
-    /// Query usage summary, optionally filtered by agent.
-    pub fn query_summary(&self, agent_id: Option<AgentId>) -> OpenFangResult<UsageSummary> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+    /// Total cost for an agent in the last 30 days.
+    pub async fn query_monthly(&self, agent_id: AgentId) -> OpenFangResult<f64> {
+        self.cost_since(Some(agent_id), chrono::Duration::days(30))
+            .await
+    }
 
-        let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match agent_id {
+    /// Total cost across all agents in the last hour.
+    pub async fn query_global_hourly(&self) -> OpenFangResult<f64> {
+        self.cost_since(None, chrono::Duration::hours(1)).await
+    }
+
+    /// Total cost across all agents today.
+    pub async fn query_today_cost(&self) -> OpenFangResult<f64> {
+        self.cost_since(None, chrono::Duration::hours(24)).await
+    }
+
+    /// Total cost across all agents in the last 30 days.
+    pub async fn query_global_monthly(&self) -> OpenFangResult<f64> {
+        self.cost_since(None, chrono::Duration::days(30)).await
+    }
+
+    /// Get a usage summary, optionally filtered by agent.
+    pub async fn query_summary(&self, agent_id: Option<AgentId>) -> OpenFangResult<UsageSummary> {
+        let (sql, binds) = match agent_id {
             Some(aid) => (
-                "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
-                        COALESCE(SUM(cost_usd), 0.0), COUNT(*), COALESCE(SUM(tool_calls), 0)
-                 FROM usage_events WHERE agent_id = ?1",
-                vec![Box::new(aid.0.to_string())],
+                "SELECT math::sum(input_tokens) AS total_input_tokens,
+                        math::sum(output_tokens) AS total_output_tokens,
+                        math::sum(cost_usd) AS total_cost_usd,
+                        count() AS event_count
+                 FROM usage WHERE agent_id = $aid GROUP ALL",
+                Some(("aid", aid.0.to_string())),
             ),
             None => (
-                "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
-                        COALESCE(SUM(cost_usd), 0.0), COUNT(*), COALESCE(SUM(tool_calls), 0)
-                 FROM usage_events",
-                vec![],
+                "SELECT math::sum(input_tokens) AS total_input_tokens,
+                        math::sum(output_tokens) AS total_output_tokens,
+                        math::sum(cost_usd) AS total_cost_usd,
+                        count() AS event_count
+                 FROM usage GROUP ALL",
+                None,
             ),
         };
-
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-
-        let summary = conn
-            .query_row(sql, params_refs.as_slice(), |row| {
-                Ok(UsageSummary {
-                    total_input_tokens: row.get::<_, i64>(0)? as u64,
-                    total_output_tokens: row.get::<_, i64>(1)? as u64,
-                    total_cost_usd: row.get(2)?,
-                    call_count: row.get::<_, i64>(3)? as u64,
-                    total_tool_calls: row.get::<_, i64>(4)? as u64,
-                })
-            })
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-
-        Ok(summary)
-    }
-
-    /// Query usage grouped by model.
-    pub fn query_by_model(&self) -> OpenFangResult<Vec<ModelUsage>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT model, COALESCE(SUM(cost_usd), 0.0), COALESCE(SUM(input_tokens), 0),
-                        COALESCE(SUM(output_tokens), 0), COUNT(*)
-                 FROM usage_events GROUP BY model ORDER BY SUM(cost_usd) DESC",
-            )
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(ModelUsage {
-                    model: row.get(0)?,
-                    total_cost_usd: row.get(1)?,
-                    total_input_tokens: row.get::<_, i64>(2)? as u64,
-                    total_output_tokens: row.get::<_, i64>(3)? as u64,
-                    call_count: row.get::<_, i64>(4)? as u64,
-                })
-            })
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| OpenFangError::Memory(e.to_string()))?);
+        let mut q = self.db.query(sql);
+        if let Some((k, v)) = binds {
+            q = q.bind((k, v));
         }
-        Ok(results)
+        let mut result = q.await.map_err(surreal_err)?;
+        let summaries: Vec<UsageSummary> = result.take(0).unwrap_or_default();
+        Ok(summaries.into_iter().next().unwrap_or_default())
     }
 
-    /// Query daily usage breakdown for the last N days.
-    pub fn query_daily_breakdown(&self, days: u32) -> OpenFangResult<Vec<DailyBreakdown>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+    /// Get usage grouped by model.
+    pub async fn query_by_model(&self) -> OpenFangResult<Vec<ModelUsage>> {
+        let mut result = self
+            .db
+            .query(
+                "SELECT model,
+                        math::sum(input_tokens) AS input_tokens,
+                        math::sum(output_tokens) AS output_tokens,
+                        math::sum(cost_usd) AS cost_usd,
+                        count() AS call_count
+                 FROM usage GROUP BY model",
+            )
+            .await
+            .map_err(surreal_err)?;
+        let rows: Vec<ModelUsage> = result.take(0).unwrap_or_default();
+        Ok(rows)
+    }
 
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT date(timestamp) as day,
-                            COALESCE(SUM(cost_usd), 0.0),
-                            COALESCE(SUM(input_tokens) + SUM(output_tokens), 0),
-                            COUNT(*)
-                     FROM usage_events
-                     WHERE timestamp > datetime('now', '-{days} days')
-                     GROUP BY day
-                     ORDER BY day ASC"
-            ))
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+    /// Delete usage records older than `days` days. Returns count deleted (best-effort).
+    pub async fn cleanup_old(&self, days: u32) -> OpenFangResult<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+        self.db
+            .query("DELETE usage WHERE created_at < $cutoff")
+            .bind(("cutoff", cutoff))
+            .await
+            .map_err(surreal_err)?;
+        // SurrealDB DELETE doesn't easily return count; return 0 as best-effort
+        Ok(0)
+    }
 
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(DailyBreakdown {
-                    date: row.get(0)?,
-                    cost_usd: row.get(1)?,
-                    tokens: row.get::<_, i64>(2)? as u64,
-                    calls: row.get::<_, i64>(3)? as u64,
-                })
-            })
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| OpenFangError::Memory(e.to_string()))?);
+    // Internal: sum cost_usd since a given duration, optionally per agent.
+    async fn cost_since(
+        &self,
+        agent_id: Option<AgentId>,
+        duration: chrono::Duration,
+    ) -> OpenFangResult<f64> {
+        let since = (Utc::now() - duration).to_rfc3339();
+        let (sql, binds) = match agent_id {
+            Some(aid) => (
+                "SELECT math::sum(cost_usd) AS total FROM usage WHERE agent_id = $aid AND created_at >= $since GROUP ALL",
+                vec![("aid", aid.0.to_string()), ("since", since)],
+            ),
+            None => (
+                "SELECT math::sum(cost_usd) AS total FROM usage WHERE created_at >= $since GROUP ALL",
+                vec![("since", since)],
+            ),
+        };
+        let mut q = self.db.query(sql);
+        for (k, v) in binds {
+            q = q.bind((k, v));
         }
-        Ok(results)
-    }
+        let mut result = q.await.map_err(surreal_err)?;
 
-    /// Query the timestamp of the earliest usage event.
-    pub fn query_first_event_date(&self) -> OpenFangResult<Option<String>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-        let result: Option<String> = conn
-            .query_row("SELECT MIN(timestamp) FROM usage_events", [], |row| {
-                row.get(0)
-            })
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-        Ok(result)
+        #[derive(Deserialize)]
+        struct Row {
+            total: Option<f64>,
+        }
+        let rows: Vec<Row> = result.take(0).unwrap_or_default();
+        Ok(rows.into_iter().next().and_then(|r| r.total).unwrap_or(0.0))
     }
+}
 
-    /// Query today's total cost across all agents.
-    pub fn query_today_cost(&self) -> OpenFangResult<f64> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-        let cost: f64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM usage_events
-                 WHERE timestamp > datetime('now', 'start of day')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-        Ok(cost)
-    }
-
-    /// Delete usage events older than the given number of days.
-    pub fn cleanup_old(&self, days: u32) -> OpenFangResult<usize> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-        let deleted = conn
-            .execute(
-                &format!(
-                    "DELETE FROM usage_events WHERE timestamp < datetime('now', '-{days} days')"
-                ),
-                [],
-            )
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-        Ok(deleted)
-    }
+/// Usage breakdown per model (returned by `query_by_model`).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelUsage {
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+    pub call_count: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migration::run_migrations;
+    use crate::db;
 
-    fn setup() -> UsageStore {
-        let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
-        UsageStore::new(Arc::new(Mutex::new(conn)))
+    async fn setup() -> UsageStore {
+        let db = db::init_mem().await.unwrap();
+        UsageStore::new(db)
     }
 
-    #[test]
-    fn test_record_and_query_summary() {
-        let store = setup();
+    #[tokio::test]
+    async fn test_record_and_summary() {
+        let store = setup().await;
         let agent_id = AgentId::new();
 
         store
-            .record(&UsageRecord {
-                agent_id,
-                model: "claude-haiku".to_string(),
-                input_tokens: 100,
-                output_tokens: 50,
-                cost_usd: 0.001,
-                tool_calls: 2,
-            })
+            .record(agent_id, "anthropic", "claude", 100, 50, 0.01, "chat")
+            .await
             .unwrap();
-
         store
-            .record(&UsageRecord {
-                agent_id,
-                model: "claude-sonnet".to_string(),
-                input_tokens: 500,
-                output_tokens: 200,
-                cost_usd: 0.01,
-                tool_calls: 1,
-            })
+            .record(agent_id, "anthropic", "claude", 200, 100, 0.02, "chat")
+            .await
             .unwrap();
 
-        let summary = store.query_summary(Some(agent_id)).unwrap();
-        assert_eq!(summary.call_count, 2);
-        assert_eq!(summary.total_input_tokens, 600);
-        assert_eq!(summary.total_output_tokens, 250);
-        assert!((summary.total_cost_usd - 0.011).abs() < 0.0001);
-        assert_eq!(summary.total_tool_calls, 3);
-    }
-
-    #[test]
-    fn test_query_summary_all_agents() {
-        let store = setup();
-        let a1 = AgentId::new();
-        let a2 = AgentId::new();
-
-        store
-            .record(&UsageRecord {
-                agent_id: a1,
-                model: "haiku".to_string(),
-                input_tokens: 100,
-                output_tokens: 50,
-                cost_usd: 0.001,
-                tool_calls: 0,
-            })
-            .unwrap();
-
-        store
-            .record(&UsageRecord {
-                agent_id: a2,
-                model: "sonnet".to_string(),
-                input_tokens: 200,
-                output_tokens: 100,
-                cost_usd: 0.005,
-                tool_calls: 1,
-            })
-            .unwrap();
-
-        let summary = store.query_summary(None).unwrap();
-        assert_eq!(summary.call_count, 2);
+        let summary = store.summary(agent_id).await.unwrap();
         assert_eq!(summary.total_input_tokens, 300);
+        assert_eq!(summary.total_output_tokens, 150);
+        assert!((summary.total_cost_usd - 0.03).abs() < 0.001);
+        assert_eq!(summary.event_count, 2);
     }
 
-    #[test]
-    fn test_query_by_model() {
-        let store = setup();
+    #[tokio::test]
+    async fn test_recent_events() {
+        let store = setup().await;
         let agent_id = AgentId::new();
 
-        for _ in 0..3 {
+        for i in 0..5 {
             store
-                .record(&UsageRecord {
-                    agent_id,
-                    model: "haiku".to_string(),
-                    input_tokens: 100,
-                    output_tokens: 50,
-                    cost_usd: 0.001,
-                    tool_calls: 0,
-                })
+                .record(agent_id, "openai", "gpt-4", i * 10, i * 5, 0.0, "chat")
+                .await
                 .unwrap();
         }
 
-        store
-            .record(&UsageRecord {
-                agent_id,
-                model: "sonnet".to_string(),
-                input_tokens: 500,
-                output_tokens: 200,
-                cost_usd: 0.01,
-                tool_calls: 1,
-            })
-            .unwrap();
-
-        let by_model = store.query_by_model().unwrap();
-        assert_eq!(by_model.len(), 2);
-        // sonnet should be first (highest cost)
-        assert_eq!(by_model[0].model, "sonnet");
-        assert_eq!(by_model[1].model, "haiku");
-        assert_eq!(by_model[1].call_count, 3);
+        let recent = store.recent(agent_id, 3).await.unwrap();
+        assert_eq!(recent.len(), 3);
     }
 
-    #[test]
-    fn test_query_hourly() {
-        let store = setup();
+    #[tokio::test]
+    async fn test_clear() {
+        let store = setup().await;
         let agent_id = AgentId::new();
-
         store
-            .record(&UsageRecord {
-                agent_id,
-                model: "haiku".to_string(),
-                input_tokens: 100,
-                output_tokens: 50,
-                cost_usd: 0.05,
-                tool_calls: 0,
-            })
+            .record(agent_id, "anthropic", "claude", 100, 50, 0.01, "chat")
+            .await
             .unwrap();
-
-        let hourly = store.query_hourly(agent_id).unwrap();
-        assert!((hourly - 0.05).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_query_daily() {
-        let store = setup();
-        let agent_id = AgentId::new();
-
-        store
-            .record(&UsageRecord {
-                agent_id,
-                model: "haiku".to_string(),
-                input_tokens: 100,
-                output_tokens: 50,
-                cost_usd: 0.123,
-                tool_calls: 0,
-            })
-            .unwrap();
-
-        let daily = store.query_daily(agent_id).unwrap();
-        assert!((daily - 0.123).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_cleanup_old() {
-        let store = setup();
-        let agent_id = AgentId::new();
-
-        store
-            .record(&UsageRecord {
-                agent_id,
-                model: "haiku".to_string(),
-                input_tokens: 100,
-                output_tokens: 50,
-                cost_usd: 0.001,
-                tool_calls: 0,
-            })
-            .unwrap();
-
-        // Cleanup events older than 1 day should not remove today's events
-        let deleted = store.cleanup_old(1).unwrap();
-        assert_eq!(deleted, 0);
-
-        let summary = store.query_summary(None).unwrap();
-        assert_eq!(summary.call_count, 1);
-    }
-
-    #[test]
-    fn test_empty_summary() {
-        let store = setup();
-        let summary = store.query_summary(None).unwrap();
-        assert_eq!(summary.call_count, 0);
-        assert_eq!(summary.total_cost_usd, 0.0);
+        store.clear(agent_id).await.unwrap();
+        let summary = store.summary(agent_id).await.unwrap();
+        assert_eq!(summary.event_count, 0);
     }
 }

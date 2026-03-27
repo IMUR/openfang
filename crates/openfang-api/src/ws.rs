@@ -499,14 +499,18 @@ async fn handle_text_message(
             // Send message to agent with streaming
             let kernel_handle: Arc<dyn KernelHandle> =
                 state.kernel.clone() as Arc<dyn KernelHandle>;
-            match state.kernel.send_message_streaming(
-                agent_id,
-                &content,
-                Some(kernel_handle),
-                None,
-                None,
-                ws_content_blocks,
-            ) {
+            match state
+                .kernel
+                .send_message_streaming(
+                    agent_id,
+                    &content,
+                    Some(kernel_handle),
+                    None,
+                    None,
+                    ws_content_blocks,
+                )
+                .await
+            {
                 Ok((mut rx, handle)) => {
                     // Forward stream events to WebSocket with debouncing.
                     //
@@ -817,7 +821,7 @@ async fn handle_command(
     verbose: &Arc<AtomicU8>,
 ) -> serde_json::Value {
     match cmd {
-        "new" | "reset" => match state.kernel.reset_session(agent_id) {
+        "new" | "reset" => match state.kernel.reset_session(agent_id).await {
             Ok(()) => {
                 serde_json::json!({"type": "command_result", "command": cmd, "message": "Session reset. Chat history cleared."})
             }
@@ -870,7 +874,7 @@ async fn handle_command(
                 }
             }
         }
-        "usage" => match state.kernel.session_usage_cost(agent_id) {
+        "usage" => match state.kernel.session_usage_cost(agent_id).await {
             Ok((input, output, cost)) => {
                 let mut msg = format!(
                     "Session usage: ~{input} in / ~{output} out (~{} total)",
@@ -885,7 +889,7 @@ async fn handle_command(
                 serde_json::json!({"type": "error", "content": format!("Usage query failed: {e}")})
             }
         },
-        "context" => match state.kernel.context_report(agent_id) {
+        "context" => match state.kernel.context_report(agent_id).await {
             Ok(report) => {
                 let formatted = openfang_runtime::compactor::format_context_report(&report);
                 serde_json::json!({
@@ -928,7 +932,7 @@ async fn handle_command(
         }
         "budget" => {
             let budget = &state.kernel.config.budget;
-            let status = state.kernel.metering.budget_status(budget);
+            let status = state.kernel.metering.budget_status(budget).await;
             let fmt = |v: f64| -> String {
                 if v > 0.0 {
                     format!("${v:.2}")
@@ -1003,7 +1007,9 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
             "id": id,
             "tool": name,
         })),
-        StreamEvent::ToolUseEnd { id, name, input, .. } if name == "canvas_present" => {
+        StreamEvent::ToolUseEnd {
+            id, name, input, ..
+        } if name == "canvas_present" => {
             let html = input.get("html").and_then(|v| v.as_str()).unwrap_or("");
             let title = input
                 .get("title")
@@ -1017,7 +1023,9 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
                 "title": title,
             }))
         }
-        StreamEvent::ToolUseEnd { id, name, input, .. } => match verbose {
+        StreamEvent::ToolUseEnd {
+            id, name, input, ..
+        } => match verbose {
             VerboseLevel::Off => None,
             VerboseLevel::On => {
                 let input_preview: String = serde_json::to_string(input)

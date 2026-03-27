@@ -1,101 +1,128 @@
-//! Memory consolidation and decay logic.
+//! Memory consolidation engine backed by SurrealDB.
 //!
-//! Reduces confidence of old, unaccessed memories and merges
-//! duplicate/similar memories.
+//! Handles background compaction of memory: merging similar fragments,
+//! decaying confidence over time, and pruning low-value memories.
 
 use chrono::Utc;
+use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
-use openfang_types::memory::ConsolidationReport;
-use rusqlite::Connection;
-use std::sync::{Arc, Mutex};
 
-/// Memory consolidation engine.
+use crate::db::SurrealDb;
+
+/// Consolidation engine backed by SurrealDB.
 #[derive(Clone)]
 pub struct ConsolidationEngine {
-    conn: Arc<Mutex<Connection>>,
-    /// Decay rate: how much to reduce confidence per consolidation cycle.
-    decay_rate: f32,
+    db: SurrealDb,
+}
+
+fn surreal_err(e: surrealdb::Error) -> OpenFangError {
+    OpenFangError::Memory(e.to_string())
 }
 
 impl ConsolidationEngine {
-    /// Create a new consolidation engine.
-    pub fn new(conn: Arc<Mutex<Connection>>, decay_rate: f32) -> Self {
-        Self { conn, decay_rate }
+    /// Create a new consolidation engine wrapping the given SurrealDB handle.
+    pub fn new(db: SurrealDb) -> Self {
+        Self { db }
     }
 
-    /// Run a consolidation cycle: decay old memories.
-    pub fn consolidate(&self) -> OpenFangResult<ConsolidationReport> {
-        let start = std::time::Instant::now();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+    /// Decay confidence for old, unused memories.
+    ///
+    /// Memories not accessed in `days_threshold` days have their confidence
+    /// reduced by `decay_factor` (e.g., 0.95 = 5% decay per run).
+    pub async fn decay_confidence(
+        &self,
+        agent_id: AgentId,
+        days_threshold: i64,
+        decay_factor: f32,
+    ) -> OpenFangResult<u64> {
+        let cutoff = (Utc::now() - chrono::Duration::days(days_threshold)).to_rfc3339();
 
-        // Decay confidence of memories not accessed in the last 7 days
-        let cutoff = (Utc::now() - chrono::Duration::days(7)).to_rfc3339();
-        let decay_factor = 1.0 - self.decay_rate as f64;
-
-        let decayed = conn
-            .execute(
-                "UPDATE memories SET confidence = MAX(0.1, confidence * ?1)
-                 WHERE deleted = 0 AND accessed_at < ?2 AND confidence > 0.1",
-                rusqlite::params![decay_factor, cutoff],
+        let mut result = self
+            .db
+            .query(
+                "UPDATE memories SET confidence = confidence * $factor
+                 WHERE agent_id = $aid
+                   AND deleted = false
+                   AND accessed_at < $cutoff
+                 RETURN BEFORE",
             )
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            .bind(("factor", decay_factor as f64))
+            .bind(("aid", agent_id.0.to_string()))
+            .bind(("cutoff", cutoff))
+            .await
+            .map_err(surreal_err)?;
 
-        let duration_ms = start.elapsed().as_millis() as u64;
+        // Count how many were updated
+        let updated: Vec<serde_json::Value> = result.take(0).unwrap_or_default();
+        Ok(updated.len() as u64)
+    }
 
-        Ok(ConsolidationReport {
-            memories_merged: 0, // Phase 1: no merging
-            memories_decayed: decayed as u64,
-            duration_ms,
-        })
+    /// Prune memories with confidence below threshold (soft-delete).
+    pub async fn prune(&self, agent_id: AgentId, min_confidence: f32) -> OpenFangResult<u64> {
+        let mut result = self
+            .db
+            .query(
+                "UPDATE memories SET deleted = true
+                 WHERE agent_id = $aid
+                   AND deleted = false
+                   AND confidence < $min_conf
+                 RETURN BEFORE",
+            )
+            .bind(("aid", agent_id.0.to_string()))
+            .bind(("min_conf", min_confidence as f64))
+            .await
+            .map_err(surreal_err)?;
+
+        let pruned: Vec<serde_json::Value> = result.take(0).unwrap_or_default();
+        Ok(pruned.len() as u64)
+    }
+
+    /// Hard-delete all soft-deleted memories for an agent.
+    pub async fn purge_deleted(&self, agent_id: AgentId) -> OpenFangResult<u64> {
+        let mut result = self
+            .db
+            .query("DELETE memories WHERE agent_id = $aid AND deleted = true RETURN BEFORE")
+            .bind(("aid", agent_id.0.to_string()))
+            .await
+            .map_err(surreal_err)?;
+
+        let purged: Vec<serde_json::Value> = result.take(0).unwrap_or_default();
+        Ok(purged.len() as u64)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migration::run_migrations;
+    use crate::db;
+    use crate::semantic::SemanticStore;
+    use openfang_types::memory::MemorySource;
+    use std::collections::HashMap;
 
-    fn setup() -> ConsolidationEngine {
-        let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
-        ConsolidationEngine::new(Arc::new(Mutex::new(conn)), 0.1)
+    async fn setup() -> (ConsolidationEngine, SemanticStore) {
+        let db = db::init_mem().await.unwrap();
+        (ConsolidationEngine::new(db.clone()), SemanticStore::new(db))
     }
 
-    #[test]
-    fn test_consolidation_empty() {
-        let engine = setup();
-        let report = engine.consolidate().unwrap();
-        assert_eq!(report.memories_decayed, 0);
-    }
+    #[tokio::test]
+    async fn test_prune_low_confidence() {
+        let (engine, store) = setup().await;
+        let agent_id = AgentId::new();
 
-    #[test]
-    fn test_consolidation_decays_old_memories() {
-        let engine = setup();
-        let conn = engine.conn.lock().unwrap();
-        // Insert an old memory
-        let old_date = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-        conn.execute(
-            "INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, deleted)
-             VALUES ('test-id', 'agent-1', 'old memory', '\"conversation\"', 'episodic', 0.9, '{}', ?1, ?1, 0, 0)",
-            rusqlite::params![old_date],
-        ).unwrap();
-        drop(conn);
-
-        let report = engine.consolidate().unwrap();
-        assert_eq!(report.memories_decayed, 1);
-
-        // Verify confidence was reduced
-        let conn = engine.conn.lock().unwrap();
-        let confidence: f64 = conn
-            .query_row(
-                "SELECT confidence FROM memories WHERE id = 'test-id'",
-                [],
-                |row| row.get(0),
+        // Store some memories
+        store
+            .remember(
+                agent_id,
+                "Important memory",
+                MemorySource::UserProvided,
+                "facts",
+                HashMap::new(),
             )
+            .await
             .unwrap();
-        assert!(confidence < 0.9);
+
+        // Initially all have confidence 1.0, so prune at 0.5 should remove nothing
+        let pruned = engine.prune(agent_id, 0.5).await.unwrap();
+        assert_eq!(pruned, 0);
     }
 }

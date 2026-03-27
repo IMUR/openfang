@@ -395,9 +395,14 @@ impl McpConnection {
                 // Handle Streamable HTTP MCP responses that use SSE framing
                 // (e.g. "event: message\ndata: {...}\n\n"). Extract the JSON
                 // from the last `data:` line if the body looks like SSE.
-                let json_body = if body.trim_start().starts_with("event:") || body.trim_start().starts_with("data:") {
+                let json_body = if body.trim_start().starts_with("event:")
+                    || body.trim_start().starts_with("data:")
+                {
                     body.lines()
-                        .filter_map(|line| line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")))
+                        .filter_map(|line| {
+                            line.strip_prefix("data: ")
+                                .or_else(|| line.strip_prefix("data:"))
+                        })
                         .filter(|s| !s.is_empty())
                         .last()
                         .unwrap_or(&body)

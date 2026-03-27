@@ -886,7 +886,6 @@ fn write_stdout_safe(msg: &str) {
 }
 
 fn main() {
-
     // Load ~/.openfang/.env into process environment (system env takes priority).
     dotenv::load_dotenv();
 
@@ -1503,7 +1502,7 @@ fn cmd_start(config: Option<PathBuf>, yolo: bool) {
             kernel_config.approval.auto_approve = true;
             kernel_config.approval.apply_shorthands();
         }
-        let kernel = match OpenFangKernel::boot_with_config(kernel_config) {
+        let kernel = match OpenFangKernel::boot_with_config(kernel_config).await {
             Ok(k) => k,
             Err(e) => {
                 boot_kernel_error(&e);
@@ -3413,7 +3412,8 @@ fn require_daemon(command: &str) -> String {
 }
 
 fn boot_kernel(config: Option<PathBuf>) -> OpenFangKernel {
-    match OpenFangKernel::boot(config.as_deref()) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    match rt.block_on(OpenFangKernel::boot(config.as_deref())) {
         Ok(k) => k,
         Err(e) => {
             boot_kernel_error(&e);

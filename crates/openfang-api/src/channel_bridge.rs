@@ -683,6 +683,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
     async fn reset_session(&self, agent_id: AgentId) -> Result<String, String> {
         self.kernel
             .reset_session(agent_id)
+            .await
             .map_err(|e| format!("{e}"))?;
         Ok("Session reset. Chat history cleared.".to_string())
     }
@@ -738,6 +739,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         let (input, output, cost) = self
             .kernel
             .session_usage_cost(agent_id)
+            .await
             .map_err(|e| format!("{e}"))?;
         let total = input + output;
         let mut msg = format!("Session usage:\n  Input: ~{input} tokens\n  Output: ~{output} tokens\n  Total: ~{total} tokens");
@@ -897,7 +899,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
 
     async fn budget_text(&self) -> String {
         let budget = &self.kernel.config.budget;
-        let status = self.kernel.metering.budget_status(budget);
+        let status = self.kernel.metering.budget_status(budget).await;
 
         let fmt_limit = |v: f64| -> String {
             if v > 0.0 {

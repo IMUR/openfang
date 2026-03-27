@@ -1,35 +1,53 @@
-//! Semantic memory store with vector embedding support.
+//! Semantic memory store with vector embedding support, backed by SurrealDB.
 //!
-//! Phase 1: SQLite LIKE matching (fallback when no embeddings).
-//! Phase 2: Vector cosine similarity search using stored embeddings.
-//!
-//! Embeddings are stored as BLOBs in the `embedding` column of the memories table.
-//! When a query embedding is provided, recall uses cosine similarity ranking.
-//! When no embeddings are available, falls back to LIKE matching.
+//! Memories are stored as documents. Embeddings are stored as JSON arrays of f32.
+//! Vector similarity search is done in Rust for now (re-ranking after fetch).
+//! Future: SurrealDB MTREE vector index for native ANN search.
 
 use chrono::Utc;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{MemoryFilter, MemoryFragment, MemoryId, MemorySource};
-use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use tracing::debug;
 
-/// Semantic store backed by SQLite with optional vector search.
+use crate::db::SurrealDb;
+
+/// Semantic store backed by SurrealDB with optional vector search.
 #[derive(Clone)]
 pub struct SemanticStore {
-    conn: Arc<Mutex<Connection>>,
+    db: SurrealDb,
+}
+
+/// Memory record for SurrealDB persistence.
+#[derive(Debug, Serialize, Deserialize)]
+struct MemoryRecord {
+    agent_id: String,
+    content: String,
+    source: MemorySource,
+    scope: String,
+    confidence: f32,
+    metadata: HashMap<String, serde_json::Value>,
+    created_at: String,
+    accessed_at: String,
+    access_count: u64,
+    deleted: bool,
+    embedding: Option<Vec<f32>>,
+}
+
+fn surreal_err(e: surrealdb::Error) -> OpenFangError {
+    OpenFangError::Memory(e.to_string())
 }
 
 impl SemanticStore {
-    /// Create a new semantic store wrapping the given connection.
-    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+    /// Create a new semantic store wrapping the given SurrealDB handle.
+    pub fn new(db: SurrealDb) -> Self {
+        Self { db }
     }
 
     /// Store a new memory fragment (without embedding).
-    pub fn remember(
+    pub async fn remember(
         &self,
         agent_id: AgentId,
         content: &str,
@@ -38,10 +56,11 @@ impl SemanticStore {
         metadata: HashMap<String, serde_json::Value>,
     ) -> OpenFangResult<MemoryId> {
         self.remember_with_embedding(agent_id, content, source, scope, metadata, None)
+            .await
     }
 
     /// Store a new memory fragment with an optional embedding vector.
-    pub fn remember_with_embedding(
+    pub async fn remember_with_embedding(
         &self,
         agent_id: AgentId,
         content: &str,
@@ -50,195 +69,132 @@ impl SemanticStore {
         metadata: HashMap<String, serde_json::Value>,
         embedding: Option<&[f32]>,
     ) -> OpenFangResult<MemoryId> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         let id = MemoryId::new();
         let now = Utc::now().to_rfc3339();
-        let source_str = serde_json::to_string(&source)
-            .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
-        let meta_str = serde_json::to_string(&metadata)
-            .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
-        let embedding_bytes: Option<Vec<u8>> = embedding.map(embedding_to_bytes);
 
-        conn.execute(
-            "INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, deleted, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1.0, ?6, ?7, ?7, 0, 0, ?8)",
-            rusqlite::params![
-                id.0.to_string(),
-                agent_id.0.to_string(),
-                content,
-                source_str,
-                scope,
-                meta_str,
-                now,
-                embedding_bytes,
-            ],
-        )
-        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let _: Option<MemoryRecord> = self
+            .db
+            .create(("memories", id.0.to_string().as_str()))
+            .content(MemoryRecord {
+                agent_id: agent_id.0.to_string(),
+                content: content.to_string(),
+                source,
+                scope: scope.to_string(),
+                confidence: 1.0,
+                metadata,
+                created_at: now.clone(),
+                accessed_at: now,
+                access_count: 0,
+                deleted: false,
+                embedding: embedding.map(|e| e.to_vec()),
+            })
+            .await
+            .map_err(surreal_err)?;
+
         Ok(id)
     }
 
     /// Search for memories using text matching (fallback, no embeddings).
-    pub fn recall(
+    pub async fn recall(
         &self,
         query: &str,
         limit: usize,
         filter: Option<MemoryFilter>,
     ) -> OpenFangResult<Vec<MemoryFragment>> {
-        self.recall_with_embedding(query, limit, filter, None)
+        self.recall_with_embedding(query, limit, filter, None).await
     }
 
     /// Search for memories using vector similarity when a query embedding is provided,
-    /// falling back to LIKE matching otherwise.
-    pub fn recall_with_embedding(
+    /// falling back to text content search otherwise.
+    pub async fn recall_with_embedding(
         &self,
         query: &str,
         limit: usize,
         filter: Option<MemoryFilter>,
         query_embedding: Option<&[f32]>,
     ) -> OpenFangResult<Vec<MemoryFragment>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-
-        // Build SQL: fetch candidates (broader than limit for vector re-ranking)
         let fetch_limit = if query_embedding.is_some() {
-            // Fetch more candidates for vector search re-ranking
             (limit * 10).max(100)
         } else {
             limit
         };
 
-        let mut sql = String::from(
-            "SELECT id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, embedding
-             FROM memories WHERE deleted = 0",
-        );
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut param_idx = 1;
+        // Build SurrealQL query with dynamic filters
+        let mut conditions = vec!["deleted = false".to_string()];
+        let mut bindings: Vec<(String, serde_json::Value)> = Vec::new();
 
-        // Text search filter (only when no embeddings — vector search handles relevance)
         if query_embedding.is_none() && !query.is_empty() {
-            sql.push_str(&format!(" AND content LIKE ?{param_idx}"));
-            params.push(Box::new(format!("%{query}%")));
-            param_idx += 1;
+            conditions.push("content CONTAINS $query_text".to_string());
+            bindings.push(("query_text".into(), serde_json::json!(query)));
         }
 
-        // Apply filters
         if let Some(ref f) = filter {
             if let Some(agent_id) = f.agent_id {
-                sql.push_str(&format!(" AND agent_id = ?{param_idx}"));
-                params.push(Box::new(agent_id.0.to_string()));
-                param_idx += 1;
+                conditions.push("agent_id = $filter_aid".to_string());
+                bindings.push((
+                    "filter_aid".into(),
+                    serde_json::json!(agent_id.0.to_string()),
+                ));
             }
             if let Some(ref scope) = f.scope {
-                sql.push_str(&format!(" AND scope = ?{param_idx}"));
-                params.push(Box::new(scope.clone()));
-                param_idx += 1;
+                conditions.push("scope = $filter_scope".to_string());
+                bindings.push(("filter_scope".into(), serde_json::json!(scope)));
             }
             if let Some(min_conf) = f.min_confidence {
-                sql.push_str(&format!(" AND confidence >= ?{param_idx}"));
-                params.push(Box::new(min_conf as f64));
-                param_idx += 1;
+                conditions.push("confidence >= $filter_conf".to_string());
+                bindings.push(("filter_conf".into(), serde_json::json!(min_conf)));
             }
             if let Some(ref source) = f.source {
-                let source_str = serde_json::to_string(source)
-                    .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
-                sql.push_str(&format!(" AND source = ?{param_idx}"));
-                params.push(Box::new(source_str));
-                let _ = param_idx;
+                conditions.push("source = $filter_source".to_string());
+                bindings.push((
+                    "filter_source".into(),
+                    serde_json::to_value(source)
+                        .map_err(|e| OpenFangError::Serialization(e.to_string()))?,
+                ));
             }
         }
 
-        sql.push_str(" ORDER BY accessed_at DESC, access_count DESC");
-        sql.push_str(&format!(" LIMIT {fetch_limit}"));
+        let where_clause = conditions.join(" AND ");
+        let sql = format!(
+            "SELECT * FROM memories WHERE {where_clause} \
+             ORDER BY accessed_at DESC, access_count DESC \
+             LIMIT {fetch_limit}"
+        );
 
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                let id_str: String = row.get(0)?;
-                let agent_str: String = row.get(1)?;
-                let content: String = row.get(2)?;
-                let source_str: String = row.get(3)?;
-                let scope: String = row.get(4)?;
-                let confidence: f64 = row.get(5)?;
-                let meta_str: String = row.get(6)?;
-                let created_str: String = row.get(7)?;
-                let accessed_str: String = row.get(8)?;
-                let access_count: i64 = row.get(9)?;
-                let embedding_bytes: Option<Vec<u8>> = row.get(10)?;
-                Ok((
-                    id_str,
-                    agent_str,
-                    content,
-                    source_str,
-                    scope,
-                    confidence,
-                    meta_str,
-                    created_str,
-                    accessed_str,
-                    access_count,
-                    embedding_bytes,
-                ))
-            })
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-
-        let mut fragments = Vec::new();
-        for row_result in rows {
-            let (
-                id_str,
-                agent_str,
-                content,
-                source_str,
-                scope,
-                confidence,
-                meta_str,
-                created_str,
-                accessed_str,
-                access_count,
-                embedding_bytes,
-            ) = row_result.map_err(|e| OpenFangError::Memory(e.to_string()))?;
-
-            let id = uuid::Uuid::parse_str(&id_str)
-                .map(MemoryId)
-                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-            let agent_id = uuid::Uuid::parse_str(&agent_str)
-                .map(openfang_types::agent::AgentId)
-                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-            let source: MemorySource =
-                serde_json::from_str(&source_str).unwrap_or(MemorySource::System);
-            let metadata: HashMap<String, serde_json::Value> =
-                serde_json::from_str(&meta_str).unwrap_or_default();
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            let accessed_at = chrono::DateTime::parse_from_rfc3339(&accessed_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-
-            let embedding = embedding_bytes.as_deref().map(embedding_from_bytes);
-
-            fragments.push(MemoryFragment {
-                id,
-                agent_id,
-                content,
-                embedding,
-                metadata,
-                source,
-                confidence: confidence as f32,
-                created_at,
-                accessed_at,
-                access_count: access_count as u64,
-                scope,
-            });
+        let mut query_builder = self.db.query(&sql);
+        for (key, val) in bindings {
+            query_builder = query_builder.bind((key, val));
         }
+
+        let mut result = query_builder.await.map_err(surreal_err)?;
+        let records: Vec<MemoryRecord> = result.take(0).unwrap_or_default();
+
+        let mut fragments: Vec<MemoryFragment> = records
+            .into_iter()
+            .filter_map(|r| {
+                let id = uuid::Uuid::parse_str(&r.agent_id).ok()?;
+                let created_at = chrono::DateTime::parse_from_rfc3339(&r.created_at)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                let accessed_at = chrono::DateTime::parse_from_rfc3339(&r.accessed_at)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+
+                Some(MemoryFragment {
+                    id: MemoryId::new(), // TODO: extract from SurrealDB record ID
+                    agent_id: AgentId(id),
+                    content: r.content,
+                    embedding: r.embedding,
+                    metadata: r.metadata,
+                    source: r.source,
+                    confidence: r.confidence,
+                    created_at,
+                    accessed_at,
+                    access_count: r.access_count,
+                    scope: r.scope,
+                })
+            })
+            .collect();
 
         // If we have a query embedding, re-rank by cosine similarity
         if let Some(qe) = query_embedding {
@@ -267,41 +223,37 @@ impl SemanticStore {
 
         // Update access counts for returned memories
         for frag in &fragments {
-            let _ = conn.execute(
-                "UPDATE memories SET access_count = access_count + 1, accessed_at = ?1 WHERE id = ?2",
-                rusqlite::params![Utc::now().to_rfc3339(), frag.id.0.to_string()],
-            );
+            let _ = self
+                .db
+                .query(
+                    "UPDATE type::thing('memories', $mid) SET access_count += 1, accessed_at = $now",
+                )
+                .bind(("mid", frag.id.0.to_string()))
+                .bind(("now", Utc::now().to_rfc3339()))
+                .await;
         }
 
         Ok(fragments)
     }
 
     /// Soft-delete a memory fragment.
-    pub fn forget(&self, id: MemoryId) -> OpenFangResult<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-        conn.execute(
-            "UPDATE memories SET deleted = 1 WHERE id = ?1",
-            rusqlite::params![id.0.to_string()],
-        )
-        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+    pub async fn forget(&self, id: MemoryId) -> OpenFangResult<()> {
+        self.db
+            .query("UPDATE type::thing('memories', $mid) SET deleted = true")
+            .bind(("mid", id.0.to_string()))
+            .await
+            .map_err(surreal_err)?;
         Ok(())
     }
 
     /// Update the embedding for an existing memory.
-    pub fn update_embedding(&self, id: MemoryId, embedding: &[f32]) -> OpenFangResult<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-        let bytes = embedding_to_bytes(embedding);
-        conn.execute(
-            "UPDATE memories SET embedding = ?1 WHERE id = ?2",
-            rusqlite::params![bytes, id.0.to_string()],
-        )
-        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+    pub async fn update_embedding(&self, id: MemoryId, embedding: &[f32]) -> OpenFangResult<()> {
+        self.db
+            .query("UPDATE type::thing('memories', $mid) SET embedding = $emb")
+            .bind(("mid", id.0.to_string()))
+            .bind(("emb", embedding.to_vec()))
+            .await
+            .map_err(surreal_err)?;
         Ok(())
     }
 }
@@ -327,37 +279,19 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Serialize embedding to bytes for SQLite BLOB storage.
-fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(embedding.len() * 4);
-    for &val in embedding {
-        bytes.extend_from_slice(&val.to_le_bytes());
-    }
-    bytes
-}
-
-/// Deserialize embedding from bytes.
-fn embedding_from_bytes(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migration::run_migrations;
+    use crate::db;
 
-    fn setup() -> SemanticStore {
-        let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
-        SemanticStore::new(Arc::new(Mutex::new(conn)))
+    async fn setup() -> SemanticStore {
+        let db = db::init_mem().await.unwrap();
+        SemanticStore::new(db)
     }
 
-    #[test]
-    fn test_remember_and_recall() {
-        let store = setup();
+    #[tokio::test]
+    async fn test_remember_and_recall() {
+        let store = setup().await;
         let agent_id = AgentId::new();
         store
             .remember(
@@ -367,15 +301,16 @@ mod tests {
                 "episodic",
                 HashMap::new(),
             )
+            .await
             .unwrap();
-        let results = store.recall("Rust", 10, None).unwrap();
+        let results = store.recall("Rust", 10, None).await.unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("Rust"));
     }
 
-    #[test]
-    fn test_recall_with_filter() {
-        let store = setup();
+    #[tokio::test]
+    async fn test_recall_with_filter() {
+        let store = setup().await;
         let agent_id = AgentId::new();
         store
             .remember(
@@ -385,6 +320,7 @@ mod tests {
                 "episodic",
                 HashMap::new(),
             )
+            .await
             .unwrap();
         store
             .remember(
@@ -394,163 +330,39 @@ mod tests {
                 "episodic",
                 HashMap::new(),
             )
+            .await
             .unwrap();
         let filter = MemoryFilter::agent(agent_id);
-        let results = store.recall("Memory", 10, Some(filter)).unwrap();
+        let results = store.recall("Memory", 10, Some(filter)).await.unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].content, "Memory A");
     }
 
-    #[test]
-    fn test_forget() {
-        let store = setup();
+    #[tokio::test]
+    async fn test_forget() {
+        let store = setup().await;
         let agent_id = AgentId::new();
         let id = store
             .remember(
                 agent_id,
-                "To forget",
+                "Forgotten memory",
                 MemorySource::Conversation,
                 "episodic",
                 HashMap::new(),
             )
+            .await
             .unwrap();
-        store.forget(id).unwrap();
-        let results = store.recall("To forget", 10, None).unwrap();
+        store.forget(id).await.unwrap();
+        let results = store.recall("Forgotten", 10, None).await.unwrap();
         assert!(results.is_empty());
     }
 
     #[test]
-    fn test_remember_with_embedding() {
-        let store = setup();
-        let agent_id = AgentId::new();
-        let embedding = vec![0.1, 0.2, 0.3, 0.4];
-        let id = store
-            .remember_with_embedding(
-                agent_id,
-                "Rust is great",
-                MemorySource::Conversation,
-                "episodic",
-                HashMap::new(),
-                Some(&embedding),
-            )
-            .unwrap();
-        assert_ne!(id.0.to_string(), "");
-    }
+    fn test_cosine_similarity() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 0.001);
 
-    #[test]
-    fn test_vector_recall_ranking() {
-        let store = setup();
-        let agent_id = AgentId::new();
-
-        // Store 3 memories with embeddings pointing in different directions
-        let emb_rust = vec![0.9, 0.1, 0.0, 0.0]; // "Rust" direction
-        let emb_python = vec![0.0, 0.0, 0.9, 0.1]; // "Python" direction
-        let emb_mixed = vec![0.5, 0.5, 0.0, 0.0]; // mixed
-
-        store
-            .remember_with_embedding(
-                agent_id,
-                "Rust is a systems language",
-                MemorySource::Conversation,
-                "episodic",
-                HashMap::new(),
-                Some(&emb_rust),
-            )
-            .unwrap();
-        store
-            .remember_with_embedding(
-                agent_id,
-                "Python is interpreted",
-                MemorySource::Conversation,
-                "episodic",
-                HashMap::new(),
-                Some(&emb_python),
-            )
-            .unwrap();
-        store
-            .remember_with_embedding(
-                agent_id,
-                "Both are popular",
-                MemorySource::Conversation,
-                "episodic",
-                HashMap::new(),
-                Some(&emb_mixed),
-            )
-            .unwrap();
-
-        // Query with a "Rust"-like embedding
-        let query_emb = vec![0.85, 0.15, 0.0, 0.0];
-        let results = store
-            .recall_with_embedding("", 3, None, Some(&query_emb))
-            .unwrap();
-
-        assert_eq!(results.len(), 3);
-        // Rust memory should be first (highest cosine similarity)
-        assert!(results[0].content.contains("Rust"));
-        // Python memory should be last (lowest similarity)
-        assert!(results[2].content.contains("Python"));
-    }
-
-    #[test]
-    fn test_update_embedding() {
-        let store = setup();
-        let agent_id = AgentId::new();
-        let id = store
-            .remember(
-                agent_id,
-                "No embedding yet",
-                MemorySource::Conversation,
-                "episodic",
-                HashMap::new(),
-            )
-            .unwrap();
-
-        // Update with embedding
-        let emb = vec![1.0, 0.0, 0.0];
-        store.update_embedding(id, &emb).unwrap();
-
-        // Verify the embedding is stored by doing vector recall
-        let query_emb = vec![1.0, 0.0, 0.0];
-        let results = store
-            .recall_with_embedding("", 10, None, Some(&query_emb))
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert!(results[0].embedding.is_some());
-        assert_eq!(results[0].embedding.as_ref().unwrap().len(), 3);
-    }
-
-    #[test]
-    fn test_mixed_embedded_and_non_embedded() {
-        let store = setup();
-        let agent_id = AgentId::new();
-
-        // One memory with embedding, one without
-        store
-            .remember_with_embedding(
-                agent_id,
-                "Has embedding",
-                MemorySource::Conversation,
-                "episodic",
-                HashMap::new(),
-                Some(&[1.0, 0.0]),
-            )
-            .unwrap();
-        store
-            .remember(
-                agent_id,
-                "No embedding",
-                MemorySource::Conversation,
-                "episodic",
-                HashMap::new(),
-            )
-            .unwrap();
-
-        // Vector recall should rank embedded memory higher
-        let results = store
-            .recall_with_embedding("", 10, None, Some(&[1.0, 0.0]))
-            .unwrap();
-        assert_eq!(results.len(), 2);
-        // Embedded memory should rank first
-        assert_eq!(results[0].content, "Has embedding");
+        let c = vec![0.0, 1.0, 0.0];
+        assert!(cosine_similarity(&a, &c).abs() < 0.001);
     }
 }

@@ -144,15 +144,16 @@ fn create_backend(config: Option<std::path::PathBuf>) -> McpBackend {
         return McpBackend::Daemon { base_url, client };
     }
 
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
     // Fall back to in-process kernel
-    let kernel = match OpenFangKernel::boot(config.as_deref()) {
+    let kernel = match rt.block_on(OpenFangKernel::boot(config.as_deref())) {
         Ok(k) => k,
         Err(e) => {
             eprintln!("Failed to boot kernel for MCP: {e}");
             std::process::exit(1);
         }
     };
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
     McpBackend::InProcess {
         kernel: Box::new(kernel),
         rt,
