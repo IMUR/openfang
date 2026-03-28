@@ -10,7 +10,7 @@ use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::db::SurrealDb;
 
@@ -458,92 +458,101 @@ impl SessionStore {
     ///
     /// Best-effort: errors are returned but should be logged and never
     /// affect the primary SurrealDB store.
-    pub fn write_jsonl_mirror(
+    pub async fn write_jsonl_mirror(
         &self,
-        session: &Session,
-        sessions_dir: &Path,
+        session: Session,
+        sessions_dir: PathBuf,
     ) -> Result<(), std::io::Error> {
-        std::fs::create_dir_all(sessions_dir)?;
-        let path = sessions_dir.join(format!("{}.jsonl", session.id.0));
-        let mut file = std::fs::File::create(&path)?;
-        let now = Utc::now().to_rfc3339();
+        tokio::task::spawn_blocking(move || write_jsonl_mirror_sync(&session, &sessions_dir))
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+    }
+}
 
-        for msg in &session.messages {
-            let role_str = match msg.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::System => "system",
-            };
+fn write_jsonl_mirror_sync(
+    session: &Session,
+    sessions_dir: &Path,
+) -> Result<(), std::io::Error> {
+    std::fs::create_dir_all(sessions_dir)?;
+    let path = sessions_dir.join(format!("{}.jsonl", session.id.0));
+    let mut file = std::fs::File::create(&path)?;
+    let now = Utc::now().to_rfc3339();
 
-            let mut text_parts: Vec<String> = Vec::new();
-            let mut tool_parts: Vec<serde_json::Value> = Vec::new();
+    for msg in &session.messages {
+        let role_str = match msg.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::System => "system",
+        };
 
-            match &msg.content {
-                MessageContent::Text(t) => {
-                    text_parts.push(t.clone());
-                }
-                MessageContent::Blocks(blocks) => {
-                    for block in blocks {
-                        match block {
-                            ContentBlock::Text { text, .. } => {
-                                text_parts.push(text.clone());
-                            }
-                            ContentBlock::ToolUse {
-                                id, name, input, ..
-                            } => {
-                                tool_parts.push(serde_json::json!({
-                                    "type": "tool_use",
-                                    "id": id,
-                                    "name": name,
-                                    "input": input,
-                                }));
-                            }
-                            ContentBlock::ToolResult {
-                                tool_use_id,
-                                tool_name: _,
-                                content,
-                                is_error,
-                            } => {
-                                tool_parts.push(serde_json::json!({
-                                    "type": "tool_result",
-                                    "tool_use_id": tool_use_id,
-                                    "content": content,
-                                    "is_error": is_error,
-                                }));
-                            }
-                            ContentBlock::Image { media_type, .. } => {
-                                text_parts.push(format!("[image: {media_type}]"));
-                            }
-                            ContentBlock::Thinking { thinking } => {
-                                text_parts.push(format!(
-                                    "[thinking: {}]",
-                                    openfang_types::truncate_str(thinking, 200)
-                                ));
-                            }
-                            ContentBlock::Unknown => {}
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut tool_parts: Vec<serde_json::Value> = Vec::new();
+
+        match &msg.content {
+            MessageContent::Text(t) => {
+                text_parts.push(t.clone());
+            }
+            MessageContent::Blocks(blocks) => {
+                for block in blocks {
+                    match block {
+                        ContentBlock::Text { text, .. } => {
+                            text_parts.push(text.clone());
                         }
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
+                            tool_parts.push(serde_json::json!({
+                                "type": "tool_use",
+                                "id": id,
+                                "name": name,
+                                "input": input,
+                            }));
+                        }
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            tool_name: _,
+                            content,
+                            is_error,
+                        } => {
+                            tool_parts.push(serde_json::json!({
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": content,
+                                "is_error": is_error,
+                            }));
+                        }
+                        ContentBlock::Image { media_type, .. } => {
+                            text_parts.push(format!("[image: {media_type}]"));
+                        }
+                        ContentBlock::Thinking { thinking } => {
+                            text_parts.push(format!(
+                                "[thinking: {}]",
+                                openfang_types::truncate_str(thinking, 200)
+                            ));
+                        }
+                        ContentBlock::Unknown => {}
                     }
                 }
             }
-
-            let line = JsonlLine {
-                timestamp: now.clone(),
-                role: role_str.to_string(),
-                content: serde_json::Value::String(text_parts.join("\n")),
-                tool_use: if tool_parts.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::Value::Array(tool_parts))
-                },
-            };
-
-            serde_json::to_writer(&mut file, &line).map_err(std::io::Error::other)?;
-            file.write_all(b"\n")?;
         }
 
-        Ok(())
+        let line = JsonlLine {
+            timestamp: now.clone(),
+            role: role_str.to_string(),
+            content: serde_json::Value::String(text_parts.join("\n")),
+            tool_use: if tool_parts.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Array(tool_parts))
+            },
+        };
+
+        serde_json::to_writer(&mut file, &line).map_err(std::io::Error::other)?;
+        file.write_all(b"\n")?;
     }
-}
+
+    Ok(())
+    }
 
 #[cfg(test)]
 mod tests {
@@ -690,7 +699,7 @@ mod tests {
 
         let dir = tempfile::TempDir::new().unwrap();
         let sessions_dir = dir.path().join("sessions");
-        store.write_jsonl_mirror(&session, &sessions_dir).unwrap();
+        store.write_jsonl_mirror(session.clone(), sessions_dir.clone()).await.unwrap();
 
         let jsonl_path = sessions_dir.join(format!("{}.jsonl", session.id.0));
         assert!(jsonl_path.exists());

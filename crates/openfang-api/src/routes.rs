@@ -5212,21 +5212,26 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
 /// GET /api/usage — Get per-agent usage statistics.
 pub async fn usage_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let agents: Vec<serde_json::Value> = state
-        .kernel
-        .registry
-        .list()
-        .iter()
-        .map(|e| {
-            let (tokens, tool_calls) = state.kernel.scheduler.get_usage(e.id).unwrap_or((0, 0));
-            serde_json::json!({
-                "agent_id": e.id.to_string(),
-                "name": e.name,
-                "total_tokens": tokens,
-                "tool_calls": tool_calls,
-            })
-        })
-        .collect();
+    let mut agents = Vec::new();
+    for entry in state.kernel.registry.list() {
+        let (tokens, tool_calls) = state.kernel.scheduler.get_usage(entry.id).unwrap_or((0, 0));
+        let cost_usd = state
+            .kernel
+            .memory
+            .usage()
+            .query_summary(Some(entry.id))
+            .await
+            .map(|summary| summary.total_cost_usd)
+            .unwrap_or(0.0);
+
+        agents.push(serde_json::json!({
+            "agent_id": entry.id.to_string(),
+            "name": entry.name,
+            "total_tokens": tokens,
+            "tool_calls": tool_calls,
+            "cost_usd": cost_usd,
+        }));
+    }
 
     Json(serde_json::json!({"agents": agents}))
 }
@@ -5236,27 +5241,85 @@ pub async fn usage_stats(State(state): State<Arc<AppState>>) -> impl IntoRespons
 // ---------------------------------------------------------------------------
 
 /// GET /api/usage/summary — Get overall usage summary from UsageStore.
-pub async fn usage_summary(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn usage_summary(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let summary = match state.kernel.memory.usage().query_summary(None).await {
+        Ok(summary) => summary,
+        Err(e) => {
+            tracing::warn!("Failed to query usage summary: {e}");
+            Default::default()
+        }
+    };
+    let total_tool_calls: u64 = state
+        .kernel
+        .registry
+        .list()
+        .iter()
+        .filter_map(|entry| {
+            state
+                .kernel
+                .scheduler
+                .get_usage(entry.id)
+                .map(|(_, calls)| calls)
+        })
+        .sum();
+
     Json(serde_json::json!({
-        "total_input_tokens": 0,
-        "total_output_tokens": 0,
-        "total_cost_usd": 0.0,
-        "call_count": 0,
-        "total_tool_calls": 0,
+        "total_input_tokens": summary.total_input_tokens,
+        "total_output_tokens": summary.total_output_tokens,
+        "total_cost_usd": summary.total_cost_usd,
+        "call_count": summary.event_count,
+        "total_calls": summary.event_count,
+        "total_tool_calls": total_tool_calls,
     }))
 }
 
 /// GET /api/usage/by-model — Get usage grouped by model.
-pub async fn usage_by_model(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(serde_json::json!({"models": []}))
+pub async fn usage_by_model(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let models = match state.kernel.memory.usage().query_by_model().await {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| {
+                serde_json::json!({
+                    "model": row.model,
+                    "total_input_tokens": row.input_tokens,
+                    "total_output_tokens": row.output_tokens,
+                    "total_cost_usd": row.cost_usd,
+                    "call_count": row.call_count,
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::warn!("Failed to query usage by model: {e}");
+            Vec::new()
+        }
+    };
+
+    Json(serde_json::json!({ "models": models }))
 }
 
 /// GET /api/usage/daily — Get daily usage breakdown for the last 7 days.
-pub async fn usage_daily(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn usage_daily(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let usage_store = state.kernel.memory.usage();
+    let days = match usage_store.query_daily_breakdown(7).await {
+        Ok(days) => days,
+        Err(e) => {
+            tracing::warn!("Failed to query daily usage: {e}");
+            Vec::new()
+        }
+    };
+    let today_cost_usd = usage_store.query_today_cost().await.unwrap_or_else(|e| {
+        tracing::warn!("Failed to query today's usage cost: {e}");
+        0.0
+    });
+    let first_event_date = usage_store.first_event_date().await.unwrap_or_else(|e| {
+        tracing::warn!("Failed to query first usage event date: {e}");
+        None
+    });
+
     Json(serde_json::json!({
-        "days": [],
-        "today_cost_usd": 0.0,
-        "first_event_date": null,
+        "days": days,
+        "today_cost_usd": today_cost_usd,
+        "first_event_date": first_event_date,
     }))
 }
 

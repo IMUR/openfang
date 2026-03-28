@@ -22,7 +22,7 @@ use openfang_types::memory::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn surreal_err(e: surrealdb::Error) -> OpenFangError {
     OpenFangError::Memory(e.to_string())
@@ -270,12 +270,12 @@ impl MemorySubstrate {
     }
 
     /// Write a human-readable JSONL mirror of a session to disk.
-    pub fn write_jsonl_mirror(
+    pub async fn write_jsonl_mirror(
         &self,
-        session: &Session,
-        sessions_dir: &Path,
+        session: Session,
+        sessions_dir: PathBuf,
     ) -> Result<(), std::io::Error> {
-        self.sessions.write_jsonl_mirror(session, sessions_dir)
+        self.sessions.write_jsonl_mirror(session, sessions_dir).await
     }
 
     /// Append messages to the agent's canonical session.

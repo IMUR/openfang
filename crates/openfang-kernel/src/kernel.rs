@@ -1984,8 +1984,9 @@ impl OpenFangKernel {
 
                     // Write JSONL session mirror to workspace
                     if let Some(ref workspace) = manifest.workspace {
+                        let sessions_dir = workspace.join("sessions");
                         if let Err(e) =
-                            memory.write_jsonl_mirror(&session, &workspace.join("sessions"))
+                            memory.write_jsonl_mirror(session.clone(), sessions_dir).await
                         {
                             warn!("Failed to write JSONL session mirror (streaming): {e}");
                         }
@@ -2554,9 +2555,11 @@ impl OpenFangKernel {
 
         // Write JSONL session mirror to workspace
         if let Some(ref workspace) = manifest.workspace {
+            let sessions_dir = workspace.join("sessions");
             if let Err(e) = self
                 .memory
-                .write_jsonl_mirror(&session, &workspace.join("sessions"))
+                .write_jsonl_mirror(session.clone(), sessions_dir)
+                .await
             {
                 warn!("Failed to write JSONL session mirror: {e}");
             }
