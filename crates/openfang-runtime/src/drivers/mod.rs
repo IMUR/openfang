@@ -183,12 +183,12 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
         }),
         "zai" | "z.ai" => Some(ProviderDefaults {
             base_url: ZAI_BASE_URL,
-            api_key_env: "ZHIPU_API_KEY",
+            api_key_env: "Z_AI_API_KEY",
             key_required: true,
         }),
-        "zai_coding" => Some(ProviderDefaults {
+        "zai_coding" | "zai-coding" => Some(ProviderDefaults {
             base_url: ZAI_CODING_BASE_URL,
-            api_key_env: "ZHIPU_API_KEY",
+            api_key_env: "Z_AI_API_KEY",
             key_required: true,
         }),
         "qianfan" | "baidu" => Some(ProviderDefaults {
@@ -541,6 +541,7 @@ pub fn known_providers() -> &'static [&'static str] {
         "zhipu",
         "zhipu_coding",
         "zai",
+        "zai_coding",
         "kimi_coding",
         "qianfan",
         "volcengine",
