@@ -194,7 +194,7 @@ AutoGen    ███████████░░░░░░░░░░░░
 | **Agent Sandbox** | **WASM dual-metered** | None | Allowlists | None | Docker | None |
 | **Channel Adapters** | **40** | 13 | 15 | 0 | 0 | 0 |
 | **Built-in Tools** | **53 + MCP + A2A** | 50+ | 12 | Plugins | MCP | LC tools |
-| **Memory** | **SQLite + vector** | File-based | SQLite FTS5 | 4-layer | External | Checkpoints |
+| **Memory** | **SurrealDB (embedded)** | File-based | SQLite FTS5 | 4-layer | External | Checkpoints |
 | **Desktop App** | **Tauri 2.0** | None | None | None | Studio | None |
 | **Audit Trail** | **Merkle hash-chain** | Logs | Logs | Tracing | Logs | Checkpoints |
 | **Cold Start** | **<200ms** | ~6s | ~10ms | ~3s | ~4s | ~2.5s |
@@ -237,7 +237,7 @@ openfang-kernel      Orchestration, workflows, metering, RBAC, scheduler, budget
 openfang-runtime     Agent loop, 3 LLM drivers, 53 tools, WASM sandbox, MCP, A2A
 openfang-api         140+ REST/WS/SSE endpoints, OpenAI-compatible API, dashboard
 openfang-channels    40 messaging adapters with rate limiting, DM/group policies
-openfang-memory      SQLite persistence, vector embeddings, canonical sessions, compaction
+openfang-memory      SurrealDB persistence, vector embeddings, canonical sessions, compaction
 openfang-types       Core types, taint tracking, Ed25519 manifest signing, model catalog
 openfang-skills      60 bundled skills, SKILL.md parser, FangHub marketplace
 openfang-hands       7 autonomous Hands, HAND.toml parser, lifecycle management

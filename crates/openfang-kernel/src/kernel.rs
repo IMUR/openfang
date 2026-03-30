@@ -558,7 +558,7 @@ impl OpenFangKernel {
         // Initialize memory substrate
         let db_path = config
             .memory
-            .sqlite_path
+            .db_path
             .clone()
             .unwrap_or_else(|| config.data_dir.join("openfang.db"));
         let memory = Arc::new(

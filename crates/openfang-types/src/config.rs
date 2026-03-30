@@ -1496,8 +1496,9 @@ impl Default for DefaultModelConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemoryConfig {
-    /// Path to SQLite database file.
-    pub sqlite_path: Option<PathBuf>,
+    /// Path to the SurrealDB data directory.
+    #[serde(alias = "sqlite_path")]
+    pub db_path: Option<PathBuf>,
     /// Embedding model for semantic search.
     pub embedding_model: String,
     /// Maximum memories before consolidation is triggered.
@@ -1522,7 +1523,7 @@ fn default_consolidation_interval() -> u64 {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            sqlite_path: None,
+            db_path: None,
             embedding_model: "all-MiniLM-L6-v2".to_string(),
             consolidation_threshold: 10_000,
             decay_rate: 0.1,

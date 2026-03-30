@@ -111,7 +111,7 @@ api_key_env = "GROQ_API_KEY"
 
 # --- Memory ---
 [memory]
-# sqlite_path = "~/.openfang/data/openfang.db"  # Auto-resolved if omitted
+# db_path = "~/.openfang/data/openfang.db"       # Auto-resolved if omitted
 embedding_model = "all-MiniLM-L6-v2"
 consolidation_threshold = 10000
 decay_rate = 0.1
@@ -276,11 +276,11 @@ api_key_env = "ANTHROPIC_API_KEY"
 
 ### `[memory]`
 
-Configures the SQLite-backed memory substrate, including vector embeddings and memory decay.
+Configures the SurrealDB-backed memory substrate, including vector embeddings and memory decay.
 
 ```toml
 [memory]
-# sqlite_path = "/custom/path/openfang.db"
+# db_path = "/custom/path/openfang.db"
 embedding_model = "all-MiniLM-L6-v2"
 consolidation_threshold = 10000
 decay_rate = 0.1
@@ -288,7 +288,7 @@ decay_rate = 0.1
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `sqlite_path` | path or null | `null` | Explicit path to the SQLite database file. When `null`, defaults to `{data_dir}/openfang.db`. |
+| `db_path` | path or null | `null` | Explicit path to the SurrealDB data directory. When `null`, defaults to `{data_dir}/openfang.db`. Accepts `sqlite_path` as an alias for backwards compatibility. |
 | `embedding_model` | string | `"all-MiniLM-L6-v2"` | Model name used for generating vector embeddings for semantic memory search. |
 | `consolidation_threshold` | u64 | `10000` | Number of stored memories before automatic consolidation is triggered to merge and prune old entries. |
 | `decay_rate` | f32 | `0.1` | Memory confidence decay rate. `0.0` = no decay (memories never fade), `1.0` = aggressive decay. Values between 0.0 and 1.0. |
