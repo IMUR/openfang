@@ -540,24 +540,24 @@ pub fn spawn_fetch_dashboard(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                 if let Ok(body) = resp.json::<serde_json::Value>() {
                     let _ = tx.send(AppEvent::DashboardData {
                         agent_count: body["agent_count"].as_u64().unwrap_or(0),
-                        uptime_secs: body["uptime_secs"].as_u64().unwrap_or(0),
+                        uptime_secs: body["uptime_seconds"].as_u64().unwrap_or(0),
                         version: body["version"].as_str().unwrap_or("?").to_string(),
-                        provider: body["provider"].as_str().unwrap_or("").to_string(),
-                        model: body["model"].as_str().unwrap_or("").to_string(),
+                        provider: body["default_provider"].as_str().unwrap_or("").to_string(),
+                        model: body["default_model"].as_str().unwrap_or("").to_string(),
                     });
                 }
             }
 
-            // Try to fetch audit trail
+            // Try to fetch audit trail — API returns {"entries": [...], ...}
             if let Ok(resp) = client.get(format!("{base_url}/api/audit/recent")).send() {
                 if let Ok(body) = resp.json::<serde_json::Value>() {
-                    let rows: Vec<AuditRow> = body
+                    let rows: Vec<AuditRow> = body["entries"]
                         .as_array()
                         .map(|arr| {
                             arr.iter()
                                 .map(|r| AuditRow {
                                     timestamp: r["timestamp"].as_str().unwrap_or("").to_string(),
-                                    agent: r["agent"].as_str().unwrap_or("").to_string(),
+                                    agent: r["agent_id"].as_str().unwrap_or("").to_string(),
                                     action: r["action"].as_str().unwrap_or("").to_string(),
                                     detail: r["detail"].as_str().unwrap_or("").to_string(),
                                 })
@@ -594,18 +594,22 @@ pub fn spawn_fetch_channels(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
 
             if let Ok(resp) = client.get(format!("{base_url}/api/channels")).send() {
                 if let Ok(body) = resp.json::<serde_json::Value>() {
-                    let channels: Vec<ChannelInfo> = body
+                    let channels: Vec<ChannelInfo> = body["channels"]
                         .as_array()
                         .map(|arr| {
                             arr.iter()
                                 .map(|ch| {
                                     use super::screens::channels::ChannelStatus;
-                                    let status_str =
-                                        ch["status"].as_str().unwrap_or("not_configured");
-                                    let status = match status_str {
-                                        "ready" => ChannelStatus::Ready,
-                                        "missing_env" => ChannelStatus::MissingEnv,
-                                        _ => ChannelStatus::NotConfigured,
+                                    let configured =
+                                        ch["configured"].as_bool().unwrap_or(false);
+                                    let has_token =
+                                        ch["has_token"].as_bool().unwrap_or(false);
+                                    let status = if configured && has_token {
+                                        ChannelStatus::Ready
+                                    } else if configured {
+                                        ChannelStatus::MissingEnv
+                                    } else {
+                                        ChannelStatus::NotConfigured
                                     };
                                     ChannelInfo {
                                         name: ch["name"].as_str().unwrap_or("?").to_string(),
@@ -619,7 +623,7 @@ pub fn spawn_fetch_channels(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                                             .to_string(),
                                         status,
                                         env_vars: Vec::new(),
-                                        enabled: ch["enabled"].as_bool().unwrap_or(false),
+                                        enabled: configured,
                                     }
                                 })
                                 .collect()
@@ -703,7 +707,7 @@ pub fn spawn_fetch_workflows(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                                     id: wf["id"].as_str().unwrap_or("?").to_string(),
                                     name: wf["name"].as_str().unwrap_or("?").to_string(),
                                     steps: wf["steps"].as_u64().unwrap_or(0) as usize,
-                                    created: wf["created"].as_str().unwrap_or("").to_string(),
+                                    created: wf["created_at"].as_str().unwrap_or("").to_string(),
                                 })
                                 .collect()
                         })
@@ -743,9 +747,14 @@ pub fn spawn_fetch_workflow_runs(
                             arr.iter()
                                 .map(|r| WorkflowRun {
                                     id: r["id"].as_str().unwrap_or("?").to_string(),
-                                    state: r["state"].as_str().unwrap_or("?").to_string(),
-                                    duration: r["duration"].as_str().unwrap_or("").to_string(),
-                                    output_preview: r["output"].as_str().unwrap_or("").to_string(),
+                                    state: r["state"].as_str()
+                                        .or_else(|| r["state"].as_object().and_then(|_| Some("running")))
+                                        .unwrap_or("?").to_string(),
+                                    duration: r["completed_at"].as_str().unwrap_or("").to_string(),
+                                    output_preview: format!(
+                                        "{} step(s)",
+                                        r["steps_completed"].as_u64().unwrap_or(0)
+                                    ),
                                 })
                                 .collect()
                         })
@@ -826,7 +835,7 @@ pub fn spawn_create_workflow(
             {
                 Ok(resp) => {
                     let body: serde_json::Value = resp.json().unwrap_or_default();
-                    let id = body["id"].as_str().unwrap_or("created").to_string();
+                    let id = body["workflow_id"].as_str().unwrap_or("created").to_string();
                     let _ = tx.send(AppEvent::WorkflowCreated(id));
                 }
                 Err(e) => {
@@ -860,8 +869,10 @@ pub fn spawn_fetch_triggers(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                                 .map(|tr| TriggerInfo {
                                     id: tr["id"].as_str().unwrap_or("?").to_string(),
                                     agent_id: tr["agent_id"].as_str().unwrap_or("?").to_string(),
-                                    pattern: tr["pattern"].as_str().unwrap_or("?").to_string(),
-                                    fires: tr["fires"].as_u64().unwrap_or(0),
+                                    pattern: tr["pattern"].as_str()
+                                        .map(String::from)
+                                        .unwrap_or_else(|| tr["pattern"].to_string()),
+                                    fires: tr["fire_count"].as_u64().unwrap_or(0),
                                     enabled: tr["enabled"].as_bool().unwrap_or(true),
                                 })
                                 .collect()
@@ -907,7 +918,7 @@ pub fn spawn_create_trigger(
             {
                 Ok(resp) => {
                     let body: serde_json::Value = resp.json().unwrap_or_default();
-                    let id = body["id"].as_str().unwrap_or("created").to_string();
+                    let id = body["trigger_id"].as_str().unwrap_or("created").to_string();
                     let _ = tx.send(AppEvent::TriggerCreated(id));
                 }
                 Err(e) => {
@@ -1233,16 +1244,16 @@ pub fn spawn_fetch_sessions(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
             let client = daemon_client();
             if let Ok(resp) = client.get(format!("{base_url}/api/sessions")).send() {
                 if let Ok(body) = resp.json::<serde_json::Value>() {
-                    let sessions: Vec<SessionInfo> = body
+                    let sessions: Vec<SessionInfo> = body["sessions"]
                         .as_array()
                         .map(|arr| {
                             arr.iter()
                                 .map(|s| SessionInfo {
-                                    id: s["id"].as_str().unwrap_or("").to_string(),
-                                    agent_name: s["agent_name"].as_str().unwrap_or("").to_string(),
+                                    id: s["session_id"].as_str().unwrap_or("").to_string(),
+                                    agent_name: s["label"].as_str().unwrap_or("").to_string(),
                                     agent_id: s["agent_id"].as_str().unwrap_or("").to_string(),
                                     message_count: s["message_count"].as_u64().unwrap_or(0),
-                                    created: s["created"].as_str().unwrap_or("").to_string(),
+                                    created: s["created_at"].as_str().unwrap_or("").to_string(),
                                 })
                                 .collect()
                         })
@@ -1420,14 +1431,14 @@ pub fn spawn_fetch_skills(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
             let client = daemon_client();
             if let Ok(resp) = client.get(format!("{base_url}/api/skills")).send() {
                 if let Ok(body) = resp.json::<serde_json::Value>() {
-                    let skills: Vec<SkillInfo> = body
+                    let skills: Vec<SkillInfo> = body["skills"]
                         .as_array()
                         .map(|arr| {
                             arr.iter()
                                 .map(|s| SkillInfo {
                                     name: s["name"].as_str().unwrap_or("").to_string(),
                                     runtime: s["runtime"].as_str().unwrap_or("").to_string(),
-                                    source: s["source"].as_str().unwrap_or("").to_string(),
+                                    source: s["source"]["type"].as_str().unwrap_or("").to_string(),
                                     description: s["description"]
                                         .as_str()
                                         .unwrap_or("")
@@ -1575,18 +1586,28 @@ pub fn spawn_fetch_mcp_servers(backend: BackendRef, tx: mpsc::Sender<AppEvent>) 
             let client = daemon_client();
             if let Ok(resp) = client.get(format!("{base_url}/api/mcp/servers")).send() {
                 if let Ok(body) = resp.json::<serde_json::Value>() {
-                    let servers: Vec<McpServerInfo> = body
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .map(|s| McpServerInfo {
-                                    name: s["name"].as_str().unwrap_or("").to_string(),
-                                    connected: s["connected"].as_bool().unwrap_or(false),
-                                    tool_count: s["tool_count"].as_u64().unwrap_or(0) as usize,
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let mut servers = Vec::new();
+                    if let Some(connected) = body["connected"].as_array() {
+                        for s in connected {
+                            servers.push(McpServerInfo {
+                                name: s["name"].as_str().unwrap_or("").to_string(),
+                                connected: true,
+                                tool_count: s["tools_count"].as_u64().unwrap_or(0) as usize,
+                            });
+                        }
+                    }
+                    if let Some(configured) = body["configured"].as_array() {
+                        for s in configured {
+                            let name = s["name"].as_str().unwrap_or("").to_string();
+                            if !servers.iter().any(|existing| existing.name == name) {
+                                servers.push(McpServerInfo {
+                                    name,
+                                    connected: false,
+                                    tool_count: 0,
+                                });
+                            }
+                        }
+                    }
                     let _ = tx.send(AppEvent::McpServersLoaded(servers));
                 }
             }
@@ -1636,30 +1657,40 @@ pub fn spawn_fetch_security(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
             let client = daemon_client();
             if let Ok(resp) = client.get(format!("{base_url}/api/security")).send() {
                 if let Ok(body) = resp.json::<serde_json::Value>() {
-                    let features: Vec<SecurityFeature> = body
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .map(|f| {
-                                    use super::screens::security::SecuritySection;
-                                    let section = match f["section"].as_str().unwrap_or("core") {
-                                        "configurable" => SecuritySection::Configurable,
-                                        "monitoring" => SecuritySection::Monitoring,
-                                        _ => SecuritySection::Core,
-                                    };
-                                    SecurityFeature {
-                                        name: f["name"].as_str().unwrap_or("").to_string(),
-                                        active: f["active"].as_bool().unwrap_or(true),
-                                        description: f["description"]
-                                            .as_str()
-                                            .unwrap_or("")
-                                            .to_string(),
-                                        section,
-                                    }
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    use super::screens::security::SecuritySection;
+                    let mut features = Vec::new();
+                    if let Some(core) = body["core_protections"].as_object() {
+                        for (name, val) in core {
+                            features.push(SecurityFeature {
+                                name: name.replace('_', " "),
+                                active: val.as_bool().unwrap_or(true),
+                                description: String::new(),
+                                section: SecuritySection::Core,
+                            });
+                        }
+                    }
+                    if let Some(cfg) = body["configurable"].as_object() {
+                        for (name, val) in cfg {
+                            let active = val["enabled"].as_bool().unwrap_or(true);
+                            features.push(SecurityFeature {
+                                name: name.replace('_', " "),
+                                active,
+                                description: String::new(),
+                                section: SecuritySection::Configurable,
+                            });
+                        }
+                    }
+                    if let Some(mon) = body["monitoring"].as_object() {
+                        for (name, val) in mon {
+                            let active = val["enabled"].as_bool().unwrap_or(true);
+                            features.push(SecurityFeature {
+                                name: name.replace('_', " "),
+                                active,
+                                description: String::new(),
+                                section: SecuritySection::Monitoring,
+                            });
+                        }
+                    }
                     if !features.is_empty() {
                         let _ = tx.send(AppEvent::SecurityLoaded(features));
                     }
@@ -1715,16 +1746,16 @@ pub fn spawn_fetch_audit(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                 .send()
             {
                 if let Ok(body) = resp.json::<serde_json::Value>() {
-                    let entries: Vec<AuditEntry> = body
+                    let entries: Vec<AuditEntry> = body["entries"]
                         .as_array()
                         .map(|arr| {
                             arr.iter()
                                 .map(|e| AuditEntry {
                                     timestamp: e["timestamp"].as_str().unwrap_or("").to_string(),
                                     action: e["action"].as_str().unwrap_or("").to_string(),
-                                    agent: e["agent"].as_str().unwrap_or("").to_string(),
+                                    agent: e["agent_id"].as_str().unwrap_or("").to_string(),
                                     detail: e["detail"].as_str().unwrap_or("").to_string(),
-                                    tip_hash: e["tip_hash"].as_str().unwrap_or("").to_string(),
+                                    tip_hash: e["hash"].as_str().unwrap_or("").to_string(),
                                 })
                                 .collect()
                         })
@@ -1755,19 +1786,19 @@ pub fn spawn_fetch_usage(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                     }));
                 }
             }
-            // By model
+            // By model — API returns {"models": [...]}
             if let Ok(resp) = client.get(format!("{base_url}/api/usage/by-model")).send() {
                 if let Ok(body) = resp.json::<serde_json::Value>() {
-                    let models: Vec<ModelUsage> = body
+                    let models: Vec<ModelUsage> = body["models"]
                         .as_array()
                         .map(|arr| {
                             arr.iter()
                                 .map(|m| ModelUsage {
-                                    model_id: m["model_id"].as_str().unwrap_or("").to_string(),
-                                    input_tokens: m["input_tokens"].as_u64().unwrap_or(0),
-                                    output_tokens: m["output_tokens"].as_u64().unwrap_or(0),
-                                    cost_usd: m["cost_usd"].as_f64().unwrap_or(0.0),
-                                    calls: m["calls"].as_u64().unwrap_or(0),
+                                    model_id: m["model"].as_str().unwrap_or("").to_string(),
+                                    input_tokens: m["total_input_tokens"].as_u64().unwrap_or(0),
+                                    output_tokens: m["total_output_tokens"].as_u64().unwrap_or(0),
+                                    cost_usd: m["total_cost_usd"].as_f64().unwrap_or(0.0),
+                                    calls: m["call_count"].as_u64().unwrap_or(0),
                                 })
                                 .collect()
                         })
@@ -1775,15 +1806,15 @@ pub fn spawn_fetch_usage(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                     let _ = tx.send(AppEvent::UsageByModelLoaded(models));
                 }
             }
-            // By agent
+            // By agent — API returns {"agents": [...]}
             if let Ok(resp) = client.get(format!("{base_url}/api/usage")).send() {
                 if let Ok(body) = resp.json::<serde_json::Value>() {
-                    let agents: Vec<AgentUsage> = body
+                    let agents: Vec<AgentUsage> = body["agents"]
                         .as_array()
                         .map(|arr| {
                             arr.iter()
                                 .map(|a| AgentUsage {
-                                    agent_name: a["agent_name"].as_str().unwrap_or("").to_string(),
+                                    agent_name: a["name"].as_str().unwrap_or("").to_string(),
                                     agent_id: a["agent_id"].as_str().unwrap_or("").to_string(),
                                     total_tokens: a["total_tokens"].as_u64().unwrap_or(0),
                                     cost_usd: a["cost_usd"].as_f64().unwrap_or(0.0),
@@ -1862,7 +1893,7 @@ pub fn spawn_fetch_models(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
             let client = daemon_client();
             if let Ok(resp) = client.get(format!("{base_url}/api/models")).send() {
                 if let Ok(body) = resp.json::<serde_json::Value>() {
-                    let models: Vec<ModelInfo> = body
+                    let models: Vec<ModelInfo> = body["models"]
                         .as_array()
                         .map(|arr| {
                             arr.iter()
@@ -1871,8 +1902,8 @@ pub fn spawn_fetch_models(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                                     provider: m["provider"].as_str().unwrap_or("").to_string(),
                                     tier: m["tier"].as_str().unwrap_or("").to_string(),
                                     context_window: m["context_window"].as_u64().unwrap_or(0),
-                                    cost_input: m["cost_input"].as_f64().unwrap_or(0.0),
-                                    cost_output: m["cost_output"].as_f64().unwrap_or(0.0),
+                                    cost_input: m["input_cost_per_m"].as_f64().unwrap_or(0.0),
+                                    cost_output: m["output_cost_per_m"].as_f64().unwrap_or(0.0),
                                 })
                                 .collect()
                         })
@@ -1881,8 +1912,24 @@ pub fn spawn_fetch_models(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                 }
             }
         }
-        BackendRef::InProcess(_) => {
-            let _ = tx.send(AppEvent::SettingsModelsLoaded(Vec::new()));
+        BackendRef::InProcess(kernel) => {
+            let models: Vec<ModelInfo> = if let Ok(catalog) = kernel.model_catalog.read() {
+                catalog
+                    .list_models()
+                    .iter()
+                    .map(|m| ModelInfo {
+                        id: m.id.clone(),
+                        provider: m.provider.clone(),
+                        tier: m.tier.to_string(),
+                        context_window: m.context_window as u64,
+                        cost_input: m.input_cost_per_m,
+                        cost_output: m.output_cost_per_m,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let _ = tx.send(AppEvent::SettingsModelsLoaded(models));
         }
     });
 }
@@ -1894,7 +1941,7 @@ pub fn spawn_fetch_tools(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
             let client = daemon_client();
             if let Ok(resp) = client.get(format!("{base_url}/api/tools")).send() {
                 if let Ok(body) = resp.json::<serde_json::Value>() {
-                    let tools: Vec<ToolInfo> = body
+                    let tools: Vec<ToolInfo> = body["tools"]
                         .as_array()
                         .map(|arr| {
                             arr.iter()
@@ -2038,20 +2085,26 @@ pub fn spawn_fetch_peers(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
             let client = daemon_client();
             if let Ok(resp) = client.get(format!("{base_url}/api/peers")).send() {
                 if let Ok(body) = resp.json::<serde_json::Value>() {
-                    let peers: Vec<PeerInfo> = body
+                    let peers: Vec<PeerInfo> = body["peers"]
                         .as_array()
                         .map(|arr| {
                             arr.iter()
-                                .map(|p| PeerInfo {
-                                    node_id: p["node_id"].as_str().unwrap_or("").to_string(),
-                                    node_name: p["node_name"].as_str().unwrap_or("").to_string(),
-                                    address: p["address"].as_str().unwrap_or("").to_string(),
-                                    state: p["state"].as_str().unwrap_or("").to_string(),
-                                    agent_count: p["agent_count"].as_u64().unwrap_or(0),
-                                    protocol_version: p["protocol_version"]
-                                        .as_str()
-                                        .unwrap_or("")
-                                        .to_string(),
+                                .map(|p| {
+                                    let agent_count = p["agents"]
+                                        .as_array()
+                                        .map(|a| a.len() as u64)
+                                        .unwrap_or(0);
+                                    PeerInfo {
+                                        node_id: p["node_id"].as_str().unwrap_or("").to_string(),
+                                        node_name: p["node_name"].as_str().unwrap_or("").to_string(),
+                                        address: p["address"].as_str().unwrap_or("").to_string(),
+                                        state: p["state"].as_str().unwrap_or("").to_string(),
+                                        agent_count,
+                                        protocol_version: p["protocol_version"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string(),
+                                    }
                                 })
                                 .collect()
                         })
@@ -2076,7 +2129,7 @@ pub fn spawn_fetch_logs(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                 .send()
             {
                 if let Ok(body) = resp.json::<serde_json::Value>() {
-                    let entries: Vec<LogEntry> = body
+                    let entries: Vec<LogEntry> = body["entries"]
                         .as_array()
                         .map(|arr| {
                             arr.iter()
@@ -2093,7 +2146,7 @@ pub fn spawn_fetch_logs(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                                         level,
                                         action,
                                         detail,
-                                        agent: e["agent"].as_str().unwrap_or("").to_string(),
+                                        agent: e["agent_id"].as_str().unwrap_or("").to_string(),
                                     }
                                 })
                                 .collect()
