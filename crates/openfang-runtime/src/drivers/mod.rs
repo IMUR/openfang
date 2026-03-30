@@ -181,12 +181,7 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             api_key_env: "ZHIPU_API_KEY",
             key_required: true,
         }),
-        "zai" | "z.ai" => Some(ProviderDefaults {
-            base_url: ZAI_BASE_URL,
-            api_key_env: "Z_AI_API_KEY",
-            key_required: true,
-        }),
-        "zai_coding" | "zai-coding" => Some(ProviderDefaults {
+        "zai_coding" | "zai-coding" | "zai" | "z.ai" => Some(ProviderDefaults {
             base_url: ZAI_CODING_BASE_URL,
             api_key_env: "Z_AI_API_KEY",
             key_required: true,
@@ -540,7 +535,6 @@ pub fn known_providers() -> &'static [&'static str] {
         "minimax",
         "zhipu",
         "zhipu_coding",
-        "zai",
         "zai_coding",
         "kimi_coding",
         "qianfan",
@@ -646,7 +640,7 @@ mod tests {
         assert!(providers.contains(&"minimax"));
         assert!(providers.contains(&"zhipu"));
         assert!(providers.contains(&"zhipu_coding"));
-        assert!(providers.contains(&"zai"));
+        assert!(providers.contains(&"zai_coding"));
         assert!(providers.contains(&"kimi_coding"));
         assert!(providers.contains(&"qianfan"));
         assert!(providers.contains(&"volcengine"));

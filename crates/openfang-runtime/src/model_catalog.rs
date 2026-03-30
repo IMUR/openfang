@@ -11,8 +11,8 @@ use openfang_types::model_catalog::{
     MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NVIDIA_NIM_BASE_URL, OLLAMA_BASE_URL,
     OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
     REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL, VLLM_BASE_URL,
-    VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
-    ZAI_CODING_BASE_URL, ZHIPU_BASE_URL, ZHIPU_CODING_BASE_URL,
+    VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_CODING_BASE_URL,
+    ZHIPU_BASE_URL, ZHIPU_CODING_BASE_URL,
 };
 use std::collections::HashMap;
 
@@ -737,17 +737,8 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             model_count: 0,
         },
         ProviderInfo {
-            id: "zai".into(),
-            display_name: "Z.AI".into(),
-            api_key_env: "Z_AI_API_KEY".into(),
-            base_url: ZAI_BASE_URL.into(),
-            key_required: true,
-            auth_status: AuthStatus::Missing,
-            model_count: 0,
-        },
-        ProviderInfo {
             id: "zai_coding".into(),
-            display_name: "Z.AI Coding (Devpack)".into(),
+            display_name: "Z.AI Coding".into(),
             api_key_env: "Z_AI_API_KEY".into(),
             base_url: ZAI_CODING_BASE_URL.into(),
             key_required: true,
@@ -3216,37 +3207,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec!["codegeex".into()],
         },
         // ══════════════════════════════════════════════════════════════
-        // Z.AI Coding Devpack (api.z.ai/api/coding/paas/v4)
-        // Models available via the GLM Coding Plan subscription.
+        // Z.AI Coding (api.z.ai/api/coding/paas/v4)
+        // Models available via the GLM Coding subscription plan.
         // ══════════════════════════════════════════════════════════════
-        ModelCatalogEntry {
-            id: "glm-5.1".into(),
-            display_name: "GLM-5.1".into(),
-            provider: "zai_coding".into(),
-            tier: ModelTier::Frontier,
-            context_window: 204_800,
-            max_output_tokens: 131_072,
-            input_cost_per_m: 0.00,
-            output_cost_per_m: 0.00,
-            supports_tools: true,
-            supports_vision: false,
-            supports_streaming: true,
-            aliases: vec![],
-        },
-        ModelCatalogEntry {
-            id: "glm-5".into(),
-            display_name: "GLM-5 (Devpack)".into(),
-            provider: "zai_coding".into(),
-            tier: ModelTier::Frontier,
-            context_window: 204_800,
-            max_output_tokens: 131_072,
-            input_cost_per_m: 0.00,
-            output_cost_per_m: 0.00,
-            supports_tools: true,
-            supports_vision: false,
-            supports_streaming: true,
-            aliases: vec![],
-        },
         ModelCatalogEntry {
             id: "glm-5-turbo".into(),
             display_name: "GLM-5 Turbo".into(),
@@ -3262,8 +3225,22 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
         ModelCatalogEntry {
-            id: "glm-4.7".into(),
-            display_name: "GLM-4.7 (Devpack)".into(),
+            id: "glm-5.1".into(),
+            display_name: "GLM-5.1".into(),
+            provider: "zai_coding".into(),
+            tier: ModelTier::Frontier,
+            context_window: 204_800,
+            max_output_tokens: 131_072,
+            input_cost_per_m: 0.00,
+            output_cost_per_m: 0.00,
+            supports_tools: true,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec![],
+        },
+        ModelCatalogEntry {
+            id: "glm-4.7-flashx".into(),
+            display_name: "GLM-4.7 FlashX".into(),
             provider: "zai_coding".into(),
             tier: ModelTier::Smart,
             context_window: 204_800,
