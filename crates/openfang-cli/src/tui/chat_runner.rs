@@ -270,13 +270,17 @@ impl StandaloneChat {
                 self.chat.push_message(
                     Role::System,
                     [
-                        "/help         \u{2014} show this help",
-                        "/model        \u{2014} open model picker (Ctrl+M)",
-                        "/model <name> \u{2014} switch to model directly",
-                        "/status       \u{2014} connection & agent info",
-                        "/clear        \u{2014} clear chat history",
-                        "/kill         \u{2014} kill the current agent & quit",
-                        "/exit         \u{2014} end chat session",
+                        "/help              \u{2014} show this help",
+                        "/model             \u{2014} open model picker (Ctrl+M)",
+                        "/model <name>      \u{2014} switch to model directly",
+                        "/status            \u{2014} connection & agent info",
+                        "/agents            \u{2014} list running agents",
+                        "/approvals         \u{2014} list pending tool approvals",
+                        "/approve <id>      \u{2014} approve a pending request",
+                        "/reject <id>       \u{2014} reject a pending request",
+                        "/clear             \u{2014} clear chat history",
+                        "/kill              \u{2014} kill the current agent & quit",
+                        "/exit              \u{2014} end chat session",
                     ]
                     .join("\n"),
                 );
@@ -363,6 +367,181 @@ impl StandaloneChat {
                         self.chat
                             .push_message(Role::System, "No backend connected.".to_string());
                     }
+                }
+            }
+            "/agents" => {
+                let mut lines = Vec::new();
+                match &self.backend {
+                    Backend::Daemon { base_url } => {
+                        let client = crate::daemon_client();
+                        if let Ok(resp) = client.get(format!("{base_url}/api/agents")).send() {
+                            if let Ok(body) = resp.json::<serde_json::Value>() {
+                                if let Some(arr) = body.as_array() {
+                                    for a in arr {
+                                        lines.push(format!(
+                                            "{} [{}] {}",
+                                            a["name"].as_str().unwrap_or("?"),
+                                            a["state"].as_str().unwrap_or("?"),
+                                            a["model_name"].as_str().unwrap_or("?"),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Backend::InProcess { kernel } => {
+                        for e in kernel.registry.list() {
+                            lines.push(format!(
+                                "{} [{:?}] {}/{}",
+                                e.name, e.state, e.manifest.model.provider, e.manifest.model.model,
+                            ));
+                        }
+                    }
+                    Backend::None => {}
+                }
+                let msg = if lines.is_empty() {
+                    "No agents running.".to_string()
+                } else {
+                    lines.join("\n")
+                };
+                self.chat.push_message(Role::System, msg);
+            }
+            "/approvals" => {
+                let mut lines = Vec::new();
+                match &self.backend {
+                    Backend::Daemon { base_url } => {
+                        let client = crate::daemon_client();
+                        if let Ok(resp) = client.get(format!("{base_url}/api/approvals")).send() {
+                            if let Ok(body) = resp.json::<serde_json::Value>() {
+                                if let Some(arr) = body["approvals"].as_array() {
+                                    for a in arr {
+                                        if a["status"].as_str() == Some("pending") {
+                                            lines.push(format!(
+                                                "[{}] {} \u{2014} {} ({})",
+                                                &a["id"].as_str().unwrap_or("?")[..8.min(
+                                                    a["id"].as_str().unwrap_or("?").len()
+                                                )],
+                                                a["agent_name"].as_str().unwrap_or("?"),
+                                                a["tool_name"].as_str().unwrap_or("?"),
+                                                a["description"].as_str().unwrap_or(""),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Backend::InProcess { kernel } => {
+                        for a in kernel.approval_manager.list_pending() {
+                            lines.push(format!(
+                                "[{}] {} \u{2014} {}",
+                                &a.id.to_string()[..8],
+                                a.tool_name,
+                                a.description,
+                            ));
+                        }
+                    }
+                    Backend::None => {}
+                }
+                let msg = if lines.is_empty() {
+                    "No pending approvals.".to_string()
+                } else {
+                    format!("Pending approvals ({}):\n{}", lines.len(), lines.join("\n"))
+                };
+                self.chat.push_message(Role::System, msg);
+            }
+            "/approve" => {
+                let id = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                if id.is_empty() {
+                    self.chat
+                        .push_message(Role::System, "Usage: /approve <id-prefix>".to_string());
+                } else {
+                    let result = match &self.backend {
+                        Backend::Daemon { base_url } => {
+                            let full_id = super::resolve_approval_id_daemon(base_url, id);
+                            match full_id {
+                                Some(fid) => {
+                                    let client = crate::daemon_client();
+                                    client
+                                        .post(format!("{base_url}/api/approvals/{fid}/approve"))
+                                        .send()
+                                        .map(|r| {
+                                            if r.status().is_success() {
+                                                format!("Approved: {fid}")
+                                            } else {
+                                                format!("Failed to approve {fid}")
+                                            }
+                                        })
+                                        .unwrap_or_else(|e| format!("Error: {e}"))
+                                }
+                                None => format!("No pending approval matching '{id}'"),
+                            }
+                        }
+                        Backend::InProcess { kernel } => {
+                            match super::resolve_approval_id_kernel(kernel, id) {
+                                Some(uuid) => {
+                                    match kernel.approval_manager.resolve(
+                                        uuid,
+                                        openfang_types::approval::ApprovalDecision::Approved,
+                                        Some("tui".to_string()),
+                                    ) {
+                                        Ok(_) => format!("Approved: {uuid}"),
+                                        Err(e) => format!("Error: {e}"),
+                                    }
+                                }
+                                None => format!("No pending approval matching '{id}'"),
+                            }
+                        }
+                        Backend::None => "No backend connected.".to_string(),
+                    };
+                    self.chat.push_message(Role::System, result);
+                }
+            }
+            "/reject" => {
+                let id = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                if id.is_empty() {
+                    self.chat
+                        .push_message(Role::System, "Usage: /reject <id-prefix>".to_string());
+                } else {
+                    let result = match &self.backend {
+                        Backend::Daemon { base_url } => {
+                            let full_id = super::resolve_approval_id_daemon(base_url, id);
+                            match full_id {
+                                Some(fid) => {
+                                    let client = crate::daemon_client();
+                                    client
+                                        .post(format!("{base_url}/api/approvals/{fid}/reject"))
+                                        .send()
+                                        .map(|r| {
+                                            if r.status().is_success() {
+                                                format!("Rejected: {fid}")
+                                            } else {
+                                                format!("Failed to reject {fid}")
+                                            }
+                                        })
+                                        .unwrap_or_else(|e| format!("Error: {e}"))
+                                }
+                                None => format!("No pending approval matching '{id}'"),
+                            }
+                        }
+                        Backend::InProcess { kernel } => {
+                            match super::resolve_approval_id_kernel(kernel, id) {
+                                Some(uuid) => {
+                                    match kernel.approval_manager.resolve(
+                                        uuid,
+                                        openfang_types::approval::ApprovalDecision::Denied,
+                                        Some("tui".to_string()),
+                                    ) {
+                                        Ok(_) => format!("Rejected: {uuid}"),
+                                        Err(e) => format!("Error: {e}"),
+                                    }
+                                }
+                                None => format!("No pending approval matching '{id}'"),
+                            }
+                        }
+                        Backend::None => "No backend connected.".to_string(),
+                    };
+                    self.chat.push_message(Role::System, result);
                 }
             }
             _ => {
