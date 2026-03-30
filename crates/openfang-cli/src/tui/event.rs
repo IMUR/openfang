@@ -139,10 +139,16 @@ pub enum AppEvent {
     UsageByAgentLoaded(Vec<AgentUsage>),
     /// Settings providers loaded.
     SettingsProvidersLoaded(Vec<ProviderInfo>),
+    /// Settings providers fetch failed.
+    SettingsProvidersFailed(String),
     /// Settings models loaded.
     SettingsModelsLoaded(Vec<ModelInfo>),
+    /// Settings models fetch failed.
+    SettingsModelsFailed(String),
     /// Settings tools loaded.
     SettingsToolsLoaded(Vec<ToolInfo>),
+    /// Settings tools fetch failed.
+    SettingsToolsFailed(String),
     /// Provider key saved.
     ProviderKeySaved(String),
     /// Provider key deleted.
@@ -1840,43 +1846,57 @@ pub fn spawn_fetch_providers(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || match backend {
         BackendRef::Daemon(base_url) => {
             let client = daemon_client();
-            if let Ok(resp) = client.get(format!("{base_url}/api/providers")).send() {
-                if let Ok(body) = resp.json::<serde_json::Value>() {
-                    // API returns { "providers": [...], "total": N }
-                    let arr = body["providers"].as_array();
-                    let providers: Vec<ProviderInfo> = arr
-                        .map(|arr| {
-                            arr.iter()
-                                .map(|p| {
-                                    let auth = p["auth_status"].as_str().unwrap_or("missing");
-                                    let key_required = p["key_required"].as_bool().unwrap_or(true);
-                                    let configured = auth == "configured" || auth == "not_required";
-                                    let is_local =
-                                        p["is_local"].as_bool().unwrap_or(false) || !key_required;
-                                    ProviderInfo {
-                                        name: p["id"].as_str().unwrap_or("").to_string(),
-                                        configured,
-                                        env_var: p["api_key_env"]
-                                            .as_str()
-                                            .unwrap_or("")
-                                            .to_string(),
-                                        is_local,
-                                        reachable: if is_local {
-                                            p["reachable"].as_bool()
-                                        } else {
-                                            None
-                                        },
-                                        latency_ms: if is_local {
-                                            p["latency_ms"].as_u64()
-                                        } else {
-                                            None
-                                        },
-                                    }
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let _ = tx.send(AppEvent::SettingsProvidersLoaded(providers));
+            match client.get(format!("{base_url}/api/providers")).send() {
+                Ok(resp) => match resp.json::<serde_json::Value>() {
+                    Ok(body) => {
+                        let arr = body["providers"].as_array();
+                        let providers: Vec<ProviderInfo> = arr
+                            .map(|arr| {
+                                arr.iter()
+                                    .map(|p| {
+                                        let auth =
+                                            p["auth_status"].as_str().unwrap_or("missing");
+                                        let key_required =
+                                            p["key_required"].as_bool().unwrap_or(true);
+                                        let configured =
+                                            auth == "configured" || auth == "not_required";
+                                        let is_local = p["is_local"].as_bool().unwrap_or(false)
+                                            || !key_required;
+                                        ProviderInfo {
+                                            name: p["id"].as_str().unwrap_or("").to_string(),
+                                            configured,
+                                            env_var: p["api_key_env"]
+                                                .as_str()
+                                                .unwrap_or("")
+                                                .to_string(),
+                                            is_local,
+                                            reachable: if is_local {
+                                                p["reachable"].as_bool()
+                                            } else {
+                                                None
+                                            },
+                                            latency_ms: if is_local {
+                                                p["latency_ms"].as_u64()
+                                            } else {
+                                                None
+                                            },
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let _ = tx.send(AppEvent::SettingsProvidersLoaded(providers));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::SettingsProvidersFailed(format!(
+                            "Invalid response: {e}"
+                        )));
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(AppEvent::SettingsProvidersFailed(format!(
+                        "Connection failed: {e}"
+                    )));
                 }
             }
         }
@@ -1891,24 +1911,45 @@ pub fn spawn_fetch_models(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || match backend {
         BackendRef::Daemon(base_url) => {
             let client = daemon_client();
-            if let Ok(resp) = client.get(format!("{base_url}/api/models")).send() {
-                if let Ok(body) = resp.json::<serde_json::Value>() {
-                    let models: Vec<ModelInfo> = body["models"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .map(|m| ModelInfo {
-                                    id: m["id"].as_str().unwrap_or("").to_string(),
-                                    provider: m["provider"].as_str().unwrap_or("").to_string(),
-                                    tier: m["tier"].as_str().unwrap_or("").to_string(),
-                                    context_window: m["context_window"].as_u64().unwrap_or(0),
-                                    cost_input: m["input_cost_per_m"].as_f64().unwrap_or(0.0),
-                                    cost_output: m["output_cost_per_m"].as_f64().unwrap_or(0.0),
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let _ = tx.send(AppEvent::SettingsModelsLoaded(models));
+            match client.get(format!("{base_url}/api/models")).send() {
+                Ok(resp) => match resp.json::<serde_json::Value>() {
+                    Ok(body) => {
+                        let models: Vec<ModelInfo> = body["models"]
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .map(|m| ModelInfo {
+                                        id: m["id"].as_str().unwrap_or("").to_string(),
+                                        provider: m["provider"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        tier: m["tier"].as_str().unwrap_or("").to_string(),
+                                        context_window: m["context_window"]
+                                            .as_u64()
+                                            .unwrap_or(0),
+                                        cost_input: m["input_cost_per_m"]
+                                            .as_f64()
+                                            .unwrap_or(0.0),
+                                        cost_output: m["output_cost_per_m"]
+                                            .as_f64()
+                                            .unwrap_or(0.0),
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let _ = tx.send(AppEvent::SettingsModelsLoaded(models));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::SettingsModelsFailed(format!(
+                            "Invalid response: {e}"
+                        )));
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(AppEvent::SettingsModelsFailed(format!(
+                        "Connection failed: {e}"
+                    )));
                 }
             }
         }
@@ -1939,23 +1980,35 @@ pub fn spawn_fetch_tools(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
     std::thread::spawn(move || match backend {
         BackendRef::Daemon(base_url) => {
             let client = daemon_client();
-            if let Ok(resp) = client.get(format!("{base_url}/api/tools")).send() {
-                if let Ok(body) = resp.json::<serde_json::Value>() {
-                    let tools: Vec<ToolInfo> = body["tools"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .map(|t| ToolInfo {
-                                    name: t["name"].as_str().unwrap_or("").to_string(),
-                                    description: t["description"]
-                                        .as_str()
-                                        .unwrap_or("")
-                                        .to_string(),
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let _ = tx.send(AppEvent::SettingsToolsLoaded(tools));
+            match client.get(format!("{base_url}/api/tools")).send() {
+                Ok(resp) => match resp.json::<serde_json::Value>() {
+                    Ok(body) => {
+                        let tools: Vec<ToolInfo> = body["tools"]
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .map(|t| ToolInfo {
+                                        name: t["name"].as_str().unwrap_or("").to_string(),
+                                        description: t["description"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string(),
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let _ = tx.send(AppEvent::SettingsToolsLoaded(tools));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::SettingsToolsFailed(format!(
+                            "Invalid response: {e}"
+                        )));
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(AppEvent::SettingsToolsFailed(format!(
+                        "Connection failed: {e}"
+                    )));
                 }
             }
         }

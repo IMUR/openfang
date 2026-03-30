@@ -475,21 +475,30 @@ impl App {
                 if !self.settings.providers.is_empty() {
                     self.settings.provider_list.select(Some(0));
                 }
-                self.settings.loading = false;
+                self.settings.providers_state = settings::LoadState::Loaded;
+            }
+            AppEvent::SettingsProvidersFailed(msg) => {
+                self.settings.providers_state = settings::LoadState::Error(msg);
             }
             AppEvent::SettingsModelsLoaded(models) => {
                 self.settings.models = models;
                 if !self.settings.models.is_empty() {
                     self.settings.model_list.select(Some(0));
                 }
-                self.settings.loading = false;
+                self.settings.models_state = settings::LoadState::Loaded;
+            }
+            AppEvent::SettingsModelsFailed(msg) => {
+                self.settings.models_state = settings::LoadState::Error(msg);
             }
             AppEvent::SettingsToolsLoaded(tools) => {
                 self.settings.tools = tools;
                 if !self.settings.tools.is_empty() {
                     self.settings.tool_list.select(Some(0));
                 }
-                self.settings.loading = false;
+                self.settings.tools_state = settings::LoadState::Loaded;
+            }
+            AppEvent::SettingsToolsFailed(msg) => {
+                self.settings.tools_state = settings::LoadState::Error(msg);
             }
             AppEvent::ProviderKeySaved(name) => {
                 self.settings.status_msg = format!("Key saved for {name}");
@@ -1095,20 +1104,21 @@ impl App {
 
     fn refresh_settings_providers(&mut self) {
         if let Some(backend) = self.backend.to_ref() {
-            self.settings.loading = true;
+            self.settings.providers_state = settings::LoadState::Loading;
             event::spawn_fetch_providers(backend, self.event_tx.clone());
         }
     }
 
     fn refresh_settings_models(&mut self) {
         if let Some(backend) = self.backend.to_ref() {
-            self.settings.loading = true;
+            self.settings.models_state = settings::LoadState::Loading;
             event::spawn_fetch_models(backend, self.event_tx.clone());
         }
     }
 
     fn refresh_settings_tools(&mut self) {
         if let Some(backend) = self.backend.to_ref() {
+            self.settings.tools_state = settings::LoadState::Loading;
             event::spawn_fetch_tools(backend, self.event_tx.clone());
         }
     }

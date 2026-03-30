@@ -56,6 +56,32 @@ pub enum SettingsSub {
     Tools,
 }
 
+pub enum LoadState {
+    Idle,
+    Loading,
+    Loaded,
+    Error(String),
+}
+
+impl Default for LoadState {
+    fn default() -> Self {
+        LoadState::Idle
+    }
+}
+
+impl LoadState {
+    pub fn is_loading(&self) -> bool {
+        matches!(self, LoadState::Loading)
+    }
+
+    pub fn error_msg(&self) -> Option<&str> {
+        match self {
+            LoadState::Error(msg) => Some(msg),
+            _ => None,
+        }
+    }
+}
+
 pub struct SettingsState {
     pub sub: SettingsSub,
     pub providers: Vec<ProviderInfo>,
@@ -68,7 +94,9 @@ pub struct SettingsState {
     pub input_mode: bool,
     pub editing_provider: Option<String>,
     pub test_result: Option<TestResult>,
-    pub loading: bool,
+    pub providers_state: LoadState,
+    pub models_state: LoadState,
+    pub tools_state: LoadState,
     pub tick: usize,
     pub status_msg: String,
 }
@@ -97,7 +125,9 @@ impl SettingsState {
             input_mode: false,
             editing_provider: None,
             test_result: None,
-            loading: false,
+            providers_state: LoadState::default(),
+            models_state: LoadState::default(),
+            tools_state: LoadState::default(),
             tick: 0,
             status_msg: String::new(),
         }
@@ -357,13 +387,27 @@ fn draw_providers(f: &mut Frame, area: Rect, state: &mut SettingsState) {
         chunks[0],
     );
 
-    if state.loading && state.providers.is_empty() {
+    if state.providers_state.is_loading() && state.providers.is_empty() {
         let spinner = theme::SPINNER_FRAMES[state.tick % theme::SPINNER_FRAMES.len()];
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(format!("  {spinner} "), Style::default().fg(theme::CYAN)),
                 Span::styled("Loading providers\u{2026}", theme::dim_style()),
             ])),
+            chunks[1],
+        );
+    } else if let Some(msg) = state.providers_state.error_msg() {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled("  \u{2718} ", Style::default().fg(theme::RED)),
+                    Span::styled(msg.to_string(), Style::default().fg(theme::RED)),
+                ]),
+                Line::from(vec![Span::styled(
+                    "  Press [r] to retry",
+                    theme::dim_style(),
+                )]),
+            ]),
             chunks[1],
         );
     } else if state.providers.is_empty() {
@@ -496,13 +540,27 @@ fn draw_models(f: &mut Frame, area: Rect, state: &mut SettingsState) {
         chunks[0],
     );
 
-    if state.loading && state.models.is_empty() {
+    if state.models_state.is_loading() && state.models.is_empty() {
         let spinner = theme::SPINNER_FRAMES[state.tick % theme::SPINNER_FRAMES.len()];
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(format!("  {spinner} "), Style::default().fg(theme::CYAN)),
                 Span::styled("Loading models\u{2026}", theme::dim_style()),
             ])),
+            chunks[1],
+        );
+    } else if let Some(msg) = state.models_state.error_msg() {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled("  \u{2718} ", Style::default().fg(theme::RED)),
+                    Span::styled(msg.to_string(), Style::default().fg(theme::RED)),
+                ]),
+                Line::from(vec![Span::styled(
+                    "  Press [r] to retry",
+                    theme::dim_style(),
+                )]),
+            ]),
             chunks[1],
         );
     } else if state.models.is_empty() {
@@ -570,7 +628,30 @@ fn draw_tools(f: &mut Frame, area: Rect, state: &mut SettingsState) {
         chunks[0],
     );
 
-    if state.tools.is_empty() {
+    if state.tools_state.is_loading() && state.tools.is_empty() {
+        let spinner = theme::SPINNER_FRAMES[state.tick % theme::SPINNER_FRAMES.len()];
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("  {spinner} "), Style::default().fg(theme::CYAN)),
+                Span::styled("Loading tools\u{2026}", theme::dim_style()),
+            ])),
+            chunks[1],
+        );
+    } else if let Some(msg) = state.tools_state.error_msg() {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled("  \u{2718} ", Style::default().fg(theme::RED)),
+                    Span::styled(msg.to_string(), Style::default().fg(theme::RED)),
+                ]),
+                Line::from(vec![Span::styled(
+                    "  Press [r] to retry",
+                    theme::dim_style(),
+                )]),
+            ]),
+            chunks[1],
+        );
+    } else if state.tools.is_empty() {
         f.render_widget(
             Paragraph::new(Span::styled("  No tools available.", theme::dim_style())),
             chunks[1],
