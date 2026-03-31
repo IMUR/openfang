@@ -66,6 +66,7 @@ Reality-checked cluster topology. Verified against live `ss -tlnp` and `/etc/cad
 |------|------|-------|---------|------|--------|
 | `4444` | `0.0.0.0` | `44**` | OpenClaw gateway | `openclaw-gateway.service` | ✅ Live |
 | `4446` | `127.0.0.1` | `44**` | OpenClaw internal | `openclaw-gateway.service` | ✅ Live |
+| `4477` | `0.0.0.0` | `44**` | OpenFang agent runtime | `openfang` | ✅ Live |
 | `5511` | `127.0.0.1` | `66**` | XTDB v2.1.0 (pgwire) | `xtdb.service` | ✅ Live |
 | `6379` | `127.0.0.1` | `66**` | Redis | `redis-server` | ✅ Live |
 | `7700` | `0.0.0.0` | `77**` | VICE voice pipeline | `vice.service` | ✅ Live |
@@ -163,6 +164,7 @@ All domains served via Caddy on crtr ports 80/443 with automatic HTTPS.
 | `ssh.ism.la` | `localhost:8086` | Termix (VPN only) |
 | `kvm.ism.la` | mixed | KVM UI + MediaMTX (Tailscale only) |
 | `ace.ism.la` | `100.64.0.7:4444` | OpenClaw (prtr via Tailscale) |
+| `guy.ism.la` | `100.64.0.7:4477` | OpenFang agent runtime (prtr via Tailscale) |
 | `vox.ism.la` | `100.64.0.7:5544` + shims | Clawdio voice UI |
 | `tts.ism.la` | `100.64.0.7:7745` | TTS shim (prtr) |
 | `btr.ism.la` | `192.168.254.123:80` | Barter |

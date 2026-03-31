@@ -6,7 +6,7 @@
 home_dir = "~/.openfang"             # OpenFang home directory
 data_dir = "~/.openfang/data"        # SQLite databases and data files
 log_level = "info"                   # trace | debug | info | warn | error
-api_listen = "127.0.0.1:50051"      # HTTP/WS API bind address
+api_listen = "127.0.0.1:4200"        # HTTP/WS API bind address (binary default; 50051 was illustrative)
 network_enabled = false              # Enable OFP peer-to-peer network
 api_key = ""                         # API Bearer token (empty = unauthenticated)
 mode = "default"                     # stable | default | dev
