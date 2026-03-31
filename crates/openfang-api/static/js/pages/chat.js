@@ -895,6 +895,68 @@ function chatPage() {
           break;
 
         case 'pong': break;
+
+        case 'approval_pending': {
+          // Render an inline approval card in the conversation thread.
+          var approvalMsg = {
+            id: ++msgId,
+            role: 'system',
+            text: '',
+            meta: '',
+            tools: [],
+            ts: Date.now(),
+            approval: {
+              id: data.id,
+              tool: data.tool,
+              action_summary: data.action_summary || '',
+              risk_level: data.risk_level || 'Low',
+              timeout_secs: data.timeout_secs || 60,
+              status: 'pending',
+              _countdown: '',
+              _timerId: null,
+            }
+          };
+          // Countdown timer — updates every second until resolved or expired.
+          var self = this;
+          var expiresAt = Date.now() + (data.timeout_secs || 60) * 1000;
+          var timerId = setInterval(function() {
+            var found = self.messages.find(function(m) { return m.approval && m.approval.id === data.id; });
+            if (!found || found.approval.status !== 'pending') {
+              clearInterval(timerId);
+              return;
+            }
+            var remaining = Math.max(0, Math.round((expiresAt - Date.now()) / 1000));
+            found.approval._countdown = 'Expires in ' + remaining + 's';
+            if (remaining === 0) {
+              found.approval.status = 'expired';
+              clearInterval(timerId);
+            }
+          }, 1000);
+          approvalMsg.approval._timerId = timerId;
+          this.messages.push(approvalMsg);
+          this.scrollToBottom();
+          break;
+        }
+
+        case 'approval_resolved': {
+          var resolvedMsg = this.messages.find(function(m) { return m.approval && m.approval.id === data.id; });
+          if (resolvedMsg) {
+            if (resolvedMsg.approval._timerId) clearInterval(resolvedMsg.approval._timerId);
+            resolvedMsg.approval.status = data.decision || 'approved';
+            resolvedMsg.approval._countdown = '';
+          }
+          break;
+        }
+
+        case 'approval_expired': {
+          var expiredMsg = this.messages.find(function(m) { return m.approval && m.approval.id === data.id; });
+          if (expiredMsg) {
+            if (expiredMsg.approval._timerId) clearInterval(expiredMsg.approval._timerId);
+            expiredMsg.approval.status = 'expired';
+            expiredMsg.approval._countdown = '';
+          }
+          break;
+        }
       }
     },
 
@@ -1254,6 +1316,24 @@ function chatPage() {
       var q = this.searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       var regex = new RegExp('(' + q + ')', 'gi');
       return html.replace(regex, '<mark style="background:var(--warning);color:var(--bg);border-radius:2px;padding:0 2px">$1</mark>');
+    },
+
+    // Approve an inline approval card by ID.
+    async approveInline(approvalId) {
+      try {
+        await OpenFangAPI.post('/api/approvals/' + approvalId + '/approve', {});
+      } catch(e) {
+        OpenFangToast.error('Approve failed: ' + (e.message || 'unknown error'));
+      }
+    },
+
+    // Reject an inline approval card by ID.
+    async rejectInline(approvalId) {
+      try {
+        await OpenFangAPI.post('/api/approvals/' + approvalId + '/reject', {});
+      } catch(e) {
+        OpenFangToast.error('Reject failed: ' + (e.message || 'unknown error'));
+      }
     },
 
     renderMarkdown: renderMarkdown,

@@ -689,6 +689,32 @@
                             </div>
                           </div>
                         </template>
+                        <!-- Inline approval card -->
+                        <template x-if="msg.approval">
+                          <div class="approval-card" :class="'approval-' + msg.approval.status" :data-approval-id="msg.approval.id">
+                            <div class="approval-card-header">
+                              <span class="approval-icon" x-text="msg.approval.risk_level === 'Critical' ? '&#9762;&#65039;' : msg.approval.risk_level === 'High' ? '&#128680;' : '&#9888;&#65039;'"></span>
+                              <span class="approval-title">Tool Approval Required</span>
+                              <span class="approval-risk" x-text="msg.approval.risk_level"></span>
+                            </div>
+                            <div class="approval-card-detail">
+                              <span class="approval-label">Tool:</span>
+                              <code x-text="msg.approval.tool"></code>
+                            </div>
+                            <div class="approval-card-detail" x-show="msg.approval.action_summary">
+                              <span class="approval-label">Action:</span>
+                              <span x-text="msg.approval.action_summary"></span>
+                            </div>
+                            <div class="approval-card-actions" x-show="msg.approval.status === 'pending'">
+                              <button class="approval-btn approval-btn-allow" @click="approveInline(msg.approval.id)">Allow</button>
+                              <button class="approval-btn approval-btn-deny" @click="rejectInline(msg.approval.id)">Deny</button>
+                              <span class="approval-countdown" x-text="msg.approval._countdown"></span>
+                            </div>
+                            <div class="approval-card-resolved" x-show="msg.approval.status !== 'pending'">
+                              <span x-text="msg.approval.status === 'approved' ? '&#10003; Approved' : msg.approval.status === 'denied' ? '&#10007; Denied' : '&#8987; Expired'"></span>
+                            </div>
+                          </div>
+                        </template>
                         <!-- Timestamp + meta row -->
                         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                           <div class="message-time" x-text="formatTime(msg.ts)" x-show="msg.ts && !msg.thinking"></div>

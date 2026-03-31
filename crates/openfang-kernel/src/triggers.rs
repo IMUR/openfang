@@ -450,6 +450,20 @@ fn describe_event(event: &Event) -> String {
                 )
             }
         },
+        EventPayload::Approval(ae) => {
+            use openfang_types::event::ApprovalEvent;
+            match ae {
+                ApprovalEvent::Pending { tool_name, agent_id, .. } => {
+                    format!("Approval pending: tool '{tool_name}' for agent {agent_id}")
+                }
+                ApprovalEvent::Resolved { id, decision, .. } => {
+                    format!("Approval {id} resolved: {decision:?}")
+                }
+                ApprovalEvent::Expired { id, .. } => {
+                    format!("Approval {id} expired")
+                }
+            }
+        }
         EventPayload::Custom(data) => {
             format!("Custom event ({} bytes)", data.len())
         }

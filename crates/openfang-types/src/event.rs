@@ -3,6 +3,7 @@
 //! All inter-agent and system communication flows through events.
 
 use crate::agent::AgentId;
+use crate::approval::{ApprovalDecision, RiskLevel};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -82,8 +83,36 @@ pub enum EventPayload {
     Network(NetworkEvent),
     /// System event (health, resources).
     System(SystemEvent),
+    /// Approval lifecycle event (pending, resolved, expired).
+    Approval(ApprovalEvent),
     /// User-defined payload.
     Custom(Vec<u8>),
+}
+
+/// Approval lifecycle event emitted when an agent tool requires human approval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event")]
+pub enum ApprovalEvent {
+    /// A new approval request has been enqueued and is awaiting a decision.
+    Pending {
+        id: Uuid,
+        agent_id: String,
+        tool_name: String,
+        action_summary: String,
+        risk_level: RiskLevel,
+        timeout_secs: u64,
+    },
+    /// An approval request was explicitly approved or denied.
+    Resolved {
+        id: Uuid,
+        agent_id: String,
+        decision: ApprovalDecision,
+    },
+    /// An approval request timed out before a decision was made.
+    Expired {
+        id: Uuid,
+        agent_id: String,
+    },
 }
 
 /// A message between agents or from user to agent.

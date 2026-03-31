@@ -5,7 +5,9 @@ use dashmap::DashMap;
 use openfang_types::approval::{
     ApprovalDecision, ApprovalPolicy, ApprovalRequest, ApprovalResponse, RiskLevel,
 };
+use openfang_types::event::ApprovalEvent;
 use std::collections::VecDeque;
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -14,11 +16,16 @@ const MAX_PENDING_PER_AGENT: usize = 5;
 /// Max recent approval records to retain for history and UI visibility.
 const MAX_RECENT_APPROVALS: usize = 100;
 
+/// Broadcast channel capacity for approval events.
+const APPROVAL_BROADCAST_CAP: usize = 64;
+
 /// Manages approval requests with oneshot channels for blocking resolution.
 pub struct ApprovalManager {
     pending: DashMap<Uuid, PendingRequest>,
     recent: std::sync::Mutex<VecDeque<ApprovalRecord>>,
     policy: std::sync::RwLock<ApprovalPolicy>,
+    /// Broadcast channel for real-time approval lifecycle events (pending / resolved / expired).
+    event_tx: broadcast::Sender<ApprovalEvent>,
 }
 
 struct PendingRequest {
@@ -36,11 +43,22 @@ pub struct ApprovalRecord {
 
 impl ApprovalManager {
     pub fn new(policy: ApprovalPolicy) -> Self {
+        let (event_tx, _) = broadcast::channel(APPROVAL_BROADCAST_CAP);
         Self {
             pending: DashMap::new(),
             recent: std::sync::Mutex::new(VecDeque::new()),
             policy: std::sync::RwLock::new(policy),
+            event_tx,
         }
+    }
+
+    /// Subscribe to real-time approval lifecycle events.
+    ///
+    /// Returns a [`broadcast::Receiver`] that receives [`ApprovalEvent`]s as they
+    /// are enqueued, resolved, or expired. Subscribers should handle
+    /// [`broadcast::error::RecvError::Lagged`] gracefully.
+    pub fn subscribe(&self) -> broadcast::Receiver<ApprovalEvent> {
+        self.event_tx.subscribe()
     }
 
     /// Check if a tool requires approval based on current policy.
@@ -66,6 +84,16 @@ impl ApprovalManager {
         let id = req.id;
         let req_for_timeout = req.clone();
 
+        // Build the pending event before moving req into the DashMap entry.
+        let pending_event = ApprovalEvent::Pending {
+            id,
+            agent_id: req.agent_id.clone(),
+            tool_name: req.tool_name.clone(),
+            action_summary: req.action_summary.clone(),
+            risk_level: req.risk_level,
+            timeout_secs: req.timeout_secs,
+        };
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending.insert(
             id,
@@ -74,6 +102,9 @@ impl ApprovalManager {
                 sender: tx,
             },
         );
+
+        // Notify subscribers that a new approval is pending.
+        let _ = self.event_tx.send(pending_event);
 
         info!(request_id = %id, "Approval request submitted, waiting for resolution");
 
@@ -88,7 +119,10 @@ impl ApprovalManager {
                     .remove(&id)
                     .map(|(_, pending)| pending.request)
                     .unwrap_or(req_for_timeout);
+                let agent_id = request.agent_id.clone();
                 self.push_recent(request, ApprovalDecision::TimedOut, None, Utc::now());
+                // Notify subscribers that the approval expired.
+                let _ = self.event_tx.send(ApprovalEvent::Expired { id, agent_id });
                 warn!(request_id = %id, "Approval request timed out");
                 ApprovalDecision::TimedOut
             }
@@ -118,6 +152,12 @@ impl ApprovalManager {
                 );
                 // Send decision to waiting agent (ignore error if receiver dropped)
                 let _ = pending.sender.send(decision);
+                // Notify subscribers of the resolution.
+                let _ = self.event_tx.send(ApprovalEvent::Resolved {
+                    id: request_id,
+                    agent_id: pending.request.agent_id.clone(),
+                    decision,
+                });
                 info!(request_id = %request_id, ?decision, "Approval request resolved");
                 Ok(response)
             }

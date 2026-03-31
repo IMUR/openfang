@@ -11,6 +11,9 @@
 //! Server → Client: `{"type":"agents_updated","agents":[...]}`
 //! Server → Client: `{"type":"silent_complete"}` (agent chose NO_REPLY)
 //! Server → Client: `{"type":"canvas","canvas_id":"...","html":"...","title":"..."}`
+//! Server → Client: `{"type":"approval_pending","id":"...","tool":"...","action_summary":"...","risk_level":"...","timeout_secs":N}`
+//! Server → Client: `{"type":"approval_resolved","id":"...","decision":"approved|denied"}`
+//! Server → Client: `{"type":"approval_expired","id":"..."}`
 
 use crate::routes::AppState;
 use axum::extract::ws::{Message, WebSocket};
@@ -291,6 +294,63 @@ async fn handle_agent_ws(
         }
     });
 
+    // Spawn background task: forward approval lifecycle events for this agent
+    let sender_approvals = Arc::clone(&sender);
+    let mut approval_rx = state.kernel.approval_manager.subscribe();
+    let agent_id_str_for_approvals = id_str.clone();
+    let approval_handle = tokio::spawn(async move {
+        let agent_id_str = agent_id_str_for_approvals;
+        loop {
+            match approval_rx.recv().await {
+                Ok(event) => {
+                    use openfang_types::event::ApprovalEvent;
+                    // Only forward events belonging to this agent.
+                    let json = match &event {
+                        ApprovalEvent::Pending {
+                            id,
+                            agent_id,
+                            tool_name,
+                            action_summary,
+                            risk_level,
+                            timeout_secs,
+                        } if *agent_id == agent_id_str => serde_json::json!({
+                            "type": "approval_pending",
+                            "id": id.to_string(),
+                            "tool": tool_name,
+                            "action_summary": action_summary,
+                            "risk_level": format!("{:?}", risk_level),
+                            "timeout_secs": timeout_secs,
+                        }),
+                        ApprovalEvent::Resolved {
+                            id,
+                            agent_id,
+                            decision,
+                        } if *agent_id == agent_id_str => serde_json::json!({
+                            "type": "approval_resolved",
+                            "id": id.to_string(),
+                            "decision": format!("{:?}", decision).to_lowercase(),
+                        }),
+                        ApprovalEvent::Expired { id, agent_id }
+                            if *agent_id == agent_id_str =>
+                        {
+                            serde_json::json!({
+                                "type": "approval_expired",
+                                "id": id.to_string(),
+                            })
+                        }
+                        // Event is for a different agent — skip it.
+                        _ => continue,
+                    };
+                    if send_json(&sender_approvals, &json).await.is_err() {
+                        break; // Client disconnected
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    });
+
     // Per-connection rate limiting: max 10 messages per 60 seconds
     let mut msg_times: Vec<std::time::Instant> = Vec::new();
     const MAX_PER_MIN: usize = 10;
@@ -380,6 +440,7 @@ async fn handle_agent_ws(
 
     // Cleanup
     update_handle.abort();
+    approval_handle.abort();
     info!(agent_id = %id_str, "WebSocket disconnected");
 }
 
