@@ -524,7 +524,12 @@ impl OpenFangKernel {
 
     /// Boot the kernel with an explicit configuration.
     pub async fn boot_with_config(mut config: KernelConfig) -> KernelResult<Self> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        if rustls::crypto::ring::default_provider()
+            .install_default()
+            .is_err()
+        {
+            debug!("rustls crypto provider already installed, skipping");
+        }
 
         use openfang_types::config::KernelMode;
 
