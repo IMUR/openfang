@@ -4,7 +4,7 @@
 
 # --- Top-level fields ---
 home_dir = "~/.openfang"             # OpenFang home directory
-data_dir = "~/.openfang/data"        # SQLite databases and data files
+data_dir = "~/.openfang/data"        # SurrealDB substrate and data files
 log_level = "info"                   # trace | debug | info | warn | error
 api_listen = "127.0.0.1:4200"        # HTTP/WS API bind address (binary default; 50051 was illustrative)
 network_enabled = false              # Enable OFP peer-to-peer network
@@ -34,7 +34,8 @@ api_key_env = "GROQ_API_KEY"
 
 # --- Memory ---
 [memory]
-# sqlite_path = "~/.openfang/data/openfang.db"  # Auto-resolved if omitted
+# db_path = "~/.openfang/data/openfang.db"  # SurrealDB data dir. Auto-resolved if omitted.
+#                                            # Accepts "sqlite_path" as a legacy alias.
 embedding_model = "all-MiniLM-L6-v2"
 consolidation_threshold = 10000
 decay_rate = 0.1
@@ -75,6 +76,17 @@ max_response_bytes = 10485760        # 10 MB
 timeout_secs = 30
 readability = true
 
+# --- Browser Automation ---
+[browser]
+headless = true
+viewport_width = 1280
+viewport_height = 720
+timeout_secs = 30
+idle_timeout_secs = 300
+max_sessions = 3
+# chromium_path = "/usr/bin/chromium"  # Auto-detected if omitted.
+#                                      # Point at a CDP-compatible binary (Chromium, Lightpanda, etc.)
+
 # --- MCP Servers ---
 [[mcp_servers]]
 name = "filesystem"
@@ -92,6 +104,18 @@ env = ["REMOTE_API_KEY"]
 [mcp_servers.transport]
 type = "sse"
 url = "https://mcp.example.com/events"
+
+# Streamable HTTP (MCP 2025-03-26) via supergateway stdio bridge.
+# Use this pattern when the remote endpoint speaks Streamable HTTP
+# (URL path ends in /mcp) rather than legacy SSE (/sse or /events).
+# supergateway proxies stdio ↔ Streamable HTTP transparently.
+[[mcp_servers]]
+name = "remote-streamable"
+timeout_secs = 60
+[mcp_servers.transport]
+type = "stdio"
+command = "bunx"
+args = ["supergateway", "--streamableHttp", "https://mcp.example.com/v0/groups/my-group/mcp"]
 
 # --- A2A Protocol ---
 [a2a]
