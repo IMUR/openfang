@@ -185,6 +185,56 @@ pub fn encode_binary_frame(msg: &VoiceProtocol) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Opus Codec
+// ---------------------------------------------------------------------------
+
+/// Opus encoder/decoder wrapper for voice chat.
+///
+/// Configured for voice: 16kHz mono, 20ms frames (320 samples).
+/// Uses SILK mode internally which is optimized for speech at low sample rates.
+pub struct OpusCodec {
+    encoder: opus_rs::OpusEncoder,
+    decoder: opus_rs::OpusDecoder,
+}
+
+/// 20ms frame at 16kHz = 320 samples.
+pub const OPUS_FRAME_SAMPLES: usize = 320;
+
+impl OpusCodec {
+    /// Create a new Opus encoder/decoder pair for 16kHz mono voice.
+    pub fn new() -> Result<Self, String> {
+        let encoder = opus_rs::OpusEncoder::new(16000, 1, opus_rs::Application::Voip)
+            .map_err(|e| format!("Opus encoder init failed: {e}"))?;
+        let decoder = opus_rs::OpusDecoder::new(16000, 1)
+            .map_err(|e| format!("Opus decoder init failed: {e}"))?;
+        Ok(Self { encoder, decoder })
+    }
+
+    /// Decode an Opus packet to PCM16 samples.
+    pub fn decode(&mut self, opus_data: &[u8]) -> Result<Vec<i16>, String> {
+        let mut pcm = vec![0i16; OPUS_FRAME_SAMPLES * 6]; // max 120ms
+        let samples = self
+            .decoder
+            .decode(opus_data, &mut pcm, false)
+            .map_err(|e| format!("Opus decode failed: {e}"))?;
+        pcm.truncate(samples);
+        Ok(pcm)
+    }
+
+    /// Encode PCM16 samples to an Opus packet.
+    /// Input should be exactly OPUS_FRAME_SAMPLES (320) samples for a 20ms frame.
+    pub fn encode(&mut self, pcm: &[i16]) -> Result<Vec<u8>, String> {
+        let mut opus_data = vec![0u8; 4000]; // max Opus packet
+        let len = self
+            .encoder
+            .encode(pcm, &mut opus_data)
+            .map_err(|e| format!("Opus encode failed: {e}"))?;
+        opus_data.truncate(len);
+        Ok(opus_data)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Voice Session
 // ---------------------------------------------------------------------------
 
@@ -211,16 +261,23 @@ pub struct VoiceSession {
     pub state: VoiceSessionState,
     /// Client-requested configuration.
     pub init: SessionInitPayload,
+    /// Opus codec for encode/decode.
+    pub codec: OpusCodec,
+    /// PCM buffer accumulating decoded audio from client.
+    pub pcm_buffer: Vec<i16>,
 }
 
 impl VoiceSession {
     /// Create a new voice session from a SessionInit payload.
-    pub fn new(init: SessionInitPayload) -> Self {
-        Self {
+    pub fn new(init: SessionInitPayload) -> Result<Self, String> {
+        let codec = OpusCodec::new()?;
+        Ok(Self {
             session_id: Uuid::new_v4().to_string(),
             state: VoiceSessionState::Idle,
             init,
-        }
+            codec,
+            pcm_buffer: Vec::with_capacity(16000 * 30), // pre-alloc 30s
+        })
     }
 }
 
@@ -349,9 +406,67 @@ mod tests {
 
     #[test]
     fn test_voice_session_new() {
-        let session = VoiceSession::new(SessionInitPayload::default());
+        let session = VoiceSession::new(SessionInitPayload::default()).unwrap();
         assert_eq!(session.state, VoiceSessionState::Idle);
         assert!(!session.session_id.is_empty());
         assert_eq!(session.init.sample_rate, 16000);
+        assert!(session.pcm_buffer.is_empty());
+    }
+
+    // --- Opus codec tests ---
+
+    #[test]
+    fn test_opus_codec_creation() {
+        let codec = OpusCodec::new();
+        assert!(codec.is_ok());
+    }
+
+    #[test]
+    fn test_opus_roundtrip_silence() {
+        let mut codec = OpusCodec::new().unwrap();
+        let silence = vec![0i16; OPUS_FRAME_SAMPLES];
+        let encoded = codec.encode(&silence).unwrap();
+        assert!(!encoded.is_empty());
+        assert!(encoded.len() < silence.len() * 2); // compressed smaller than raw
+        let decoded = codec.decode(&encoded).unwrap();
+        assert_eq!(decoded.len(), OPUS_FRAME_SAMPLES);
+        // Silence in should produce near-silence out
+        let max_sample = decoded.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        assert!(max_sample < 100, "Expected near-silence, got max sample {max_sample}");
+    }
+
+    #[test]
+    fn test_opus_roundtrip_sine_wave() {
+        let mut codec = OpusCodec::new().unwrap();
+        // 440Hz sine wave at 16kHz
+        let pcm: Vec<i16> = (0..OPUS_FRAME_SAMPLES)
+            .map(|i| {
+                let t = i as f64 / 16000.0;
+                (f64::sin(2.0 * std::f64::consts::PI * 440.0 * t) * 16000.0) as i16
+            })
+            .collect();
+
+        let encoded = codec.encode(&pcm).unwrap();
+        assert!(!encoded.is_empty());
+
+        let decoded = codec.decode(&encoded).unwrap();
+        assert_eq!(decoded.len(), OPUS_FRAME_SAMPLES);
+        // Should have non-trivial audio content
+        let max_sample = decoded.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        assert!(max_sample > 1000, "Expected audible signal, got max sample {max_sample}");
+    }
+
+    #[test]
+    fn test_opus_multiple_frames() {
+        let mut codec = OpusCodec::new().unwrap();
+        // Encode and decode 10 frames to test stateful codec behavior
+        for i in 0..10 {
+            let pcm: Vec<i16> = (0..OPUS_FRAME_SAMPLES)
+                .map(|j| ((i * OPUS_FRAME_SAMPLES + j) as i16).wrapping_mul(7))
+                .collect();
+            let encoded = codec.encode(&pcm).unwrap();
+            let decoded = codec.decode(&encoded).unwrap();
+            assert_eq!(decoded.len(), OPUS_FRAME_SAMPLES);
+        }
     }
 }

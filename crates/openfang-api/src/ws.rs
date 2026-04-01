@@ -454,18 +454,27 @@ async fn handle_agent_ws(
 
                 match voice::parse_binary_frame(&data) {
                     Ok(VoiceProtocol::SessionInit(payload)) => {
-                        let session = VoiceSession::new(payload);
-                        let ack = voice::encode_binary_frame(&VoiceProtocol::SessionAck {
-                            session_id: session.session_id.clone(),
-                        });
-                        info!(
-                            agent_id = %id_str,
-                            session_id = %session.session_id,
-                            "Voice session initialized"
-                        );
-                        voice_session = Some(session);
-                        let mut s = sender.lock().await;
-                        let _ = s.send(Message::Binary(ack.into())).await;
+                        match VoiceSession::new(payload) {
+                            Ok(session) => {
+                                let ack = voice::encode_binary_frame(&VoiceProtocol::SessionAck {
+                                    session_id: session.session_id.clone(),
+                                });
+                                info!(
+                                    agent_id = %id_str,
+                                    session_id = %session.session_id,
+                                    "Voice session initialized"
+                                );
+                                voice_session = Some(session);
+                                let mut s = sender.lock().await;
+                                let _ = s.send(Message::Binary(ack.into())).await;
+                            }
+                            Err(e) => {
+                                warn!(agent_id = %id_str, error = %e, "Voice session init failed");
+                                let err = voice::encode_binary_frame(&VoiceProtocol::Error(e));
+                                let mut s = sender.lock().await;
+                                let _ = s.send(Message::Binary(err.into())).await;
+                            }
+                        }
                     }
                     Ok(VoiceProtocol::AudioDataIn(_opus_data)) => {
                         if voice_session.is_none() {
