@@ -2,12 +2,30 @@
 //!
 //! Entities are stored as documents in the `entities` table.
 //! Relations use SurrealDB's native RELATE graph edges.
+//!
+//! ## Traversal
+//!
+//! - `query_graph` — flat edge scan with optional source/relation/target filters.
+//!   Suitable for pattern matching ("find all WorksAt relations").
+//!
+//! - `traverse_from` — multi-hop graph traversal using SurrealDB's native `->` operator.
+//!   More efficient for fan-out from a known source entity (up to 3 hops).
 
 use chrono::Utc;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{
     Entity, EntityType, GraphMatch, GraphPattern, Relation, RelationType,
 };
+
+/// A node reached during graph traversal, with the hop depth it was found at.
+#[derive(Debug, Clone)]
+pub struct TraversalNode {
+    pub entity: Entity,
+    /// 1 = direct neighbour, 2 = two hops away, etc.
+    pub depth: usize,
+    /// The ID of the entity that linked to this node.
+    pub via_entity_id: String,
+}
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -52,6 +70,78 @@ struct GraphRow {
 
 fn surreal_err(e: surrealdb::Error) -> OpenFangError {
     OpenFangError::Memory(e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Traversal helper types and functions
+// ---------------------------------------------------------------------------
+
+/// Raw entity record as returned by a graph traversal hop.
+#[derive(Debug, Deserialize)]
+struct RawEntity {
+    #[serde(rename = "id")]
+    raw_id: Option<surrealdb::RecordId>,
+    entity_type: Option<EntityType>,
+    name: Option<String>,
+    #[serde(default)]
+    properties: std::collections::HashMap<String, serde_json::Value>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+}
+
+/// Result row from the multi-hop traversal query.
+#[derive(Debug, Deserialize)]
+struct TraversalResult {
+    #[allow(dead_code)]
+    eid: Option<String>,
+    #[serde(default)]
+    hop1: Vec<RawEntity>,
+    #[serde(default)]
+    hop2: Vec<RawEntity>,
+    #[serde(default)]
+    hop3: Vec<RawEntity>,
+}
+
+/// Convert a batch of raw entities from one hop into `TraversalNode`s, deduplicating.
+fn collect_hop(
+    raw_ents: Vec<RawEntity>,
+    hop_depth: usize,
+    via: &str,
+    seen: &mut std::collections::HashSet<String>,
+    nodes: &mut Vec<TraversalNode>,
+) {
+    for re in raw_ents {
+        let eid = re
+            .raw_id
+            .as_ref()
+            .map(|rid| format!("{}", rid.key()))
+            .unwrap_or_default();
+        if eid.is_empty() || !seen.insert(eid.clone()) {
+            continue;
+        }
+        let now = Utc::now();
+        let parse_ts = |s: Option<&str>| -> chrono::DateTime<Utc> {
+            s.and_then(|ts| {
+                chrono::DateTime::parse_from_rfc3339(ts)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            })
+            .unwrap_or(now)
+        };
+        let entity = Entity {
+            id: eid.clone(),
+            entity_type: re.entity_type.unwrap_or(EntityType::Custom("unknown".to_string())),
+            name: re.name.unwrap_or_default(),
+            properties: re.properties,
+            created_at: parse_ts(re.created_at.as_deref()),
+            updated_at: parse_ts(re.updated_at.as_deref()),
+        };
+        nodes.push(TraversalNode {
+            entity,
+            depth: hop_depth,
+            via_entity_id: via.to_string(),
+        });
+    }
 }
 
 impl KnowledgeStore {
@@ -205,6 +295,76 @@ impl KnowledgeStore {
 
         Ok(matches)
     }
+
+    /// Multi-hop graph traversal from a source entity using SurrealDB's `->` operator.
+    ///
+    /// Returns all entities reachable within `max_depth` hops from `source_id`,
+    /// deduplicating across hops. Depth 1 = direct neighbours, depth 2 = two hops, etc.
+    ///
+    /// SurrealDB's graph traversal is significantly more efficient than the flat
+    /// `query_graph` method for fan-out queries — it avoids a full table scan of
+    /// the `relations` edge table.
+    pub async fn traverse_from(
+        &self,
+        source_id: &str,
+        max_depth: usize,
+    ) -> OpenFangResult<Vec<TraversalNode>> {
+        let depth = max_depth.clamp(1, 3);
+
+        // Build the traversal projection for each requested depth.
+        // Each hop: ->relations->entities with full entity fields.
+        // We use a single query that projects all hops; SurrealDB resolves them
+        // in one round-trip via index-backed edge lookups.
+        let sql = match depth {
+            1 => {
+                "SELECT meta::id(id) AS eid,
+                        (->relations->entities.*) AS hop1
+                 FROM type::thing('entities', $src)"
+                .to_string()
+            }
+            2 => {
+                "SELECT meta::id(id) AS eid,
+                        (->relations->entities.*) AS hop1,
+                        (->relations->entities->relations->entities.*) AS hop2
+                 FROM type::thing('entities', $src)"
+                .to_string()
+            }
+            _ => {
+                "SELECT meta::id(id) AS eid,
+                        (->relations->entities.*) AS hop1,
+                        (->relations->entities->relations->entities.*) AS hop2,
+                        (->relations->entities->relations->entities->relations->entities.*) AS hop3
+                 FROM type::thing('entities', $src)"
+                .to_string()
+            }
+        };
+
+        let mut result = self
+            .db
+            .query(&sql)
+            .bind(("src", source_id.to_string()))
+            .await
+            .map_err(surreal_err)?;
+
+        let rows: Vec<TraversalResult> = result.take(0).unwrap_or_default();
+
+        let mut nodes: Vec<TraversalNode> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(source_id.to_string());
+        let root_id = source_id.to_string();
+
+        for row in rows {
+            collect_hop(row.hop1, 1, &root_id, &mut seen, &mut nodes);
+            if depth >= 2 {
+                collect_hop(row.hop2, 2, &root_id, &mut seen, &mut nodes);
+            }
+            if depth >= 3 {
+                collect_hop(row.hop3, 3, &root_id, &mut seen, &mut nodes);
+            }
+        }
+
+        Ok(nodes)
+    }
 }
 
 #[cfg(test)]
@@ -233,6 +393,58 @@ mod tests {
             .await
             .unwrap();
         assert!(!id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_traverse_from() {
+        let store = setup().await;
+
+        let alice_id = store
+            .add_entity(Entity {
+                id: "alice".to_string(),
+                entity_type: EntityType::Person,
+                name: "Alice".to_string(),
+                properties: HashMap::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let acme_id = store
+            .add_entity(Entity {
+                id: "acme".to_string(),
+                entity_type: EntityType::Organization,
+                name: "Acme Corp".to_string(),
+                properties: HashMap::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        store
+            .add_relation(Relation {
+                source: alice_id.clone(),
+                relation: RelationType::WorksAt,
+                target: acme_id.clone(),
+                properties: HashMap::new(),
+                confidence: 0.9,
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        // Depth-1 traversal from alice should reach Acme Corp
+        let nodes = store.traverse_from(&alice_id, 1).await.unwrap();
+        assert!(!nodes.is_empty(), "Expected at least one node in traversal");
+        let names: Vec<&str> = nodes.iter().map(|n| n.entity.name.as_str()).collect();
+        assert!(
+            names.contains(&"Acme Corp"),
+            "Expected Acme Corp in traversal: {:?}",
+            names
+        );
+        assert_eq!(nodes[0].depth, 1);
     }
 
     #[tokio::test]

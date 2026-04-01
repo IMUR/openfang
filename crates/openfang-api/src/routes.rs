@@ -3368,6 +3368,23 @@ pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoRespo
     let config_warnings = state.kernel.config.validate();
     let status = if db_ok { "ok" } else { "degraded" };
 
+    // Memory intelligence subsystem status
+    let embedding_provider = state.kernel.config.memory.embedding_provider
+        .as_deref()
+        .unwrap_or("none");
+    let embedding_model = &state.kernel.config.memory.embedding_model;
+    let embedding_active = state.kernel.embedding_driver.is_some();
+    let ner_active = state.kernel.ner_driver.is_some();
+    let reranker_active = state.kernel.reranker.is_some();
+    let cuda_device = state.kernel.config.memory.cuda_device;
+    let models_cached = {
+        let models_dir = state.kernel.config.home_dir.join("models");
+        models_dir.exists() && {
+            let embedding_dir = models_dir.join(embedding_model.replace('/', std::path::MAIN_SEPARATOR_STR));
+            embedding_dir.join("model.safetensors").exists()
+        }
+    };
+
     Json(serde_json::json!({
         "status": status,
         "version": env!("CARGO_PKG_VERSION"),
@@ -3377,6 +3394,15 @@ pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoRespo
         "agent_count": state.kernel.registry.count(),
         "database": if db_ok { "connected" } else { "error" },
         "config_warnings": config_warnings,
+        "memory_intelligence": {
+            "embedding_provider": embedding_provider,
+            "embedding_model": embedding_model,
+            "embedding_active": embedding_active,
+            "ner_active": ner_active,
+            "reranker_active": reranker_active,
+            "cuda_device": cuda_device,
+            "models_cached": models_cached,
+        }
     }))
 }
 

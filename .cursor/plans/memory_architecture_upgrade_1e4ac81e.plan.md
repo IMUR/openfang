@@ -4,34 +4,34 @@ overview: Upgrade OpenFang's memory layer from brute-force Rust re-ranking to na
 todos:
   - id: align-embedding
     content: "Align embedding model: switch HNSW index to 768d (nomic-embed-text), update db.rs DDL and ~/.openfang/config.toml"
-    status: pending
+    status: completed
   - id: hnsw-knn-query
     content: Replace brute-force cosine in semantic.rs with native HNSW KNN <|k,ef|> operator
-    status: pending
+    status: completed
   - id: bm25-search
     content: Replace CONTAINS text search with BM25 @1@ operator in semantic.rs
-    status: pending
+    status: completed
   - id: hybrid-search
     content: Implement hybrid search (vector + BM25) with weighted score merge
-    status: pending
+    status: completed
   - id: fix-record-id
     content: "Fix record ID extraction bug in semantic.rs line 184 (TODO: extract from SurrealDB record ID)"
-    status: pending
+    status: completed
   - id: wire-consolidation
     content: Wire consolidation engine in substrate.rs to iterate agents, decay confidence, prune low-confidence memories
-    status: pending
+    status: completed
   - id: multi-hop-graph
     content: Add multi-hop graph traversal to knowledge.rs using SurrealDB -> operator
-    status: pending
+    status: completed
   - id: secondary-indexes
     content: Add secondary indexes (agent_id, created_at) to DDL in db.rs
-    status: pending
+    status: completed
   - id: enable-surrealml
     content: Add ml feature to surrealdb dependency, verify compilation
-    status: pending
+    status: completed
   - id: update-tests
     content: Update existing tests to cover HNSW, BM25, hybrid search, and consolidation paths
-    status: pending
+    status: completed
 isProject: false
 ---
 

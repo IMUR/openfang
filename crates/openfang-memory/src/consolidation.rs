@@ -77,6 +77,27 @@ impl ConsolidationEngine {
         Ok(pruned.len() as u64)
     }
 
+    /// Return the distinct agent IDs that have at least one non-deleted memory.
+    pub async fn all_agent_ids(&self) -> OpenFangResult<Vec<AgentId>> {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            agent_id: String,
+        }
+
+        let mut result = self
+            .db
+            .query("SELECT DISTINCT agent_id FROM memories WHERE deleted = false")
+            .await
+            .map_err(surreal_err)?;
+
+        let rows: Vec<Row> = result.take(0).unwrap_or_default();
+        let ids = rows
+            .into_iter()
+            .filter_map(|r| uuid::Uuid::parse_str(&r.agent_id).ok().map(AgentId))
+            .collect();
+        Ok(ids)
+    }
+
     /// Hard-delete all soft-deleted memories for an agent.
     pub async fn purge_deleted(&self, agent_id: AgentId) -> OpenFangResult<u64> {
         let mut result = self

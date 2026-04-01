@@ -14,9 +14,16 @@ pub type SurrealDb = Surreal<Db>;
 
 /// Idempotent schema DDL for all OpenFang tables.
 ///
-/// Every statement uses `IF NOT EXISTS` so re-running on an existing DB is safe.
-/// All document tables remain SCHEMALESS for backwards compatibility with
+/// Document tables remain SCHEMALESS for backwards compatibility with
 /// existing data that was written before any DEFINE statements existed.
+///
+/// The HNSW index is explicitly removed and recreated on every boot to
+/// handle dimension migrations (e.g. MiniLM 384d → nomic-embed-text 768d).
+/// Existing record embeddings remain in the document store; the graph is
+/// repopulated as memories are written going forward.
+///
+/// Embedding dimension: 768 — matches nomic-embed-text (Ollama default).
+/// If the model changes, update the HNSW DIMENSION and reset the database.
 const SCHEMA_DDL: &str = r#"
 -- Text analyzer for BM25 full-text search
 DEFINE ANALYZER IF NOT EXISTS memory_analyzer
@@ -54,13 +61,17 @@ DEFINE FIELD IF NOT EXISTS access_count ON memories TYPE int;
 DEFINE FIELD IF NOT EXISTS deleted ON memories TYPE bool;
 DEFINE FIELD IF NOT EXISTS embedding ON memories TYPE option<array<float>>;
 
--- HNSW vector index: 384 dimensions = all-MiniLM-L6-v2
-DEFINE INDEX IF NOT EXISTS hnsw_embedding ON memories
-    FIELDS embedding HNSW DIMENSION 384 DIST COSINE;
+-- HNSW vector index: 384 dimensions = BGE-small-en-v1.5 (Candle Phase 1).
+-- Explicitly removed and recreated to handle dimension migrations between providers.
+-- Phase 2 will change this to 768 for nomic-embed-text.
+-- M=16 EFC=200 gives good recall (≥0.99 at ef=40) at reasonable build cost.
+REMOVE INDEX IF EXISTS hnsw_embedding ON memories;
+DEFINE INDEX hnsw_embedding ON memories
+    FIELDS embedding HNSW DIMENSION 384 DIST COSINE M 16 EFC 200 TYPE F32;
 
 -- BM25 full-text index on content
 DEFINE INDEX IF NOT EXISTS ft_content ON memories
-    FIELDS content SEARCH ANALYZER memory_analyzer BM25(1.2, 0.75);
+    FIELDS content SEARCH ANALYZER memory_analyzer BM25(1.2, 0.75) HIGHLIGHTS;
 
 -- KV store (composite record IDs: kv:{agent_id}:{key})
 DEFINE TABLE IF NOT EXISTS kv SCHEMALESS;
@@ -121,6 +132,15 @@ DEFINE FIELD IF NOT EXISTS created_by ON task_queue TYPE string;
 DEFINE FIELD IF NOT EXISTS created_at ON task_queue TYPE string;
 DEFINE FIELD IF NOT EXISTS completed_at ON task_queue TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS result ON task_queue TYPE option<string>;
+
+-- Secondary indexes for common filter patterns
+DEFINE INDEX IF NOT EXISTS idx_memories_agent ON memories FIELDS agent_id;
+DEFINE INDEX IF NOT EXISTS idx_memories_deleted ON memories FIELDS deleted;
+DEFINE INDEX IF NOT EXISTS idx_sessions_agent ON sessions FIELDS agent_id;
+DEFINE INDEX IF NOT EXISTS idx_canonical_agent ON canonical_sessions FIELDS agent_id;
+DEFINE INDEX IF NOT EXISTS idx_usage_agent ON usage FIELDS agent_id;
+DEFINE INDEX IF NOT EXISTS idx_usage_created ON usage FIELDS created_at;
+DEFINE INDEX IF NOT EXISTS idx_kv_agent ON kv FIELDS agent_id;
 "#;
 
 /// Execute schema DDL against the database. Errors abort boot.
@@ -198,6 +218,11 @@ mod tests {
         assert!(
             info_str.contains("ft_content"),
             "BM25 index not found in: {info_str}"
+        );
+        // Verify HNSW is configured for 384d (BGE-small-en-v1.5, Candle Phase 1)
+        assert!(
+            info_str.contains("384"),
+            "HNSW dimension 384 not found in: {info_str}"
         );
 
         // Verify relations table is TYPE RELATION

@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use crate::voice::{self, VoiceProtocol, VoiceSession};
 use tracing::{debug, info, warn};
 
 /// Per-IP WebSocket connection tracker.
@@ -231,6 +232,9 @@ async fn handle_agent_ws(
 
     // Per-connection verbose level (default: Full)
     let verbose = Arc::new(AtomicU8::new(VerboseLevel::Full as u8));
+
+    // Voice session state — None for text-only clients, created on SessionInit.
+    let mut voice_session: Option<VoiceSession> = None;
 
     // Send initial connection confirmation
     let _ = send_json(
@@ -434,7 +438,69 @@ async fn handle_agent_ws(
                 let mut s = sender.lock().await;
                 let _ = s.send(Message::Pong(data)).await;
             }
-            _ => {} // Ignore binary and pong
+            Message::Binary(data) => {
+                last_activity = std::time::Instant::now();
+
+                // SECURITY: Reject oversized binary frames (256KB max — allows ~3s of Opus audio)
+                const MAX_BINARY_SIZE: usize = 256 * 1024;
+                if data.len() > MAX_BINARY_SIZE {
+                    let err = voice::encode_binary_frame(&VoiceProtocol::Error(
+                        "Binary frame too large (max 256KB)".into(),
+                    ));
+                    let mut s = sender.lock().await;
+                    let _ = s.send(Message::Binary(err.into())).await;
+                    continue;
+                }
+
+                match voice::parse_binary_frame(&data) {
+                    Ok(VoiceProtocol::SessionInit(payload)) => {
+                        let session = VoiceSession::new(payload);
+                        let ack = voice::encode_binary_frame(&VoiceProtocol::SessionAck {
+                            session_id: session.session_id.clone(),
+                        });
+                        info!(
+                            agent_id = %id_str,
+                            session_id = %session.session_id,
+                            "Voice session initialized"
+                        );
+                        voice_session = Some(session);
+                        let mut s = sender.lock().await;
+                        let _ = s.send(Message::Binary(ack.into())).await;
+                    }
+                    Ok(VoiceProtocol::AudioDataIn(_opus_data)) => {
+                        if voice_session.is_none() {
+                            let err = voice::encode_binary_frame(&VoiceProtocol::Error(
+                                "No voice session — send SessionInit first".into(),
+                            ));
+                            let mut s = sender.lock().await;
+                            let _ = s.send(Message::Binary(err.into())).await;
+                            continue;
+                        }
+                        // TODO (Phase 2+): Opus decode → PCM → VAD → STT → agent
+                    }
+                    Ok(VoiceProtocol::Interrupt) => {
+                        if let Some(ref mut session) = voice_session {
+                            info!(
+                                agent_id = %id_str,
+                                session_id = %session.session_id,
+                                "Voice interrupt received"
+                            );
+                            session.state = voice::VoiceSessionState::Idle;
+                            // TODO (Phase 5): cancel active TTS pipeline
+                        }
+                    }
+                    Ok(other) => {
+                        debug!(agent_id = %id_str, "Unexpected voice message from client: {other:?}");
+                    }
+                    Err(e) => {
+                        debug!(agent_id = %id_str, error = %e, "Invalid binary frame");
+                        let err = voice::encode_binary_frame(&VoiceProtocol::Error(e));
+                        let mut s = sender.lock().await;
+                        let _ = s.send(Message::Binary(err.into())).await;
+                    }
+                }
+            }
+            _ => {} // Ignore pong
         }
     }
 

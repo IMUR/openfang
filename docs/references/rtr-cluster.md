@@ -1,12 +1,12 @@
 ---
 title: "Reactor `rtr` Cluster Reference"
-date: 2026-03-25
-verified: 2026-03-25T10:40:00-07:00
+date: 2026-04-01
+verified: 2026-04-01T14:45:00-07:00
 ---
 
 # Reactor `rtr` Cluster Reference
 
-Reality-checked cluster topology. Verified against live `ss -tlnp` and `/etc/caddy/Caddyfile` on 2026-03-25.
+Reality-checked cluster topology. Verified against live `ss -tlnp` and `/etc/caddy/Caddyfile` on 2026-04-01.
 
 ## Nodes
 
@@ -70,10 +70,11 @@ Reality-checked cluster topology. Verified against live `ss -tlnp` and `/etc/cad
 | `5511` | `127.0.0.1` | `66**` | XTDB v2.1.0 (pgwire) | `xtdb.service` | ✅ Live |
 | `6379` | `127.0.0.1` | `66**` | Redis | `redis-server` | ✅ Live |
 | `7700` | `0.0.0.0` | `77**` | VICE voice pipeline | `vice.service` | ✅ Live |
-| `7711` | `*` | `77**` | Ollama | `ollama.service` | ✅ Live |
-| `7733` | `0.0.0.0` | `77**` | Whisper STT | `whisper-stt.service` | ✅ Live |
-| `7744` | `0.0.0.0` | `77**` | Kokoro TTS | `kokoro-tts.service` | ✅ Live |
-| `7745` | `0.0.0.0` | `77**` | TTS shim (ElevenLabs→Kokoro) | python | ✅ Live |
+| `7711` | `*` | `77**` | Ollama (GPU #1 + #2) | `ollama.service` | ✅ Live |
+| `7722` | `0.0.0.0` | `77**` | LFM2.5-Audio-1.5B ONNX Q4 (GPU #3) | `lfm25-audio.service` | ✅ Live |
+| `7733` | `0.0.0.0` | `77**` | Whisper STT distil-large-v3 int8 (GPU #3) | `whisper-stt.service` | ✅ Live |
+| `7744` | `0.0.0.0` | `77**` | Kokoro TTS ONNX q8f16 (GPU #3) | `kokoro-tts.service` | ✅ Live |
+| `7745` | `0.0.0.0` | `77**` | TTS shim (ElevenLabs→Kokoro) | `tts-shim.service` | ✅ Live |
 | `9090` | `*` | `55**` | Cockpit | `cockpit.socket` | ✅ Live |
 
 ---

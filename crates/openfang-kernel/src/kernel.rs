@@ -115,6 +115,10 @@ pub struct OpenFangKernel {
     /// Embedding driver for vector similarity search (None = text fallback).
     pub embedding_driver:
         Option<Arc<dyn openfang_runtime::embedding::EmbeddingDriver + Send + Sync>>,
+    /// NER driver for knowledge graph auto-population on memory writes (None = disabled).
+    pub ner_driver: Option<Arc<openfang_runtime::candle_ner::CandleNerDriver>>,
+    /// Cross-encoder reranker for HNSW candidate reranking (None = disabled).
+    pub reranker: Option<Arc<openfang_runtime::candle_reranker::CandleReranker>>,
     /// Hand registry — curated autonomous capability packages.
     pub hand_registry: openfang_hands::registry::HandRegistry,
     /// Credential resolver — vault → dotenv → env var priority chain.
@@ -555,16 +559,21 @@ impl OpenFangKernel {
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| KernelError::BootFailed(format!("Failed to create data dir: {e}")))?;
 
-        // Initialize memory substrate
+        // Initialize memory substrate with consolidation config from MemoryConfig
         let db_path = config
             .memory
             .db_path
             .clone()
             .unwrap_or_else(|| config.data_dir.join("openfang.db"));
         let memory = Arc::new(
-            MemorySubstrate::open(&db_path)
-                .await
-                .map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))?,
+            MemorySubstrate::open_with_config(
+                &db_path,
+                config.memory.decay_rate,
+                0.1, // min_confidence: prune memories below 10% confidence
+                7,   // decay_age_days: start decaying after 7 days without access
+            )
+            .await
+            .map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))?,
         );
 
         // Initialize credential resolver (vault → dotenv → env var)
@@ -851,7 +860,7 @@ impl OpenFangKernel {
         let embedding_driver: Option<
             Arc<dyn openfang_runtime::embedding::EmbeddingDriver + Send + Sync>,
         > = {
-            use openfang_runtime::embedding::create_embedding_driver;
+            use openfang_runtime::embedding::{create_candle_embedding_driver, create_embedding_driver};
             let configured_model = &config.memory.embedding_model;
             if let Some(ref provider) = config.memory.embedding_provider {
                 // Explicit config takes priority — use the configured embedding model.
@@ -863,6 +872,20 @@ impl OpenFangKernel {
                 } else {
                     configured_model.as_str()
                 };
+
+                if provider == "candle" {
+                    // Candle in-process CUDA backend — async model loading
+                    match create_candle_embedding_driver(model, &config.home_dir, config.memory.cuda_device).await {
+                        Ok(d) => {
+                            info!(model = %model, cuda_device = ?config.memory.cuda_device, "Embedding driver configured: Candle (in-process CUDA)");
+                            Some(Arc::from(d))
+                        }
+                        Err(e) => {
+                            warn!(model = %model, error = %e, "Candle embedding driver init failed — falling back to text search");
+                            None
+                        }
+                    }
+                } else {
                 let api_key_env = config.memory.embedding_api_key_env.as_deref().unwrap_or("");
                 let custom_url = config
                     .provider_urls
@@ -877,6 +900,7 @@ impl OpenFangKernel {
                         warn!(provider = %provider, error = %e, "Embedding driver init failed — falling back to text search");
                         None
                     }
+                }
                 }
             } else if std::env::var("OPENAI_API_KEY").is_ok() {
                 let model = if configured_model == "all-MiniLM-L6-v2" {
@@ -914,6 +938,52 @@ impl OpenFangKernel {
                     }
                 }
             }
+        };
+
+        // Load Candle NER and reranker when the embedding provider is "candle".
+        // These run on the same CUDA device as the embedding driver.
+        // Failures are logged as warnings — the system degrades gracefully.
+        let (candle_ner, candle_reranker) = if config.memory.embedding_provider.as_deref() == Some("candle") {
+            let cuda = config.memory.cuda_device;
+            let home = config.home_dir.clone();
+
+            let ner = if let Some(ref model_id) = config.memory.ner_model {
+                let model_id = model_id.clone();
+                match openfang_runtime::candle_ner::CandleNerDriver::load(&model_id, &home, cuda).await {
+                    Ok(d) => {
+                        info!(model = %model_id, ?cuda, "NER driver loaded — knowledge graph auto-population active");
+                        Some(Arc::new(d))
+                    }
+                    Err(e) => {
+                        warn!(model = %model_id, error = %e, "NER driver failed to load — knowledge graph will not be auto-populated");
+                        None
+                    }
+                }
+            } else {
+                info!("NER driver disabled (ner_model = null in config)");
+                None
+            };
+
+            let reranker = if let Some(ref model_id) = config.memory.reranker_model {
+                let model_id = model_id.clone();
+                match openfang_runtime::candle_reranker::CandleReranker::load(&model_id, &home, cuda).await {
+                    Ok(d) => {
+                        info!(model = %model_id, ?cuda, "Cross-encoder reranker loaded — HNSW reranking active");
+                        Some(Arc::new(d))
+                    }
+                    Err(e) => {
+                        warn!(model = %model_id, error = %e, "Reranker failed to load — HNSW candidates will not be reranked");
+                        None
+                    }
+                }
+            } else {
+                info!("Reranker disabled (reranker_model = null in config)");
+                None
+            };
+
+            (ner, reranker)
+        } else {
+            (None, None)
         };
 
         let browser_ctx = openfang_runtime::browser::BrowserManager::new(config.browser.clone());
@@ -979,6 +1049,8 @@ impl OpenFangKernel {
             tts_engine,
             pairing,
             embedding_driver,
+            ner_driver: candle_ner,
+            reranker: candle_reranker,
             hand_registry,
             credential_resolver: std::sync::Mutex::new(credential_resolver),
             extension_registry: std::sync::RwLock::new(extension_registry),
@@ -1408,6 +1480,107 @@ impl OpenFangKernel {
         info!(signer = %signed.signer_id, hash = %signed.content_hash, "Signed manifest verified");
         Ok(signed.manifest)
     }
+
+    // -----------------------------------------------------------------
+    // Candle intelligence activation (called post-boot from bin/daemon)
+    // -----------------------------------------------------------------
+
+    /// Load and activate the Candle NER driver for knowledge graph population.
+    ///
+    /// Called after the kernel is fully booted and the Candle embedding driver
+    /// has been validated. Safe to call more than once (idempotent).
+    pub async fn activate_ner_driver(
+        &mut self,
+        model_id: &str,
+        cuda_device: Option<u32>,
+    ) {
+        use openfang_runtime::candle_ner::CandleNerDriver;
+        match CandleNerDriver::load(model_id, &self.config.home_dir, cuda_device).await {
+            Ok(driver) => {
+                self.ner_driver = Some(Arc::new(driver));
+                info!(model_id, "NER driver activated for knowledge graph population");
+            }
+            Err(e) => {
+                warn!(model_id, error = %e, "NER driver load failed — knowledge graph will not be auto-populated");
+            }
+        }
+    }
+
+    /// Load and activate the Candle cross-encoder reranker.
+    ///
+    /// Called after the kernel is fully booted. Safe to call more than once.
+    pub async fn activate_reranker(&mut self, model_id: &str, cuda_device: Option<u32>) {
+        use openfang_runtime::candle_reranker::CandleReranker;
+        match CandleReranker::load(model_id, &self.config.home_dir, cuda_device).await {
+            Ok(driver) => {
+                self.reranker = Some(Arc::new(driver));
+                info!(model_id, "Cross-encoder reranker activated");
+            }
+            Err(e) => {
+                warn!(model_id, error = %e, "Reranker load failed — HNSW results will not be reranked");
+            }
+        }
+    }
+
+    /// Populate the knowledge graph from text using NER extraction.
+    ///
+    /// Called in a background task after each `remember()` write. If the NER
+    /// driver is not loaded, this is a no-op.
+    pub async fn populate_knowledge_graph(
+        &self,
+        agent_id: openfang_types::agent::AgentId,
+        text: &str,
+        memory_id: &str,
+    ) {
+        let Some(ref ner) = self.ner_driver else { return };
+
+        match ner.extract_entities(text, 0.70).await {
+            Ok(entities) => {
+                for entity in entities {
+                    use openfang_types::memory::{Entity, Relation, RelationType};
+                    use chrono::Utc;
+
+                    let entity_id = format!("{}-{}", agent_id, entity.text.to_lowercase().replace(' ', "_"));
+                    let e = Entity {
+                        id: entity_id.clone(),
+                        entity_type: entity.entity_type,
+                        name: entity.text.clone(),
+                        properties: std::collections::HashMap::new(),
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                    };
+
+                    if let Err(err) = self.memory.add_entity(e).await {
+                        tracing::debug!(error = %err, "Failed to add entity to KG");
+                        continue;
+                    }
+
+                    // Link the entity back to the memory that mentioned it
+                    let relation = Relation {
+                        source: memory_id.to_string(),
+                        relation: RelationType::RelatedTo,
+                        target: entity_id,
+                        properties: {
+                            let mut m = std::collections::HashMap::new();
+                            m.insert("confidence".into(), serde_json::json!(entity.confidence));
+                            m
+                        },
+                        confidence: entity.confidence,
+                        created_at: Utc::now(),
+                    };
+
+                    let _ = self.memory.add_relation(relation).await;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "NER extraction failed");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Core message passing
+    // -----------------------------------------------------------------
 
     /// Send a message to an agent and get a response.
     ///

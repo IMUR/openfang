@@ -29,6 +29,9 @@ rust-version = "1.75"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 
+# Audio codec (pure Rust, no C dependency)
+opus-rs = "0.1"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -54,7 +57,24 @@ chrono-tz = "0.10"
 # IDs
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
+# ML Inference (Candle — in-process BERT on CUDA, GTX 970 #0)
+# candle-kernels is patched at git.ism.la/rtr/candle-kernels to skip WMMA MoE
+# kernels on pre-Volta GPUs (CC < 7.0). GTX 970 is CC 5.2, GTX 1080 is CC 6.1.
+# candle-onnx: requires protoc; re-enable for Phase 2 (Liquid LFM2 ONNX models).
+candle-core = { version = "0.10", features = ["cuda"] }
+candle-nn = { version = "0.10" }
+candle-transformers = { version = "0.10" }
+# candle-onnx = { version = "0.10" }
+tokenizers = { version = "0.22" }
+hf-hub = { version = "0.5", features = ["tokio"] }
+
 # Database
+# SurrealML (ml feature) is blocked by a three-way version triangle:
+#   surrealdb-core 2.6.5   → ndarray 0.16.x, ort rc.12
+#   surrealml-core crates.io (0.1.11) → ort rc.12 API (source bug: mut/method errors)
+#   surrealml-core git main (0.1.9)   → ort rc.9 → ndarray 0.15.6 (type mismatch vs 0.16)
+# No combination of published/git surrealml-core compiles with surrealdb 2.6.5.
+# Re-enable when surrealdb publishes a release with aligned ml/ort/ndarray deps.
 surrealdb = { version = "2", features = ["kv-surrealkv", "kv-mem"], default-features = false }
 
 # CLI
@@ -148,6 +168,11 @@ openssl = { version = "0.10", features = ["vendored"] }
 tokio-test = "0.4"
 tempfile = "3"
 
+# Patch candle-kernels to skip WMMA MoE kernels on pre-Volta GPUs (CC < 7.0).
+# GTX 970 (CC 5.2) and GTX 1080 (CC 6.1) both lack Tensor Cores.
+[patch.crates-io]
+candle-kernels = { git = "ssh://git@git.ism.la:6666/rtr/candle-kernels.git", branch = "main" }
+
 [profile.release]
 lto = true
 codegen-units = 1
@@ -160,3 +185,4 @@ lto = "thin"
 codegen-units = 8
 opt-level = 2
 strip = false
+

@@ -174,7 +174,23 @@ impl EmbeddingDriver for OpenAIEmbeddingDriver {
     }
 }
 
-/// Create an embedding driver from kernel config.
+/// Create the Candle in-process embedding driver (async, CUDA).
+///
+/// Separate from `create_embedding_driver` because model loading is async
+/// (HF Hub download on first use, then CUDA memory transfer).
+pub async fn create_candle_embedding_driver(
+    model: &str,
+    home_dir: &std::path::Path,
+    cuda_device: Option<u32>,
+) -> Result<Box<dyn EmbeddingDriver + Send + Sync>, EmbeddingError> {
+    use crate::candle_embedding::CandleEmbeddingDriver;
+    let driver = CandleEmbeddingDriver::load(model, home_dir, cuda_device).await?;
+    Ok(Box::new(driver))
+}
+
+/// Create an HTTP-based embedding driver from kernel config.
+///
+/// For the Candle in-process backend, use `create_candle_embedding_driver` instead.
 pub fn create_embedding_driver(
     provider: &str,
     model: &str,

@@ -1514,10 +1514,33 @@ pub struct MemoryConfig {
     /// How often to run memory consolidation (hours). 0 = disabled.
     #[serde(default = "default_consolidation_interval")]
     pub consolidation_interval_hours: u64,
+    /// CUDA device index for in-process Candle inference.
+    /// None = use CPU; Some(0) = first GPU (GTX 970 #0 for memory intelligence).
+    /// Ignored when embedding_provider != "candle".
+    #[serde(default)]
+    pub cuda_device: Option<u32>,
+    /// HuggingFace model ID for NER entity extraction (knowledge graph population).
+    /// None = disabled. Loaded at boot when embedding_provider = "candle".
+    /// Default: "dslim/bert-base-NER" (110M params, ~270MB VRAM FP16).
+    #[serde(default = "default_ner_model")]
+    pub ner_model: Option<String>,
+    /// HuggingFace model ID for cross-encoder reranking of HNSW candidates.
+    /// None = disabled. Loaded at boot when embedding_provider = "candle".
+    /// Default: "cross-encoder/ms-marco-MiniLM-L-6-v2" (22M params, ~60MB VRAM FP16).
+    #[serde(default = "default_reranker_model")]
+    pub reranker_model: Option<String>,
 }
 
 fn default_consolidation_interval() -> u64 {
     24
+}
+
+fn default_ner_model() -> Option<String> {
+    Some("dslim/bert-base-NER".to_string())
+}
+
+fn default_reranker_model() -> Option<String> {
+    Some("cross-encoder/ms-marco-MiniLM-L-6-v2".to_string())
 }
 
 impl Default for MemoryConfig {
@@ -1530,6 +1553,9 @@ impl Default for MemoryConfig {
             embedding_provider: None,
             embedding_api_key_env: None,
             consolidation_interval_hours: default_consolidation_interval(),
+            cuda_device: None,
+            ner_model: default_ner_model(),
+            reranker_model: default_reranker_model(),
         }
     }
 }

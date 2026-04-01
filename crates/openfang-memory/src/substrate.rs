@@ -63,13 +63,31 @@ pub struct MemorySubstrate {
     sessions: SessionStore,
     consolidation: ConsolidationEngine,
     usage: UsageStore,
+    /// Decay factor applied per consolidation run (0 = no decay, 1 = erase immediately).
+    /// Sourced from `MemoryConfig::decay_rate`.
+    decay_rate: f32,
+    /// Minimum confidence below which memories are soft-deleted during consolidation.
+    min_confidence: f32,
+    /// Days without access before a memory's confidence starts to decay.
+    decay_age_days: i64,
 }
 
 impl MemorySubstrate {
-    /// Open or create a memory substrate at the given database path.
+    /// Open or create a memory substrate at the given database path using defaults.
     pub async fn open(db_path: &Path) -> OpenFangResult<Self> {
         let handle = db::init(db_path).await?;
         Ok(Self::from_handle(handle))
+    }
+
+    /// Open with explicit consolidation config sourced from `MemoryConfig`.
+    pub async fn open_with_config(
+        db_path: &Path,
+        decay_rate: f32,
+        min_confidence: f32,
+        decay_age_days: i64,
+    ) -> OpenFangResult<Self> {
+        let handle = db::init(db_path).await?;
+        Ok(Self::from_handle_with_config(handle, decay_rate, min_confidence, decay_age_days))
     }
 
     /// Create an in-memory substrate (for testing).
@@ -78,8 +96,18 @@ impl MemorySubstrate {
         Ok(Self::from_handle(handle))
     }
 
-    /// Construct from an already-initialised SurrealDB handle.
+    /// Construct from an already-initialised SurrealDB handle with default consolidation params.
     fn from_handle(handle: SurrealDb) -> Self {
+        Self::from_handle_with_config(handle, 0.05, 0.1, 7)
+    }
+
+    /// Construct from an already-initialised SurrealDB handle with explicit consolidation params.
+    fn from_handle_with_config(
+        handle: SurrealDb,
+        decay_rate: f32,
+        min_confidence: f32,
+        decay_age_days: i64,
+    ) -> Self {
         Self {
             db: handle.clone(),
             structured: StructuredStore::new(handle.clone()),
@@ -88,6 +116,9 @@ impl MemorySubstrate {
             sessions: SessionStore::new(handle.clone()),
             usage: UsageStore::new(handle.clone()),
             consolidation: ConsolidationEngine::new(handle),
+            decay_rate,
+            min_confidence,
+            decay_age_days,
         }
     }
 
@@ -594,11 +625,35 @@ impl Memory for MemorySubstrate {
 
     async fn consolidate(&self) -> OpenFangResult<ConsolidationReport> {
         let start = std::time::Instant::now();
-        // For consolidation, we need a reference agent_id. In the future this
-        // should iterate over all agents. For now, return a no-op report.
+
+        // Discover all agents that have live memories
+        let agent_ids = self.consolidation.all_agent_ids().await?;
+
+        let mut total_decayed: u64 = 0;
+        let mut total_pruned: u64 = 0;
+
+        for agent_id in agent_ids {
+            // Apply confidence decay to memories not accessed recently
+            let decayed = self
+                .consolidation
+                .decay_confidence(agent_id, self.decay_age_days, 1.0 - self.decay_rate)
+                .await
+                .unwrap_or(0);
+
+            // Soft-delete memories whose confidence has dropped below the threshold
+            let pruned = self
+                .consolidation
+                .prune(agent_id, self.min_confidence)
+                .await
+                .unwrap_or(0);
+
+            total_decayed += decayed;
+            total_pruned += pruned;
+        }
+
         Ok(ConsolidationReport {
-            memories_merged: 0,
-            memories_decayed: 0,
+            memories_merged: 0, // merge-by-similarity is Phase 3 (SurrealML)
+            memories_decayed: total_decayed + total_pruned,
             duration_ms: start.elapsed().as_millis() as u64,
         })
     }
