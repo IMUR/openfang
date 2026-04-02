@@ -457,6 +457,36 @@ impl SemanticStore {
         Ok(records.into_iter().filter_map(memory_record_to_fragment).collect())
     }
 
+    /// List all non-deleted memory fragments for an agent, paginated.
+    ///
+    /// Used by the backfill pipeline to iterate over existing memories and
+    /// re-apply NER, classification, and metadata enrichment.
+    pub async fn list_fragments(
+        &self,
+        agent_id: AgentId,
+        offset: usize,
+        limit: usize,
+    ) -> OpenFangResult<Vec<MemoryFragment>> {
+        let sql = "SELECT meta::id(id) AS record_key, agent_id, content, source, scope, confidence,
+                           metadata, created_at, accessed_at, access_count, deleted, embedding
+                   FROM memories
+                   WHERE deleted = false AND agent_id = $aid
+                   ORDER BY created_at ASC
+                   LIMIT $lim START $off";
+
+        let mut result = self
+            .db
+            .query(sql)
+            .bind(("aid", agent_id.0.to_string()))
+            .bind(("lim", limit))
+            .bind(("off", offset))
+            .await
+            .map_err(surreal_err)?;
+
+        let records: Vec<MemoryRecord> = result.take(0).unwrap_or_default();
+        Ok(records.into_iter().filter_map(memory_record_to_fragment).collect())
+    }
+
     /// Soft-delete a memory fragment.
     pub async fn forget(&self, id: MemoryId) -> OpenFangResult<()> {
         self.db
@@ -473,6 +503,44 @@ impl SemanticStore {
             .query("UPDATE type::thing('memories', $mid) SET embedding = $emb")
             .bind(("mid", id.0.to_string()))
             .bind(("emb", embedding.to_vec()))
+            .await
+            .map_err(surreal_err)?;
+        Ok(())
+    }
+
+    /// Set the `entities` key in a memory record's metadata.
+    ///
+    /// Uses SurrealDB's nested field setter so only the `entities` key is
+    /// written — all other metadata keys set at write time are preserved.
+    pub async fn set_metadata_entities(
+        &self,
+        memory_id: &str,
+        entity_ids: Vec<String>,
+    ) -> OpenFangResult<()> {
+        let mid = memory_id.to_string();
+        self.db
+            .query("UPDATE type::thing('memories', $mid) SET metadata.entities = $ents")
+            .bind(("mid", mid))
+            .bind(("ents", entity_ids))
+            .await
+            .map_err(surreal_err)?;
+        Ok(())
+    }
+
+    /// Replace the full metadata of an existing memory record.
+    ///
+    /// Prefer `set_metadata_entities` when only updating a single key to avoid
+    /// accidentally overwriting metadata written by other concurrent paths.
+    pub async fn update_metadata(
+        &self,
+        memory_id: &str,
+        metadata: HashMap<String, serde_json::Value>,
+    ) -> OpenFangResult<()> {
+        let mid = memory_id.to_string();
+        self.db
+            .query("UPDATE type::thing('memories', $mid) SET metadata = $meta")
+            .bind(("mid", mid))
+            .bind(("meta", metadata))
             .await
             .map_err(surreal_err)?;
         Ok(())

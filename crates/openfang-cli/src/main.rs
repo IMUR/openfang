@@ -736,6 +736,21 @@ enum MemoryCommands {
         /// Key name.
         key: String,
     },
+    /// Re-run NER, classification, and metadata enrichment on existing memories.
+    Backfill {
+        /// Restrict to a specific agent (name or UUID). Omit to process all agents.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Report how many fragments would be updated without writing changes.
+        #[arg(long)]
+        dry_run: bool,
+        /// Number of fragments to process per batch (default 50, max 200).
+        #[arg(long, default_value = "50")]
+        batch_size: usize,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1067,6 +1082,12 @@ fn main() {
             MemoryCommands::Get { agent, key, json } => cmd_memory_get(&agent, &key, json),
             MemoryCommands::Set { agent, key, value } => cmd_memory_set(&agent, &key, &value),
             MemoryCommands::Delete { agent, key } => cmd_memory_delete(&agent, &key),
+            MemoryCommands::Backfill {
+                agent,
+                dry_run,
+                batch_size,
+                json,
+            } => cmd_memory_backfill(agent.as_deref(), dry_run, batch_size, json),
         },
         Some(Commands::Devices(sub)) => match sub {
             DevicesCommands::List { json } => cmd_devices_list(json),
@@ -6149,6 +6170,60 @@ fn cmd_memory_delete(agent: &str, key: &str) {
         ));
     } else {
         ui::success(&format!("Deleted key '{key}' for agent '{agent}'."));
+    }
+}
+
+fn cmd_memory_backfill(agent: Option<&str>, dry_run: bool, batch_size: usize, json: bool) {
+    let base = require_daemon("memory backfill");
+    let client = daemon_client();
+
+    let mut payload = serde_json::json!({
+        "dry_run": dry_run,
+        "batch_size": batch_size,
+    });
+    if let Some(a) = agent {
+        payload["agent_id"] = serde_json::Value::String(a.to_string());
+    }
+
+    let body = daemon_json(
+        client
+            .post(format!("{base}/api/memory/backfill"))
+            .json(&payload)
+            .send(),
+    );
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
+        return;
+    }
+
+    if body.get("error").is_some() {
+        ui::error(&format!(
+            "Backfill failed: {}",
+            body["error"].as_str().unwrap_or("unknown error")
+        ));
+        return;
+    }
+
+    let processed = body["processed"].as_u64().unwrap_or(0);
+    let updated = body["updated"].as_u64().unwrap_or(0);
+    let errors = body["errors"].as_u64().unwrap_or(0);
+    let is_dry = body["dry_run"].as_bool().unwrap_or(false);
+
+    if is_dry {
+        ui::step(&format!(
+            "Dry run: {processed} fragments scanned, {updated} would be updated."
+        ));
+    } else {
+        ui::success(&format!(
+            "Backfill complete: {processed} scanned, {updated} updated, {errors} errors."
+        ));
+    }
+    if errors > 0 {
+        ui::check_warn(&format!("{errors} fragments failed to update — check daemon logs."));
     }
 }
 

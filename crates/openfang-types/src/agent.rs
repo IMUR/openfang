@@ -106,6 +106,14 @@ pub enum HookEvent {
     BeforePromptBuild,
     /// Fires after the agent loop completes.
     AgentLoopEnd,
+    /// Fires after a memory fragment is written.
+    ///
+    /// `data` contains `memory_id`, `scope`, `source`, and `category`.
+    AfterMemoryStore,
+    /// Fires after a memory recall returns results.
+    ///
+    /// `data` contains `query`, `result_count`, and `retrieval_path`.
+    AfterMemoryRecall,
 }
 
 /// Unique identifier for an agent instance.

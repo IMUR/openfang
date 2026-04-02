@@ -5,10 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "HTTP/WebSocket API server for the OpenFang Agent OS daemon"
 
+[features]
+default = []
+memory-candle = ["openfang-kernel/memory-candle"]
+
 [dependencies]
 openfang-types = { path = "../openfang-types" }
-openfang-kernel = { path = "../openfang-kernel" }
-openfang-runtime = { path = "../openfang-runtime" }
+openfang-kernel = { path = "../openfang-kernel", default-features = false }
+openfang-runtime = { path = "../openfang-runtime", default-features = false }
 openfang-memory = { path = "../openfang-memory" }
 openfang-channels = { path = "../openfang-channels" }
 openfang-wire = { path = "../openfang-wire" }

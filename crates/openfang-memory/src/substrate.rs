@@ -17,8 +17,8 @@ use async_trait::async_trait;
 use openfang_types::agent::{AgentEntry, AgentId, SessionId};
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{
-    ConsolidationReport, Entity, ExportFormat, GraphMatch, GraphPattern, ImportReport, Memory,
-    MemoryFilter, MemoryFragment, MemoryId, MemorySource, Relation,
+    scope, ConsolidationReport, Entity, ExportFormat, GraphMatch, GraphPattern, ImportReport,
+    Memory, MemoryFilter, MemoryFragment, MemoryId, MemorySource, Relation,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -419,6 +419,50 @@ impl MemorySubstrate {
         self.semantic.update_embedding(id, embedding).await
     }
 
+    /// Set the `entities` key in a memory record's metadata without overwriting other keys.
+    pub async fn set_metadata_entities(
+        &self,
+        memory_id: &str,
+        entity_ids: Vec<String>,
+    ) -> OpenFangResult<()> {
+        self.semantic.set_metadata_entities(memory_id, entity_ids).await
+    }
+
+    /// Replace the full metadata of an existing memory record.
+    pub async fn update_metadata(
+        &self,
+        memory_id: &str,
+        metadata: std::collections::HashMap<String, serde_json::Value>,
+    ) -> OpenFangResult<()> {
+        self.semantic.update_metadata(memory_id, metadata).await
+    }
+
+    /// List non-deleted memory fragments for an agent, paginated.
+    ///
+    /// Used by the backfill pipeline to iterate over stored memories and
+    /// re-apply NER, classification, and metadata enrichment without a
+    /// full recall query.
+    pub async fn list_fragments(
+        &self,
+        agent_id: AgentId,
+        offset: usize,
+        limit: usize,
+    ) -> OpenFangResult<Vec<openfang_types::memory::MemoryFragment>> {
+        self.semantic.list_fragments(agent_id, offset, limit).await
+    }
+
+    /// Multi-hop graph traversal from a source entity (up to 3 hops).
+    ///
+    /// Returns all entities reachable from `source_entity_id`, deduplicated,
+    /// with their hop depth. Used for graph-boosted recall.
+    pub async fn traverse_from_entity(
+        &self,
+        source_entity_id: &str,
+        max_depth: usize,
+    ) -> OpenFangResult<Vec<crate::knowledge::TraversalNode>> {
+        self.knowledge.traverse_from(source_entity_id, max_depth).await
+    }
+
     /// Async recall_with_embedding (alias — all ops are already async).
     pub async fn recall_with_embedding_async(
         &self,
@@ -442,6 +486,80 @@ impl MemorySubstrate {
         embedding: Option<&[f32]>,
     ) -> OpenFangResult<MemoryId> {
         self.remember_with_embedding(agent_id, content, source, scope, metadata, embedding)
+            .await
+    }
+
+    // -----------------------------------------------------------------
+    // Active agent discovery
+    // -----------------------------------------------------------------
+
+    /// Return the distinct agent IDs that have at least one non-deleted memory.
+    pub async fn all_active_agent_ids(
+        &self,
+    ) -> OpenFangResult<Vec<openfang_types::agent::AgentId>> {
+        self.consolidation.all_agent_ids().await
+    }
+
+    // -----------------------------------------------------------------
+    // L1 Summarization support
+    // -----------------------------------------------------------------
+
+    /// Fetch episodic memories older than `older_than_hours` that have not yet been
+    /// folded into an L1 summary. Returns at most `max_items` items ordered by creation
+    /// time ascending. Called by the kernel before generating a summary via the LLM.
+    pub async fn fetch_episodic_for_summarization(
+        &self,
+        agent_id: AgentId,
+        older_than_hours: i64,
+        max_items: u64,
+    ) -> OpenFangResult<Vec<crate::consolidation::EpisodicBatchItem>> {
+        self.consolidation
+            .fetch_episodic_batch(agent_id, older_than_hours, max_items)
+            .await
+    }
+
+    /// Mark a set of memories as summarised into `summary_id` and reduce their
+    /// confidence to accelerate natural decay.
+    pub async fn mark_memories_summarized(
+        &self,
+        memory_ids: &[String],
+        summary_id: &str,
+        confidence_reduction: f32,
+    ) -> OpenFangResult<()> {
+        self.consolidation
+            .mark_summarized(memory_ids, summary_id, confidence_reduction)
+            .await
+    }
+
+    /// Write a semantic L1 summary memory.
+    ///
+    /// `summarized_from_ids` is embedded in the metadata as `summarized_from`.
+    pub async fn write_l1_summary(
+        &self,
+        agent_id: AgentId,
+        summary_text: &str,
+        summarized_from_ids: Vec<String>,
+    ) -> OpenFangResult<MemoryId> {
+        let mut meta: HashMap<String, serde_json::Value> = HashMap::new();
+        meta.insert(
+            "summarized_from".to_string(),
+            serde_json::json!(summarized_from_ids),
+        );
+        meta.insert("source_role".to_string(), serde_json::json!("system"));
+        meta.insert("category".to_string(), serde_json::json!("observation"));
+        meta.insert(
+            "classification_source".to_string(),
+            serde_json::json!("consolidation"),
+        );
+
+        self.semantic
+            .remember(
+                agent_id,
+                summary_text,
+                MemorySource::System,
+                openfang_types::memory::scope::SEMANTIC,
+                meta,
+            )
             .await
     }
 
@@ -609,6 +727,14 @@ impl Memory for MemorySubstrate {
 
     async fn forget(&self, id: MemoryId) -> OpenFangResult<()> {
         self.semantic.forget(id).await
+    }
+
+    async fn update_metadata(
+        &self,
+        memory_id: &str,
+        metadata: HashMap<String, serde_json::Value>,
+    ) -> OpenFangResult<()> {
+        self.semantic.update_metadata(memory_id, metadata).await
     }
 
     async fn add_entity(&self, entity: Entity) -> OpenFangResult<String> {

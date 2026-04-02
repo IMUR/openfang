@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use crate::voice::{self, VoiceProtocol, VoiceSession};
+use crate::voice::{self, VoiceAction, VoiceProtocol, VoiceSession};
 use tracing::{debug, info, warn};
 
 /// Per-IP WebSocket connection tracker.
@@ -454,7 +454,8 @@ async fn handle_agent_ws(
 
                 match voice::parse_binary_frame(&data) {
                     Ok(VoiceProtocol::SessionInit(payload)) => {
-                        match VoiceSession::new(payload) {
+                        let voice_config = state.kernel.config.voice.clone();
+                        match VoiceSession::new(payload, voice_config) {
                             Ok(session) => {
                                 let ack = voice::encode_binary_frame(&VoiceProtocol::SessionAck {
                                     session_id: session.session_id.clone(),
@@ -476,16 +477,244 @@ async fn handle_agent_ws(
                             }
                         }
                     }
-                    Ok(VoiceProtocol::AudioDataIn(_opus_data)) => {
-                        if voice_session.is_none() {
-                            let err = voice::encode_binary_frame(&VoiceProtocol::Error(
-                                "No voice session — send SessionInit first".into(),
-                            ));
-                            let mut s = sender.lock().await;
-                            let _ = s.send(Message::Binary(err.into())).await;
-                            continue;
+                    Ok(VoiceProtocol::AudioDataIn(opus_data)) => {
+                        let session = match voice_session.as_mut() {
+                            Some(s) => s,
+                            None => {
+                                let err = voice::encode_binary_frame(&VoiceProtocol::Error(
+                                    "No voice session — send SessionInit first".into(),
+                                ));
+                                let mut s = sender.lock().await;
+                                let _ = s.send(Message::Binary(err.into())).await;
+                                continue;
+                            }
+                        };
+
+                        // Decode audio (Opus or PCM16 depending on session codec)
+                        let pcm = match session.decode_audio(&opus_data) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                debug!(agent_id = %id_str, error = %e, "Audio decode failed");
+                                continue;
+                            }
+                        };
+
+                        // Feed PCM through VAD
+                        match session.handle_audio(&pcm) {
+                            VoiceAction::Continue => {}
+                            VoiceAction::Transcribe(pcm_buffer) => {
+                                // Send VadSpeechEnd to client
+                                {
+                                    let frame = voice::encode_binary_frame(&VoiceProtocol::VadSpeechEnd);
+                                    let mut s = sender.lock().await;
+                                    let _ = s.send(Message::Binary(frame.into())).await;
+                                }
+
+                                // STT: transcribe PCM → text
+                                let stt_client = voice::SttClient::new(
+                                    &session.config.stt_endpoint,
+                                    &session.config.stt_model,
+                                );
+                                let transcription = match stt_client.transcribe(&pcm_buffer, 16000).await {
+                                    Ok(text) if !text.is_empty() => text,
+                                    Ok(_) => {
+                                        session.state = voice::VoiceSessionState::Idle;
+                                        continue; // empty transcription, go back to listening
+                                    }
+                                    Err(e) => {
+                                        warn!(agent_id = %id_str, error = %e, "STT failed");
+                                        let err = voice::encode_binary_frame(&VoiceProtocol::Error(
+                                            format!("Transcription failed: {e}"),
+                                        ));
+                                        let mut s = sender.lock().await;
+                                        let _ = s.send(Message::Binary(err.into())).await;
+                                        session.state = voice::VoiceSessionState::Idle;
+                                        continue;
+                                    }
+                                };
+
+                                info!(agent_id = %id_str, text = %transcription, "Voice transcription");
+                                session.state = voice::VoiceSessionState::Processing;
+
+                                // Send transcription as text event so dashboard shows it
+                                let _ = send_json(
+                                    &sender,
+                                    &serde_json::json!({
+                                        "type": "voice_transcript",
+                                        "content": &transcription,
+                                    }),
+                                )
+                                .await;
+
+                                // Feed transcription to agent (same path as text chat)
+                                let kernel_handle: Arc<dyn KernelHandle> =
+                                    state.kernel.clone() as Arc<dyn KernelHandle>;
+                                match state
+                                    .kernel
+                                    .send_message_streaming(
+                                        agent_id,
+                                        &transcription,
+                                        Some(kernel_handle),
+                                        None,
+                                        None,
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    Ok((mut rx, handle)) => {
+                                        // Voice stream: filter events, TTS speakable text, send Opus back
+                                        let sender_voice = Arc::clone(&sender);
+                                        let tts_endpoint = session.config.tts_endpoint.clone();
+                                        let tts_voice = session.config.tts_voice.clone();
+                                        let tts_speed = session.config.tts_speed;
+                                        let use_opus = session.init.codec != "pcm16";
+
+                                        let voice_task = tokio::spawn(async move {
+                                            let tts_client = voice::TtsClient::new(
+                                                &tts_endpoint,
+                                                &tts_voice,
+                                                tts_speed,
+                                            );
+                                            let mut sentence_buf = voice::SentenceBuffer::new();
+                                            let mut accumulated_text = String::new();
+
+                                            // Send SpeechStart
+                                            {
+                                                let frame = voice::encode_binary_frame(
+                                                    &VoiceProtocol::SpeechStart,
+                                                );
+                                                let mut s = sender_voice.lock().await;
+                                                let _ = s.send(Message::Binary(frame.into())).await;
+                                            }
+
+                                            while let Some(event) = rx.recv().await {
+                                                match event {
+                                                    StreamEvent::TextDelta { ref text } => {
+                                                        accumulated_text.push_str(text);
+                                                        let speakable =
+                                                            voice::markdown_to_speakable(text);
+                                                        sentence_buf.push(&speakable);
+
+                                                        // TTS each complete sentence
+                                                        while let Some(sentence) =
+                                                            sentence_buf.next_sentence()
+                                                        {
+                                                            if sentence.trim().is_empty() {
+                                                                continue;
+                                                            }
+                                                            match tts_client
+                                                                .synthesize(&sentence)
+                                                                .await
+                                                            {
+                                                                Ok(pcm) => {
+                                                                    for frame in voice::encode_pcm_to_frames(&pcm, use_opus) {
+                                                                        let mut s = sender_voice.lock().await;
+                                                                        if s.send(Message::Binary(frame.into())).await.is_err() {
+                                                                            return accumulated_text;
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    warn!("TTS failed: {e}");
+                                                                }
+                                                            }
+                                                        }
+
+                                                        // Also forward TextDelta as JSON for dashboard
+                                                        let _ = send_json(
+                                                            &sender_voice,
+                                                            &serde_json::json!({
+                                                                "type": "text_delta",
+                                                                "content": text,
+                                                            }),
+                                                        )
+                                                        .await;
+                                                    }
+                                                    StreamEvent::ContentComplete { .. } => {
+                                                        // Flush remaining sentence buffer
+                                                        if let Some(tail) = sentence_buf.flush() {
+                                                            if !tail.trim().is_empty() {
+                                                                if let Ok(pcm) = tts_client
+                                                                    .synthesize(&tail)
+                                                                    .await
+                                                                {
+                                                                    for frame in voice::encode_pcm_to_frames(&pcm, use_opus) {
+                                                                        let mut s = sender_voice.lock().await;
+                                                                        let _ = s.send(Message::Binary(frame.into())).await;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        break;
+                                                    }
+                                                    StreamEvent::ToolUseStart { ref name, .. } => {
+                                                        // Send tool status as JSON (not spoken)
+                                                        let _ = send_json(
+                                                            &sender_voice,
+                                                            &serde_json::json!({
+                                                                "type": "voice_status",
+                                                                "text": format!("Using {name}..."),
+                                                            }),
+                                                        )
+                                                        .await;
+                                                    }
+                                                    // Skip thinking, tool input, tool results
+                                                    StreamEvent::ThinkingDelta { .. }
+                                                    | StreamEvent::ToolInputDelta { .. }
+                                                    | StreamEvent::ToolUseEnd { .. }
+                                                    | StreamEvent::ToolExecutionResult { .. }
+                                                    | StreamEvent::PhaseChange { .. } => {}
+                                                }
+                                            }
+
+                                            // Send SpeechEnd
+                                            {
+                                                let frame = voice::encode_binary_frame(
+                                                    &VoiceProtocol::SpeechEnd,
+                                                );
+                                                let mut s = sender_voice.lock().await;
+                                                let _ = s.send(Message::Binary(frame.into())).await;
+                                            }
+
+                                            accumulated_text
+                                        });
+
+                                        // Wait for voice stream to finish, then let kernel cleanup in background
+                                        let _ = voice_task.await;
+                                        let sender_bg = Arc::clone(&sender);
+                                        tokio::spawn(async move {
+                                            if let Err(e) = handle.await {
+                                                warn!("Voice agent post-processing failed: {e}");
+                                                let _ = send_json(
+                                                    &sender_bg,
+                                                    &serde_json::json!({
+                                                        "type": "error",
+                                                        "content": "Internal error during voice processing",
+                                                    }),
+                                                )
+                                                .await;
+                                            }
+                                        });
+
+                                        // Return to idle
+                                        if let Some(ref mut s) = voice_session {
+                                            s.state = voice::VoiceSessionState::Idle;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(agent_id = %id_str, error = %e, "Voice message dispatch failed");
+                                        let err = voice::encode_binary_frame(&VoiceProtocol::Error(
+                                            format!("Agent error: {e}"),
+                                        ));
+                                        let mut s = sender.lock().await;
+                                        let _ = s.send(Message::Binary(err.into())).await;
+                                        if let Some(ref mut s) = voice_session {
+                                            s.state = voice::VoiceSessionState::Idle;
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        // TODO (Phase 2+): Opus decode → PCM → VAD → STT → agent
                     }
                     Ok(VoiceProtocol::Interrupt) => {
                         if let Some(ref mut session) = voice_session {

@@ -506,6 +506,50 @@ impl Default for TtsElevenLabsConfig {
     }
 }
 
+/// Voice chat configuration — real-time conversational voice over WebSocket.
+///
+/// Voice is a transport layer: audio arrives as binary WS frames, gets transcribed
+/// via local STT, fed to the agent as text, and the response is synthesized via
+/// local TTS and sent back. The kernel and agent loop are unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceConfig {
+    /// Enable voice chat. Default: false.
+    pub enabled: bool,
+    /// STT service endpoint. Default: "http://localhost:7733".
+    pub stt_endpoint: String,
+    /// TTS service endpoint. Default: "http://localhost:7744".
+    pub tts_endpoint: String,
+    /// STT model name (passed to service). Default: "distil-large-v3".
+    pub stt_model: String,
+    /// TTS voice name. Default: "af_heart".
+    pub tts_voice: String,
+    /// TTS speed multiplier. Default: 1.0.
+    pub tts_speed: f32,
+    /// Minimum silence duration (ms) before treating as end-of-utterance. Default: 800.
+    pub vad_silence_ms: u64,
+    /// Energy threshold for speech detection (RMS, 0.0–1.0). Default: 0.01.
+    pub vad_energy_threshold: f32,
+    /// Maximum utterance duration in seconds. Default: 30.
+    pub max_utterance_secs: u32,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            stt_endpoint: "http://localhost:7733".to_string(),
+            tts_endpoint: "http://localhost:7744".to_string(),
+            stt_model: "distil-large-v3".to_string(),
+            tts_voice: "af_heart".to_string(),
+            tts_speed: 1.0,
+            vad_silence_ms: 800,
+            vad_energy_threshold: 0.01,
+            max_utterance_secs: 30,
+        }
+    }
+}
+
 /// Docker container sandbox configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1064,6 +1108,9 @@ pub struct KernelConfig {
     /// Text-to-speech configuration.
     #[serde(default)]
     pub tts: TtsConfig,
+    /// Voice chat configuration (real-time conversational voice over WebSocket).
+    #[serde(default)]
+    pub voice: VoiceConfig,
     /// Docker container sandbox configuration.
     #[serde(default)]
     pub docker: DockerSandboxConfig,
@@ -1322,6 +1369,7 @@ impl Default for KernelConfig {
             auto_reply: AutoReplyConfig::default(),
             canvas: CanvasConfig::default(),
             tts: TtsConfig::default(),
+            voice: VoiceConfig::default(),
             docker: DockerSandboxConfig::default(),
             pairing: PairingConfig::default(),
             auth_profiles: HashMap::new(),
@@ -1514,21 +1562,45 @@ pub struct MemoryConfig {
     /// How often to run memory consolidation (hours). 0 = disabled.
     #[serde(default = "default_consolidation_interval")]
     pub consolidation_interval_hours: u64,
-    /// CUDA device index for in-process Candle inference.
-    /// None = use CPU; Some(0) = first GPU (GTX 970 #0 for memory intelligence).
-    /// Ignored when embedding_provider != "candle".
+    /// CUDA device index for in-process Candle memory inference (embeddings when
+    /// `embedding_provider = "candle"`, and NER/rerank when their backends are `candle`).
+    /// None = CPU for all Candle workloads.
     #[serde(default)]
     pub cuda_device: Option<u32>,
+    /// How NER runs for knowledge-graph population (`memory-candle` binary only).
+    ///
+    /// - `none` / `off`: disabled (`ner_model` ignored).
+    /// - `candle`: load in-process Candle NER when `ner_model` is set (independent of embedding provider).
+    /// - `auto` or omitted: legacy — enable Candle NER only when `embedding_provider` is `candle`.
+    #[serde(default)]
+    pub ner_backend: Option<String>,
+    /// How cross-encoder reranking runs (`memory-candle` binary only). Same values as `ner_backend`.
+    #[serde(default)]
+    pub reranker_backend: Option<String>,
     /// HuggingFace model ID for NER entity extraction (knowledge graph population).
-    /// None = disabled. Loaded at boot when embedding_provider = "candle".
+    /// None = disabled regardless of `ner_backend`.
     /// Default: "dslim/bert-base-NER" (110M params, ~270MB VRAM FP16).
     #[serde(default = "default_ner_model")]
     pub ner_model: Option<String>,
     /// HuggingFace model ID for cross-encoder reranking of HNSW candidates.
-    /// None = disabled. Loaded at boot when embedding_provider = "candle".
+    /// None = disabled regardless of `reranker_backend`.
     /// Default: "cross-encoder/ms-marco-MiniLM-L-6-v2" (22M params, ~60MB VRAM FP16).
     #[serde(default = "default_reranker_model")]
     pub reranker_model: Option<String>,
+    /// How memory classification runs (`memory-candle` binary only).
+    ///
+    /// - `none` / `off`: disabled, always use rule-based classification.
+    /// - `candle`: load in-process Candle NLI classifier when `classification_model` is set.
+    /// - `auto` or omitted: legacy — enable only when `embedding_provider` is `candle`.
+    ///
+    /// Rule-based classification (Phase 1c) remains as fallback when this is absent or Off.
+    #[serde(default)]
+    pub classification_backend: Option<String>,
+    /// HuggingFace model ID for zero-shot memory classification via NLI entailment.
+    /// None = disabled regardless of `classification_backend`.
+    /// Default: "typeform/distilbert-base-uncased-mnli" (67M params, ~135MB FP32 / ~68MB FP16).
+    #[serde(default = "default_classification_model")]
+    pub classification_model: Option<String>,
 }
 
 fn default_consolidation_interval() -> u64 {
@@ -1543,6 +1615,10 @@ fn default_reranker_model() -> Option<String> {
     Some("cross-encoder/ms-marco-MiniLM-L-6-v2".to_string())
 }
 
+fn default_classification_model() -> Option<String> {
+    Some("typeform/distilbert-base-uncased-mnli".to_string())
+}
+
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
@@ -1554,9 +1630,118 @@ impl Default for MemoryConfig {
             embedding_api_key_env: None,
             consolidation_interval_hours: default_consolidation_interval(),
             cuda_device: None,
+            ner_backend: None,
+            reranker_backend: None,
             ner_model: default_ner_model(),
             reranker_model: default_reranker_model(),
+            classification_backend: None,
+            classification_model: default_classification_model(),
         }
+    }
+}
+
+/// Resolved backend for optional Candle memory subsystems (NER, reranker).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryCandleSubsystem {
+    /// Do not load this subsystem.
+    Off,
+    /// Follow legacy coupling: only when `embedding_provider == Some("candle")`.
+    Auto,
+    /// Load Candle when the binary supports it and the model id is set.
+    Candle,
+}
+
+impl MemoryConfig {
+    fn parse_memory_subsystem_backend(raw: &Option<String>) -> Result<MemoryCandleSubsystem, ()> {
+        match raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            None => Ok(MemoryCandleSubsystem::Auto),
+            Some("none" | "off") => Ok(MemoryCandleSubsystem::Off),
+            Some("auto") => Ok(MemoryCandleSubsystem::Auto),
+            Some("candle") => Ok(MemoryCandleSubsystem::Candle),
+            Some(_) => Err(()),
+        }
+    }
+
+    fn resolved_ner_backend(&self) -> Result<MemoryCandleSubsystem, ()> {
+        Self::parse_memory_subsystem_backend(&self.ner_backend)
+    }
+
+    fn resolved_reranker_backend(&self) -> Result<MemoryCandleSubsystem, ()> {
+        Self::parse_memory_subsystem_backend(&self.reranker_backend)
+    }
+
+    /// Whether to load Candle NER at kernel boot (`memory-candle` + model id + backend policy).
+    pub fn wants_candle_ner(&self) -> bool {
+        if self.ner_model.is_none() {
+            return false;
+        }
+        let Ok(mode) = self.resolved_ner_backend() else {
+            return false;
+        };
+        match mode {
+            MemoryCandleSubsystem::Off => false,
+            MemoryCandleSubsystem::Candle => true,
+            MemoryCandleSubsystem::Auto => self.embedding_provider.as_deref() == Some("candle"),
+        }
+    }
+
+    fn resolved_classification_backend(&self) -> Result<MemoryCandleSubsystem, ()> {
+        Self::parse_memory_subsystem_backend(&self.classification_backend)
+    }
+
+    /// Whether to load Candle cross-encoder reranker at kernel boot.
+    pub fn wants_candle_reranker(&self) -> bool {
+        if self.reranker_model.is_none() {
+            return false;
+        }
+        let Ok(mode) = self.resolved_reranker_backend() else {
+            return false;
+        };
+        match mode {
+            MemoryCandleSubsystem::Off => false,
+            MemoryCandleSubsystem::Candle => true,
+            MemoryCandleSubsystem::Auto => self.embedding_provider.as_deref() == Some("candle"),
+        }
+    }
+
+    /// Whether to load the Candle zero-shot NLI classifier at kernel boot.
+    pub fn wants_candle_classification(&self) -> bool {
+        if self.classification_model.is_none() {
+            return false;
+        }
+        let Ok(mode) = self.resolved_classification_backend() else {
+            return false;
+        };
+        match mode {
+            MemoryCandleSubsystem::Off => false,
+            MemoryCandleSubsystem::Candle => true,
+            MemoryCandleSubsystem::Auto => self.embedding_provider.as_deref() == Some("candle"),
+        }
+    }
+
+    /// Validation messages for unknown backend tokens.
+    pub fn memory_subsystem_backend_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.ner_backend.is_some() && self.resolved_ner_backend().is_err() {
+            out.push(format!(
+                "Unknown [memory] ner_backend {:?} — use none|off|auto|candle",
+                self.ner_backend.as_ref().unwrap()
+            ));
+        }
+        if self.reranker_backend.is_some() && self.resolved_reranker_backend().is_err() {
+            out.push(format!(
+                "Unknown [memory] reranker_backend {:?} — use none|off|auto|candle",
+                self.reranker_backend.as_ref().unwrap()
+            ));
+        }
+        if self.classification_backend.is_some() && self.resolved_classification_backend().is_err()
+        {
+            out.push(format!(
+                "Unknown [memory] classification_backend {:?} — use none|off|auto|candle",
+                self.classification_backend.as_ref().unwrap()
+            ));
+        }
+        out
     }
 }
 
@@ -3521,6 +3706,8 @@ impl KernelConfig {
             SearchProvider::DuckDuckGo | SearchProvider::Auto => {}
         }
 
+        warnings.extend(self.memory.memory_subsystem_backend_warnings());
+
         // --- Production bounds validation ---
         // Clamp dangerous zero/extreme values to safe defaults instead of crashing.
         warnings
@@ -3619,6 +3806,43 @@ mod tests {
         let config = KernelConfig::default();
         let warnings = config.validate();
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_memory_wants_candle_ner_decoupled_from_embeddings() {
+        let mut m = MemoryConfig::default();
+        m.embedding_provider = Some("ollama".to_string());
+        m.ner_backend = Some("candle".to_string());
+        m.ner_model = Some("dslim/bert-base-NER".to_string());
+        assert!(m.wants_candle_ner());
+    }
+
+    #[test]
+    fn test_memory_wants_candle_ner_auto_legacy() {
+        let mut m = MemoryConfig::default();
+        m.embedding_provider = Some("ollama".to_string());
+        m.ner_backend = None;
+        m.ner_model = Some("dslim/bert-base-NER".to_string());
+        assert!(!m.wants_candle_ner());
+        m.embedding_provider = Some("candle".to_string());
+        assert!(m.wants_candle_ner());
+    }
+
+    #[test]
+    fn test_memory_wants_candle_ner_explicit_off() {
+        let mut m = MemoryConfig::default();
+        m.embedding_provider = Some("candle".to_string());
+        m.ner_backend = Some("none".to_string());
+        m.ner_model = Some("dslim/bert-base-NER".to_string());
+        assert!(!m.wants_candle_ner());
+    }
+
+    #[test]
+    fn test_memory_unknown_backend_validation() {
+        let mut c = KernelConfig::default();
+        c.memory.ner_backend = Some("voodoo".to_string());
+        let w = c.validate();
+        assert!(w.iter().any(|s| s.contains("ner_backend")));
     }
 
     #[test]

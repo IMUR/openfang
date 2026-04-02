@@ -120,6 +120,7 @@ pub async fn build_router(
     let gcra_limiter = rate_limiter::create_rate_limiter();
 
     let app = Router::new()
+        .route("/voice", axum::routing::get(webchat::voice_page))
         .route("/", axum::routing::get(webchat::webchat_page))
         .route("/logo.png", axum::routing::get(webchat::logo_png))
         .route("/favicon.ico", axum::routing::get(webchat::favicon_ico))
@@ -284,6 +285,10 @@ pub async fn build_router(
             axum::routing::get(routes::get_agent_kv_key)
                 .put(routes::set_agent_kv_key)
                 .delete(routes::delete_agent_kv_key),
+        )
+        .route(
+            "/api/memory/backfill",
+            axum::routing::post(routes::memory_backfill),
         )
         // Trigger endpoints
         .route(

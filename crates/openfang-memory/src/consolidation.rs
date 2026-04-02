@@ -9,6 +9,15 @@ use openfang_types::error::{OpenFangError, OpenFangResult};
 
 use crate::db::SurrealDb;
 
+/// A single episodic memory item selected for L1 summarization.
+#[derive(Debug, Clone)]
+pub struct EpisodicBatchItem {
+    /// SurrealDB record key for this memory (without the table prefix).
+    pub memory_id: String,
+    /// Text content to be included in the summary prompt.
+    pub content: String,
+}
+
 /// Consolidation engine backed by SurrealDB.
 #[derive(Clone)]
 pub struct ConsolidationEngine {
@@ -96,6 +105,85 @@ impl ConsolidationEngine {
             .filter_map(|r| uuid::Uuid::parse_str(&r.agent_id).ok().map(AgentId))
             .collect();
         Ok(ids)
+    }
+
+    /// Fetch episodic memories older than `older_than_hours` that have not yet been
+    /// included in an L1 summary (no `metadata.summarized_into` key set).
+    /// Returns at most `max_items` records ordered by creation time ascending.
+    pub async fn fetch_episodic_batch(
+        &self,
+        agent_id: AgentId,
+        older_than_hours: i64,
+        max_items: u64,
+    ) -> OpenFangResult<Vec<EpisodicBatchItem>> {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            record_key: Option<String>,
+            content: String,
+        }
+
+        let cutoff = (Utc::now() - chrono::Duration::hours(older_than_hours)).to_rfc3339();
+
+        let mut result = self
+            .db
+            .query(
+                "SELECT meta::id(id) AS record_key, content
+                 FROM memories
+                 WHERE agent_id = $aid
+                   AND scope = 'episodic'
+                   AND deleted = false
+                   AND created_at < $cutoff
+                   AND (metadata.summarized_into = NONE OR !metadata.summarized_into)
+                 ORDER BY created_at ASC
+                 LIMIT $lim",
+            )
+            .bind(("aid", agent_id.0.to_string()))
+            .bind(("cutoff", cutoff))
+            .bind(("lim", max_items))
+            .await
+            .map_err(surreal_err)?;
+
+        let rows: Vec<Row> = result.take(0).unwrap_or_default();
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                r.record_key.map(|key| EpisodicBatchItem {
+                    memory_id: key,
+                    content: r.content,
+                })
+            })
+            .collect())
+    }
+
+    /// Mark a batch of memories as summarised into `summary_id` and reduce their
+    /// confidence to accelerate natural decay (they are no longer the primary source).
+    ///
+    /// `confidence_reduction` is the fractional amount to subtract (0.3 = 30% reduction).
+    pub async fn mark_summarized(
+        &self,
+        memory_ids: &[String],
+        summary_id: &str,
+        confidence_reduction: f32,
+    ) -> OpenFangResult<()> {
+        let factor = (1.0_f64 - confidence_reduction as f64).max(0.0);
+        let sid = summary_id.to_string();
+
+        for mid in memory_ids {
+            let m = mid.clone();
+            let s = sid.clone();
+            self.db
+                .query(
+                    "UPDATE type::thing('memories', $mid)
+                     SET metadata.summarized_into = $sid,
+                         confidence = confidence * $factor",
+                )
+                .bind(("mid", m))
+                .bind(("sid", s))
+                .bind(("factor", factor))
+                .await
+                .map_err(surreal_err)?;
+        }
+        Ok(())
     }
 
     /// Hard-delete all soft-deleted memories for an agent.

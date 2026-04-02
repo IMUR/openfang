@@ -20,10 +20,16 @@ pub mod context_overflow;
 pub mod copilot_oauth;
 pub mod docker_sandbox;
 pub mod drivers;
+#[cfg(feature = "memory-candle")]
 pub mod candle_embedding;
+#[cfg(feature = "memory-candle")]
+pub mod candle_classifier;
+#[cfg(feature = "memory-candle")]
 pub mod candle_ner;
+#[cfg(feature = "memory-candle")]
 pub mod candle_reranker;
 pub mod embedding;
+#[cfg(feature = "memory-candle")]
 pub mod model_cache;
 pub mod graceful_shutdown;
 pub mod hooks;

@@ -20,7 +20,9 @@
 //! | 0x40   | Interrupt      | client→server   | empty                              |
 //! | 0xF0   | Error          | server→client   | UTF-8 error string                 |
 
+use openfang_types::config::VoiceConfig;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -211,23 +213,35 @@ impl OpusCodec {
     }
 
     /// Decode an Opus packet to PCM16 samples.
+    ///
+    /// `opus-rs` uses `f32` samples in ±1.0; we convert to `i16` for the rest of the pipeline.
     pub fn decode(&mut self, opus_data: &[u8]) -> Result<Vec<i16>, String> {
-        let mut pcm = vec![0i16; OPUS_FRAME_SAMPLES * 6]; // max 120ms
+        let mut f32_out = vec![0.0f32; OPUS_FRAME_SAMPLES * 6]; // up to 120ms @ 16kHz mono
         let samples = self
             .decoder
-            .decode(opus_data, &mut pcm, false)
+            .decode(opus_data, OPUS_FRAME_SAMPLES, &mut f32_out)
             .map_err(|e| format!("Opus decode failed: {e}"))?;
-        pcm.truncate(samples);
-        Ok(pcm)
+        f32_out.truncate(samples);
+        Ok(f32_out
+            .iter()
+            .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .collect())
     }
 
     /// Encode PCM16 samples to an Opus packet.
-    /// Input should be exactly OPUS_FRAME_SAMPLES (320) samples for a 20ms frame.
+    /// Input should be exactly `OPUS_FRAME_SAMPLES` (320) samples for a 20ms @ 16kHz frame.
     pub fn encode(&mut self, pcm: &[i16]) -> Result<Vec<u8>, String> {
-        let mut opus_data = vec![0u8; 4000]; // max Opus packet
+        if pcm.len() != OPUS_FRAME_SAMPLES {
+            return Err(format!(
+                "Opus encode expects {OPUS_FRAME_SAMPLES} samples, got {}",
+                pcm.len()
+            ));
+        }
+        let f32_in: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+        let mut opus_data = vec![0u8; 4000];
         let len = self
             .encoder
-            .encode(pcm, &mut opus_data)
+            .encode(&f32_in, OPUS_FRAME_SAMPLES, &mut opus_data)
             .map_err(|e| format!("Opus encode failed: {e}"))?;
         opus_data.truncate(len);
         Ok(opus_data)
@@ -253,6 +267,14 @@ pub enum VoiceSessionState {
     Speaking,
 }
 
+/// Result of processing an audio frame through the voice session.
+pub enum VoiceAction {
+    /// Keep accumulating audio.
+    Continue,
+    /// Silence detected — transcribe this PCM buffer.
+    Transcribe(Vec<i16>),
+}
+
 /// A voice session associated with a WebSocket connection.
 pub struct VoiceSession {
     /// Unique session identifier.
@@ -261,23 +283,623 @@ pub struct VoiceSession {
     pub state: VoiceSessionState,
     /// Client-requested configuration.
     pub init: SessionInitPayload,
-    /// Opus codec for encode/decode.
-    pub codec: OpusCodec,
+    /// Opus codec for encode/decode (None when codec="pcm16").
+    pub opus: Option<OpusCodec>,
     /// PCM buffer accumulating decoded audio from client.
     pub pcm_buffer: Vec<i16>,
+    /// Voice configuration from KernelConfig.
+    pub config: VoiceConfig,
+    /// Consecutive silent frames count (energy-based VAD).
+    silence_frames: u32,
+    /// Whether we've seen speech in the current utterance.
+    speech_detected: bool,
+    /// Sentence buffer for TTS output.
+    pub sentence_buffer: SentenceBuffer,
 }
 
 impl VoiceSession {
-    /// Create a new voice session from a SessionInit payload.
-    pub fn new(init: SessionInitPayload) -> Result<Self, String> {
-        let codec = OpusCodec::new()?;
+    /// Create a new voice session from a SessionInit payload and config.
+    pub fn new(init: SessionInitPayload, config: VoiceConfig) -> Result<Self, String> {
+        let opus = if init.codec == "pcm16" {
+            None
+        } else {
+            Some(OpusCodec::new()?)
+        };
         Ok(Self {
             session_id: Uuid::new_v4().to_string(),
             state: VoiceSessionState::Idle,
             init,
-            codec,
-            pcm_buffer: Vec::with_capacity(16000 * 30), // pre-alloc 30s
+            opus,
+            pcm_buffer: Vec::with_capacity(16000 * 30),
+            config,
+            silence_frames: 0,
+            speech_detected: false,
+            sentence_buffer: SentenceBuffer::new(),
         })
+    }
+
+    /// Decode incoming audio bytes to PCM16 samples.
+    /// For Opus: decode the packet. For PCM16: interpret bytes as little-endian i16.
+    pub fn decode_audio(&mut self, data: &[u8]) -> Result<Vec<i16>, String> {
+        match self.opus.as_mut() {
+            Some(codec) => codec.decode(data),
+            None => {
+                // Raw PCM16 little-endian
+                if data.len() % 2 != 0 {
+                    return Err("PCM16 data must be even length".into());
+                }
+                Ok(data
+                    .chunks_exact(2)
+                    .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                    .collect())
+            }
+        }
+    }
+
+    /// Encode PCM16 samples to output bytes.
+    /// For Opus: encode to Opus packet. For PCM16: convert to little-endian bytes.
+    pub fn encode_audio(&mut self, pcm: &[i16]) -> Result<Vec<u8>, String> {
+        match self.opus.as_mut() {
+            Some(codec) => codec.encode(pcm),
+            None => {
+                // Raw PCM16 little-endian
+                let mut bytes = Vec::with_capacity(pcm.len() * 2);
+                for &sample in pcm {
+                    bytes.extend_from_slice(&sample.to_le_bytes());
+                }
+                Ok(bytes)
+            }
+        }
+    }
+
+    /// Process incoming decoded PCM audio. Returns a `VoiceAction` indicating
+    /// whether to keep listening or trigger transcription.
+    pub fn handle_audio(&mut self, pcm: &[i16]) -> VoiceAction {
+        // Compute RMS energy
+        let rms = if pcm.is_empty() {
+            0.0
+        } else {
+            let sum_sq: f64 = pcm.iter().map(|&s| (s as f64) * (s as f64)).sum();
+            (sum_sq / pcm.len() as f64).sqrt() / 32768.0
+        };
+
+        let threshold = self.config.vad_energy_threshold as f64;
+        let silence_threshold_frames =
+            (self.config.vad_silence_ms as f32 / 20.0).ceil() as u32; // 20ms per frame
+        let max_samples = self.config.max_utterance_secs as usize * 16000;
+
+        if rms > threshold {
+            // Speech detected
+            if !self.speech_detected {
+                self.speech_detected = true;
+                self.state = VoiceSessionState::Listening;
+            }
+            self.silence_frames = 0;
+            self.pcm_buffer.extend_from_slice(pcm);
+        } else if self.speech_detected {
+            // Silence after speech
+            self.silence_frames += 1;
+            self.pcm_buffer.extend_from_slice(pcm); // include trailing silence
+
+            if self.silence_frames >= silence_threshold_frames {
+                // End of utterance
+                self.state = VoiceSessionState::Transcribing;
+                self.speech_detected = false;
+                self.silence_frames = 0;
+                let buffer = std::mem::replace(
+                    &mut self.pcm_buffer,
+                    Vec::with_capacity(16000 * 30),
+                );
+                return VoiceAction::Transcribe(buffer);
+            }
+        }
+        // else: silence before any speech — ignore
+
+        // Force transcription if buffer exceeds max duration
+        if self.pcm_buffer.len() >= max_samples && self.speech_detected {
+            self.state = VoiceSessionState::Transcribing;
+            self.speech_detected = false;
+            self.silence_frames = 0;
+            let buffer =
+                std::mem::replace(&mut self.pcm_buffer, Vec::with_capacity(16000 * 30));
+            return VoiceAction::Transcribe(buffer);
+        }
+
+        VoiceAction::Continue
+    }
+
+    /// Reset the session to idle state (e.g. after barge-in).
+    pub fn reset_to_idle(&mut self) {
+        self.state = VoiceSessionState::Idle;
+        self.speech_detected = false;
+        self.silence_frames = 0;
+        self.pcm_buffer.clear();
+        self.sentence_buffer = SentenceBuffer::new();
+    }
+}
+
+/// Encode PCM16 samples into binary WS frame payloads (AudioDataOut).
+///
+/// For Opus: chunks into 20ms frames, encodes each, wraps in 0x02 header.
+/// For PCM16: converts to little-endian bytes in a single frame.
+pub fn encode_pcm_to_frames(pcm: &[i16], use_opus: bool) -> Vec<Vec<u8>> {
+    if !use_opus {
+        // Single frame with all PCM16 data
+        let mut bytes = Vec::with_capacity(pcm.len() * 2);
+        for &s in pcm {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        return vec![encode_binary_frame(&VoiceProtocol::AudioDataOut(bytes))];
+    }
+
+    // Opus: chunk into 20ms frames
+    let mut frames = Vec::new();
+    let mut enc = match OpusCodec::new() {
+        Ok(e) => e,
+        Err(_) => return frames,
+    };
+    for chunk in pcm.chunks(OPUS_FRAME_SAMPLES) {
+        let mut frame_pcm = chunk.to_vec();
+        frame_pcm.resize(OPUS_FRAME_SAMPLES, 0);
+        if let Ok(opus) = enc.encode(&frame_pcm) {
+            frames.push(encode_binary_frame(&VoiceProtocol::AudioDataOut(opus)));
+        }
+    }
+    frames
+}
+
+// ---------------------------------------------------------------------------
+// STT Client
+// ---------------------------------------------------------------------------
+
+/// HTTP client for the Whisper STT service.
+pub struct SttClient {
+    endpoint: String,
+    model: String,
+    client: reqwest::Client,
+}
+
+impl SttClient {
+    pub fn new(endpoint: &str, model: &str) -> Self {
+        Self {
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+            model: model.to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Transcribe PCM16 audio to text via the Whisper service.
+    pub async fn transcribe(&self, pcm: &[i16], sample_rate: u32) -> Result<String, String> {
+        let wav = pcm_to_wav(pcm, sample_rate);
+        let part = reqwest::multipart::Part::bytes(wav)
+            .file_name("audio.wav")
+            .mime_str("audio/wav")
+            .map_err(|e| format!("MIME error: {e}"))?;
+
+        let form = reqwest::multipart::Form::new()
+            .part("file", part)
+            .text("model", self.model.clone())
+            .text("response_format", "json");
+
+        let url = format!("{}/v1/audio/transcriptions", self.endpoint);
+        let resp = self
+            .client
+            .post(&url)
+            .multipart(form)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| format!("STT request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("STT failed (HTTP {status}): {body}"));
+        }
+
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("STT response parse failed: {e}"))?;
+
+        Ok(json["text"].as_str().unwrap_or("").trim().to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TTS Client
+// ---------------------------------------------------------------------------
+
+/// HTTP client for the Kokoro TTS service.
+pub struct TtsClient {
+    endpoint: String,
+    voice: String,
+    speed: f32,
+    client: reqwest::Client,
+}
+
+impl TtsClient {
+    pub fn new(endpoint: &str, voice: &str, speed: f32) -> Self {
+        Self {
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+            voice: voice.to_string(),
+            speed,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Synthesize text to PCM16 samples at 16kHz mono.
+    ///
+    /// Kokoro returns 24kHz WAV; we parse the WAV header, extract PCM16, and resample to 16kHz.
+    pub async fn synthesize(&self, text: &str) -> Result<Vec<i16>, String> {
+        let url = format!("{}/v1/audio/speech", self.endpoint);
+        let body = serde_json::json!({
+            "input": text,
+            "voice": self.voice,
+            "speed": self.speed,
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| format!("TTS request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("TTS failed (HTTP {status}): {body}"));
+        }
+
+        let wav_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("TTS response read failed: {e}"))?;
+
+        let (pcm_24k, sample_rate) = parse_wav(&wav_bytes)?;
+
+        if sample_rate == 16000 {
+            Ok(pcm_24k)
+        } else {
+            Ok(resample(&pcm_24k, sample_rate, 16000))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WAV Utilities
+// ---------------------------------------------------------------------------
+
+/// Encode PCM16 mono samples to a WAV byte buffer.
+pub fn pcm_to_wav(pcm: &[i16], sample_rate: u32) -> Vec<u8> {
+    let data_len = (pcm.len() * 2) as u32;
+    let file_len = 36 + data_len;
+    let mut buf = Vec::with_capacity(44 + pcm.len() * 2);
+
+    // RIFF header
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&file_len.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+
+    // fmt chunk
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes()); // chunk size
+    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM format
+    buf.extend_from_slice(&1u16.to_le_bytes()); // mono
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
+    buf.extend_from_slice(&2u16.to_le_bytes()); // block align
+    buf.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+
+    // data chunk
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_len.to_le_bytes());
+    for &sample in pcm {
+        buf.extend_from_slice(&sample.to_le_bytes());
+    }
+
+    buf
+}
+
+/// Parse a WAV byte buffer, returning PCM16 samples and sample rate.
+/// Handles standard RIFF/WAVE with PCM16 format.
+pub fn parse_wav(data: &[u8]) -> Result<(Vec<i16>, u32), String> {
+    if data.len() < 44 {
+        return Err("WAV too short".into());
+    }
+    if &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        return Err("Not a WAV file".into());
+    }
+
+    let sample_rate = u32::from_le_bytes(
+        data[24..28].try_into().map_err(|_| "Bad sample rate")?,
+    );
+    let bits_per_sample = u16::from_le_bytes(
+        data[34..36].try_into().map_err(|_| "Bad bits/sample")?,
+    );
+
+    if bits_per_sample != 16 {
+        return Err(format!("Expected 16-bit PCM, got {bits_per_sample}-bit"));
+    }
+
+    // Find the "data" chunk
+    let mut offset = 12;
+    while offset + 8 < data.len() {
+        let chunk_id = &data[offset..offset + 4];
+        let chunk_size = u32::from_le_bytes(
+            data[offset + 4..offset + 8]
+                .try_into()
+                .map_err(|_| "Bad chunk size")?,
+        ) as usize;
+
+        if chunk_id == b"data" {
+            let pcm_start = offset + 8;
+            let pcm_end = (pcm_start + chunk_size).min(data.len());
+            let pcm_bytes = &data[pcm_start..pcm_end];
+            let samples: Vec<i16> = pcm_bytes
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            return Ok((samples, sample_rate));
+        }
+        offset += 8 + chunk_size;
+    }
+
+    Err("No data chunk found in WAV".into())
+}
+
+/// Resample PCM16 from one sample rate to another using linear interpolation.
+pub fn resample(pcm: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
+    if from_rate == to_rate || pcm.is_empty() {
+        return pcm.to_vec();
+    }
+    let ratio = from_rate as f64 / to_rate as f64;
+    let out_len = (pcm.len() as f64 / ratio).ceil() as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src_pos = i as f64 * ratio;
+        let idx = src_pos as usize;
+        let frac = src_pos - idx as f64;
+        let s0 = pcm[idx] as f64;
+        let s1 = if idx + 1 < pcm.len() {
+            pcm[idx + 1] as f64
+        } else {
+            s0
+        };
+        out.push((s0 + frac * (s1 - s0)) as i16);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Markdown-to-Speakable Text Cleanup
+// ---------------------------------------------------------------------------
+
+/// Strip markdown formatting from text to make it suitable for TTS.
+///
+/// Removes code blocks, inline code, link URLs, heading markers, bold/italic
+/// markers, and HTML tags. Keeps the readable text content.
+pub fn markdown_to_speakable(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(&ch) = chars.peek() {
+        match ch {
+            // Fenced code blocks: skip entirely
+            '`' => {
+                // Check for ``` (fenced block)
+                let backtick_count = count_char(&mut chars, '`');
+                if backtick_count >= 3 {
+                    // Skip until closing ```
+                    let mut closing = 0;
+                    for c in chars.by_ref() {
+                        if c == '`' {
+                            closing += 1;
+                            if closing >= 3 {
+                                break;
+                            }
+                        } else {
+                            closing = 0;
+                        }
+                    }
+                    result.push_str(" code omitted ");
+                } else {
+                    // Inline code: skip backticks, keep text
+                    let mut code_text = String::new();
+                    for c in chars.by_ref() {
+                        if c == '`' {
+                            break;
+                        }
+                        code_text.push(c);
+                    }
+                    // Only speak short inline code (filenames etc.)
+                    if code_text.len() <= 30 {
+                        result.push_str(&code_text);
+                    } else {
+                        result.push_str(" code ");
+                    }
+                }
+            }
+            // Links: [text](url) → keep text
+            '[' => {
+                chars.next();
+                let mut link_text = String::new();
+                let mut depth = 1;
+                for c in chars.by_ref() {
+                    if c == '[' {
+                        depth += 1;
+                    } else if c == ']' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    link_text.push(c);
+                }
+                // Skip (url) part
+                if chars.peek() == Some(&'(') {
+                    chars.next();
+                    let mut paren_depth = 1;
+                    for c in chars.by_ref() {
+                        if c == '(' {
+                            paren_depth += 1;
+                        } else if c == ')' {
+                            paren_depth -= 1;
+                            if paren_depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                result.push_str(&link_text);
+            }
+            // Bold/italic markers
+            '*' | '_' => {
+                chars.next();
+                // Skip consecutive markers
+                while chars.peek() == Some(&ch) {
+                    chars.next();
+                }
+            }
+            // Heading markers at start of line
+            '#' => {
+                chars.next();
+                while chars.peek() == Some(&'#') {
+                    chars.next();
+                }
+                // Skip the space after #
+                if chars.peek() == Some(&' ') {
+                    chars.next();
+                }
+            }
+            // HTML tags: skip <...>
+            '<' => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c == '>' {
+                        break;
+                    }
+                }
+            }
+            // Strikethrough ~~text~~
+            '~' => {
+                chars.next();
+                if chars.peek() == Some(&'~') {
+                    chars.next();
+                } else {
+                    result.push('~');
+                }
+            }
+            // Everything else: keep
+            _ => {
+                result.push(ch);
+                chars.next();
+            }
+        }
+    }
+
+    // Collapse multiple spaces/newlines
+    let mut collapsed = String::with_capacity(result.len());
+    let mut last_was_space = false;
+    for ch in result.chars() {
+        if ch.is_whitespace() {
+            if !last_was_space {
+                collapsed.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            collapsed.push(ch);
+            last_was_space = false;
+        }
+    }
+
+    collapsed.trim().to_string()
+}
+
+fn count_char(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, target: char) -> usize {
+    let mut count = 0;
+    while chars.peek() == Some(&target) {
+        chars.next();
+        count += 1;
+    }
+    count
+}
+
+// ---------------------------------------------------------------------------
+// Sentence Buffer
+// ---------------------------------------------------------------------------
+
+/// Lightweight sentence accumulator for TTS.
+///
+/// Accumulates TextDelta fragments and yields complete sentences.
+/// Splits on `.!?` followed by whitespace or end-of-input.
+/// This is NOT the ElevenLabs paradigm — just "don't send half a word to TTS".
+pub struct SentenceBuffer {
+    buffer: String,
+    pending: VecDeque<String>,
+}
+
+impl SentenceBuffer {
+    pub fn new() -> Self {
+        Self {
+            buffer: String::new(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// Push a text delta. Internally splits on sentence boundaries.
+    pub fn push(&mut self, text: &str) {
+        self.buffer.push_str(text);
+        self.extract_sentences();
+    }
+
+    /// Pop the next complete sentence, if available.
+    pub fn next_sentence(&mut self) -> Option<String> {
+        self.pending.pop_front()
+    }
+
+    /// Flush any remaining text as a final sentence.
+    pub fn flush(&mut self) -> Option<String> {
+        let remaining = self.buffer.trim().to_string();
+        self.buffer.clear();
+        if remaining.is_empty() {
+            None
+        } else {
+            Some(remaining)
+        }
+    }
+
+    fn extract_sentences(&mut self) {
+        loop {
+            let split_pos = self.find_sentence_end();
+            match split_pos {
+                Some(pos) => {
+                    let sentence: String = self.buffer[..pos].trim().to_string();
+                    self.buffer = self.buffer[pos..].trim_start().to_string();
+                    if !sentence.is_empty() {
+                        self.pending.push_back(sentence);
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn find_sentence_end(&self) -> Option<usize> {
+        let bytes = self.buffer.as_bytes();
+        for i in 0..bytes.len() {
+            if matches!(bytes[i], b'.' | b'!' | b'?') {
+                // Check if followed by whitespace or end
+                let next = i + 1;
+                if next >= bytes.len() || bytes[next].is_ascii_whitespace() {
+                    return Some(next);
+                }
+            }
+        }
+        None
     }
 }
 
@@ -406,10 +1028,185 @@ mod tests {
 
     #[test]
     fn test_voice_session_new() {
-        let session = VoiceSession::new(SessionInitPayload::default()).unwrap();
+        let session =
+            VoiceSession::new(SessionInitPayload::default(), VoiceConfig::default()).unwrap();
         assert_eq!(session.state, VoiceSessionState::Idle);
         assert!(!session.session_id.is_empty());
         assert_eq!(session.init.sample_rate, 16000);
+        assert!(session.pcm_buffer.is_empty());
+    }
+
+    // --- WAV utilities ---
+
+    #[test]
+    fn test_pcm_to_wav_roundtrip() {
+        let pcm: Vec<i16> = (0..1600).map(|i| (i * 3) as i16).collect();
+        let wav = pcm_to_wav(&pcm, 16000);
+        let (decoded, rate) = parse_wav(&wav).unwrap();
+        assert_eq!(rate, 16000);
+        assert_eq!(decoded, pcm);
+    }
+
+    #[test]
+    fn test_parse_wav_too_short() {
+        assert!(parse_wav(&[0; 10]).is_err());
+    }
+
+    #[test]
+    fn test_parse_wav_not_wav() {
+        assert!(parse_wav(&[0; 44]).is_err());
+    }
+
+    // --- Resampler ---
+
+    #[test]
+    fn test_resample_identity() {
+        let pcm: Vec<i16> = (0..100).map(|i| i * 100).collect();
+        let out = resample(&pcm, 16000, 16000);
+        assert_eq!(out, pcm);
+    }
+
+    #[test]
+    fn test_resample_downsample() {
+        // 24kHz → 16kHz should produce 2/3 the samples
+        let pcm: Vec<i16> = vec![0; 2400];
+        let out = resample(&pcm, 24000, 16000);
+        assert_eq!(out.len(), 1600);
+    }
+
+    // --- Markdown to speakable ---
+
+    #[test]
+    fn test_markdown_plain_text() {
+        assert_eq!(markdown_to_speakable("Hello world"), "Hello world");
+    }
+
+    #[test]
+    fn test_markdown_bold_italic() {
+        assert_eq!(markdown_to_speakable("This is **bold** and *italic*"), "This is bold and italic");
+    }
+
+    #[test]
+    fn test_markdown_code_block() {
+        let input = "Here is code:\n```rust\nfn main() {}\n```\nDone.";
+        let output = markdown_to_speakable(input);
+        assert!(output.contains("code omitted"));
+        assert!(output.contains("Done."));
+        assert!(!output.contains("fn main"));
+    }
+
+    #[test]
+    fn test_markdown_inline_code_short() {
+        assert_eq!(markdown_to_speakable("Run `ls -la` now"), "Run ls -la now");
+    }
+
+    #[test]
+    fn test_markdown_link() {
+        assert_eq!(
+            markdown_to_speakable("See [the docs](https://example.com) for details"),
+            "See the docs for details"
+        );
+    }
+
+    #[test]
+    fn test_markdown_heading() {
+        assert_eq!(markdown_to_speakable("## Section Title"), "Section Title");
+    }
+
+    // --- Sentence buffer ---
+
+    #[test]
+    fn test_sentence_buffer_single() {
+        let mut buf = SentenceBuffer::new();
+        buf.push("Hello world. ");
+        assert_eq!(buf.next_sentence(), Some("Hello world.".to_string()));
+        assert_eq!(buf.next_sentence(), None);
+    }
+
+    #[test]
+    fn test_sentence_buffer_multiple() {
+        let mut buf = SentenceBuffer::new();
+        buf.push("First. Second! Third? ");
+        assert_eq!(buf.next_sentence(), Some("First.".to_string()));
+        assert_eq!(buf.next_sentence(), Some("Second!".to_string()));
+        assert_eq!(buf.next_sentence(), Some("Third?".to_string()));
+    }
+
+    #[test]
+    fn test_sentence_buffer_incremental() {
+        let mut buf = SentenceBuffer::new();
+        buf.push("This is a ");
+        assert_eq!(buf.next_sentence(), None);
+        buf.push("sentence. And another.");
+        assert_eq!(buf.next_sentence(), Some("This is a sentence.".to_string()));
+        // "And another." ends with period at end-of-buffer — counts as complete sentence
+        assert_eq!(buf.next_sentence(), Some("And another.".to_string()));
+    }
+
+    #[test]
+    fn test_sentence_buffer_partial_word() {
+        let mut buf = SentenceBuffer::new();
+        buf.push("Hello worl");
+        assert_eq!(buf.next_sentence(), None); // no sentence boundary
+        buf.push("d. Done.");
+        assert_eq!(buf.next_sentence(), Some("Hello world.".to_string()));
+        assert_eq!(buf.next_sentence(), Some("Done.".to_string()));
+    }
+
+    #[test]
+    fn test_sentence_buffer_flush_empty() {
+        let mut buf = SentenceBuffer::new();
+        assert_eq!(buf.flush(), None);
+    }
+
+    // --- VAD / VoiceSession state machine ---
+
+    #[test]
+    fn test_vad_silence_ignored() {
+        let mut session =
+            VoiceSession::new(SessionInitPayload::default(), VoiceConfig::default()).unwrap();
+        let silence = vec![0i16; OPUS_FRAME_SAMPLES];
+        match session.handle_audio(&silence) {
+            VoiceAction::Continue => {} // expected
+            VoiceAction::Transcribe(_) => panic!("Should not transcribe silence"),
+        }
+        assert_eq!(session.state, VoiceSessionState::Idle);
+    }
+
+    #[test]
+    fn test_vad_speech_then_silence_triggers_transcribe() {
+        let mut config = VoiceConfig::default();
+        config.vad_silence_ms = 40; // 2 frames of silence at 20ms each
+        config.vad_energy_threshold = 0.001;
+        let mut session =
+            VoiceSession::new(SessionInitPayload::default(), config).unwrap();
+
+        // Send loud audio (speech)
+        let speech: Vec<i16> = (0..OPUS_FRAME_SAMPLES).map(|i| ((i % 50) as i16 * 500)).collect();
+        assert!(matches!(session.handle_audio(&speech), VoiceAction::Continue));
+        assert_eq!(session.state, VoiceSessionState::Listening);
+
+        // Send silence
+        let silence = vec![0i16; OPUS_FRAME_SAMPLES];
+        assert!(matches!(session.handle_audio(&silence), VoiceAction::Continue));
+        // Second silence frame should trigger transcription
+        match session.handle_audio(&silence) {
+            VoiceAction::Transcribe(pcm) => {
+                assert!(!pcm.is_empty());
+                assert_eq!(session.state, VoiceSessionState::Transcribing);
+            }
+            VoiceAction::Continue => panic!("Expected Transcribe after silence threshold"),
+        }
+    }
+
+    #[test]
+    fn test_vad_reset_to_idle() {
+        let mut session =
+            VoiceSession::new(SessionInitPayload::default(), VoiceConfig::default()).unwrap();
+        session.state = VoiceSessionState::Speaking;
+        session.pcm_buffer.extend_from_slice(&[1, 2, 3]);
+        session.reset_to_idle();
+        assert_eq!(session.state, VoiceSessionState::Idle);
         assert!(session.pcm_buffer.is_empty());
     }
 

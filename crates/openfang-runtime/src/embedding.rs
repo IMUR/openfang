@@ -104,18 +104,22 @@ impl OpenAIEmbeddingDriver {
 
 /// Infer embedding dimensions from model name.
 fn infer_dimensions(model: &str) -> usize {
-    match model {
+    let m = model.to_lowercase();
+    match m.as_str() {
         // OpenAI
         "text-embedding-3-small" => 1536,
         "text-embedding-3-large" => 3072,
         "text-embedding-ada-002" => 1536,
         // Sentence Transformers / local models
-        "all-MiniLM-L6-v2" => 384,
-        "all-MiniLM-L12-v2" => 384,
+        "all-minilm-l6-v2" => 384,
+        "all-minilm-l12-v2" => 384,
         "all-mpnet-base-v2" => 768,
         "nomic-embed-text" => 768,
         "mxbai-embed-large" => 1024,
-        // Default to 1536 (most common)
+        _ if m.contains("bge-small") || m.ends_with("bge-small-en-v1.5") => 384,
+        _ if m.contains("bge-base") => 768,
+        _ if m.contains("nomic-embed") => 768,
+        // Default to 1536 (most common cloud default)
         _ => 1536,
     }
 }
@@ -178,6 +182,9 @@ impl EmbeddingDriver for OpenAIEmbeddingDriver {
 ///
 /// Separate from `create_embedding_driver` because model loading is async
 /// (HF Hub download on first use, then CUDA memory transfer).
+///
+/// Only available when `openfang-runtime` is built with feature **`memory-candle`**.
+#[cfg(feature = "memory-candle")]
 pub async fn create_candle_embedding_driver(
     model: &str,
     home_dir: &std::path::Path,

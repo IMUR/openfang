@@ -7,6 +7,31 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// Scope vocabulary for memory classification.
+///
+/// Scopes determine how memories are recalled and how they decay over time.
+/// Every `remember()` call should use one of these constants; raw string
+/// literals outside this module are a sign the classification path was skipped.
+pub mod scope {
+    /// Conversation turns — default for user/assistant exchanges.
+    pub const EPISODIC: &str = "episodic";
+    /// Distilled knowledge / L1 summaries produced by the consolidation engine.
+    pub const SEMANTIC: &str = "semantic";
+    /// How-to knowledge derived from tool outputs and procedural observations.
+    pub const PROCEDURAL: &str = "procedural";
+    /// Facts, preferences, and user-stated information.
+    pub const DECLARATIVE: &str = "declarative";
+}
+
+/// Category labels used in `metadata.category` for classification.
+pub mod category {
+    pub const FACT: &str = "fact";
+    pub const PREFERENCE: &str = "preference";
+    pub const INSTRUCTION: &str = "instruction";
+    pub const OBSERVATION: &str = "observation";
+    pub const QUESTION: &str = "question";
+}
+
 /// Unique identifier for a memory fragment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MemoryId(pub Uuid);
@@ -303,6 +328,18 @@ pub trait Memory: Send + Sync {
 
     /// Soft-delete a memory fragment.
     async fn forget(&self, id: MemoryId) -> crate::error::OpenFangResult<()>;
+
+    /// Replace the metadata of an existing memory record.
+    ///
+    /// Used to back-fill enrichment data (NER entity links, classification
+    /// results) after the initial write. Callers that want to add a single
+    /// key without overwriting others should use the concrete
+    /// `MemorySubstrate::set_metadata_entities` method instead.
+    async fn update_metadata(
+        &self,
+        memory_id: &str,
+        metadata: HashMap<String, serde_json::Value>,
+    ) -> crate::error::OpenFangResult<()>;
 
     // -- Knowledge graph operations --
 

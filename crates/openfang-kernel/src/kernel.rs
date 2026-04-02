@@ -116,9 +116,15 @@ pub struct OpenFangKernel {
     pub embedding_driver:
         Option<Arc<dyn openfang_runtime::embedding::EmbeddingDriver + Send + Sync>>,
     /// NER driver for knowledge graph auto-population on memory writes (None = disabled).
+    /// Present only when OpenFang is built with `memory-candle`.
+    #[cfg(feature = "memory-candle")]
     pub ner_driver: Option<Arc<openfang_runtime::candle_ner::CandleNerDriver>>,
     /// Cross-encoder reranker for HNSW candidate reranking (None = disabled).
+    #[cfg(feature = "memory-candle")]
     pub reranker: Option<Arc<openfang_runtime::candle_reranker::CandleReranker>>,
+    /// Zero-shot NLI memory classifier (None = use rule-based fallback).
+    #[cfg(feature = "memory-candle")]
+    pub classifier: Option<Arc<openfang_runtime::candle_classifier::CandleClassifier>>,
     /// Hand registry — curated autonomous capability packages.
     pub hand_registry: openfang_hands::registry::HandRegistry,
     /// Credential resolver — vault → dotenv → env var priority chain.
@@ -860,7 +866,7 @@ impl OpenFangKernel {
         let embedding_driver: Option<
             Arc<dyn openfang_runtime::embedding::EmbeddingDriver + Send + Sync>,
         > = {
-            use openfang_runtime::embedding::{create_candle_embedding_driver, create_embedding_driver};
+            use openfang_runtime::embedding::create_embedding_driver;
             let configured_model = &config.memory.embedding_model;
             if let Some(ref provider) = config.memory.embedding_provider {
                 // Explicit config takes priority — use the configured embedding model.
@@ -874,16 +880,35 @@ impl OpenFangKernel {
                 };
 
                 if provider == "candle" {
-                    // Candle in-process CUDA backend — async model loading
-                    match create_candle_embedding_driver(model, &config.home_dir, config.memory.cuda_device).await {
-                        Ok(d) => {
-                            info!(model = %model, cuda_device = ?config.memory.cuda_device, "Embedding driver configured: Candle (in-process CUDA)");
-                            Some(Arc::from(d))
+                    #[cfg(feature = "memory-candle")]
+                    {
+                        // Candle in-process CUDA/CPU backend — async model loading
+                        match openfang_runtime::embedding::create_candle_embedding_driver(
+                            model,
+                            &config.home_dir,
+                            config.memory.cuda_device,
+                        )
+                        .await
+                        {
+                            Ok(d) => {
+                                info!(model = %model, cuda_device = ?config.memory.cuda_device, "Embedding driver configured: Candle (in-process)");
+                                Some(Arc::from(d))
+                            }
+                            Err(e) => {
+                                warn!(model = %model, error = %e, "Candle embedding driver init failed — falling back to text search");
+                                None
+                            }
                         }
-                        Err(e) => {
-                            warn!(model = %model, error = %e, "Candle embedding driver init failed — falling back to text search");
-                            None
-                        }
+                    }
+                    #[cfg(not(feature = "memory-candle"))]
+                    {
+                        warn!(
+                            model = %model,
+                            "embedding_provider=\"candle\" is set but this binary was built without the memory-candle feature. \
+                             Use embedding_provider=\"ollama\" (or another HTTP /v1/embeddings provider) and point provider_urls, \
+                             or rebuild with: cargo build -p openfang-cli --release --features memory-candle"
+                        );
+                        None
                     }
                 } else {
                 let api_key_env = config.memory.embedding_api_key_env.as_deref().unwrap_or("");
@@ -940,50 +965,108 @@ impl OpenFangKernel {
             }
         };
 
-        // Load Candle NER and reranker when the embedding provider is "candle".
-        // These run on the same CUDA device as the embedding driver.
-        // Failures are logged as warnings — the system degrades gracefully.
-        let (candle_ner, candle_reranker) = if config.memory.embedding_provider.as_deref() == Some("candle") {
-            let cuda = config.memory.cuda_device;
-            let home = config.home_dir.clone();
+        // Candle NER / reranker / classifier: independent of embedding provider when backend = "candle".
+        #[cfg(feature = "memory-candle")]
+        let (candle_ner, candle_reranker, candle_classifier) = {
+            let want_ner = config.memory.wants_candle_ner();
+            let want_rerank = config.memory.wants_candle_reranker();
+            let want_classify = config.memory.wants_candle_classification();
+            if !want_ner && !want_rerank && !want_classify {
+                (None, None, None)
+            } else {
+                let cuda = config.memory.cuda_device;
+                let home = config.home_dir.clone();
 
-            let ner = if let Some(ref model_id) = config.memory.ner_model {
-                let model_id = model_id.clone();
-                match openfang_runtime::candle_ner::CandleNerDriver::load(&model_id, &home, cuda).await {
-                    Ok(d) => {
-                        info!(model = %model_id, ?cuda, "NER driver loaded — knowledge graph auto-population active");
-                        Some(Arc::new(d))
-                    }
-                    Err(e) => {
-                        warn!(model = %model_id, error = %e, "NER driver failed to load — knowledge graph will not be auto-populated");
+                let ner = if want_ner {
+                    if let Some(ref model_id) = config.memory.ner_model {
+                        let model_id = model_id.clone();
+                        match openfang_runtime::candle_ner::CandleNerDriver::load(
+                            &model_id, &home, cuda,
+                        )
+                        .await
+                        {
+                            Ok(d) => {
+                                info!(model = %model_id, ?cuda, "NER driver loaded — knowledge graph auto-population active");
+                                Some(Arc::new(d))
+                            }
+                            Err(e) => {
+                                warn!(model = %model_id, error = %e, "NER driver failed to load — knowledge graph will not be auto-populated");
+                                None
+                            }
+                        }
+                    } else {
                         None
                     }
-                }
-            } else {
-                info!("NER driver disabled (ner_model = null in config)");
-                None
-            };
+                } else if config.memory.ner_model.is_none() {
+                    info!("NER driver disabled (ner_model not set)");
+                    None
+                } else {
+                    info!("NER driver disabled by ner_backend policy (use candle to force in-process NER)");
+                    None
+                };
 
-            let reranker = if let Some(ref model_id) = config.memory.reranker_model {
-                let model_id = model_id.clone();
-                match openfang_runtime::candle_reranker::CandleReranker::load(&model_id, &home, cuda).await {
-                    Ok(d) => {
-                        info!(model = %model_id, ?cuda, "Cross-encoder reranker loaded — HNSW reranking active");
-                        Some(Arc::new(d))
-                    }
-                    Err(e) => {
-                        warn!(model = %model_id, error = %e, "Reranker failed to load — HNSW candidates will not be reranked");
+                let reranker = if want_rerank {
+                    if let Some(ref model_id) = config.memory.reranker_model {
+                        let model_id = model_id.clone();
+                        match openfang_runtime::candle_reranker::CandleReranker::load(
+                            &model_id,
+                            &home,
+                            cuda,
+                        )
+                        .await
+                        {
+                            Ok(d) => {
+                                info!(model = %model_id, ?cuda, "Cross-encoder reranker loaded — HNSW reranking active");
+                                Some(Arc::new(d))
+                            }
+                            Err(e) => {
+                                warn!(model = %model_id, error = %e, "Reranker failed to load — HNSW candidates will not be reranked");
+                                None
+                            }
+                        }
+                    } else {
                         None
                     }
-                }
-            } else {
-                info!("Reranker disabled (reranker_model = null in config)");
-                None
-            };
+                } else if config.memory.reranker_model.is_none() {
+                    info!("Reranker disabled (reranker_model not set)");
+                    None
+                } else {
+                    info!("Reranker disabled by reranker_backend policy (use candle to force in-process reranking)");
+                    None
+                };
 
-            (ner, reranker)
-        } else {
-            (None, None)
+                let classifier = if want_classify {
+                    if let Some(ref model_id) = config.memory.classification_model {
+                        let model_id = model_id.clone();
+                        match openfang_runtime::candle_classifier::CandleClassifier::load(
+                            &model_id,
+                            &home,
+                            cuda,
+                        )
+                        .await
+                        {
+                            Ok(d) => {
+                                info!(model = %model_id, ?cuda, "NLI classifier loaded — ML-based memory classification active");
+                                Some(Arc::new(d))
+                            }
+                            Err(e) => {
+                                warn!(model = %model_id, error = %e, "NLI classifier failed to load — falling back to rule-based classification");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else if config.memory.classification_model.is_none() {
+                    info!("Classifier disabled (classification_model not set)");
+                    None
+                } else {
+                    info!("Classifier disabled by classification_backend policy (use candle to force ML classification)");
+                    None
+                };
+
+                (ner, reranker, classifier)
+            }
         };
 
         let browser_ctx = openfang_runtime::browser::BrowserManager::new(config.browser.clone());
@@ -1049,8 +1132,12 @@ impl OpenFangKernel {
             tts_engine,
             pairing,
             embedding_driver,
+            #[cfg(feature = "memory-candle")]
             ner_driver: candle_ner,
+            #[cfg(feature = "memory-candle")]
             reranker: candle_reranker,
+            #[cfg(feature = "memory-candle")]
+            classifier: candle_classifier,
             hand_registry,
             credential_resolver: std::sync::Mutex::new(credential_resolver),
             extension_registry: std::sync::RwLock::new(extension_registry),
@@ -1487,8 +1574,9 @@ impl OpenFangKernel {
 
     /// Load and activate the Candle NER driver for knowledge graph population.
     ///
-    /// Called after the kernel is fully booted and the Candle embedding driver
-    /// has been validated. Safe to call more than once (idempotent).
+    /// Does not depend on the embedding provider; use when activating NER after
+    /// a config reload or delayed model fetch. Safe to call more than once (idempotent).
+    #[cfg(feature = "memory-candle")]
     pub async fn activate_ner_driver(
         &mut self,
         model_id: &str,
@@ -1509,6 +1597,7 @@ impl OpenFangKernel {
     /// Load and activate the Candle cross-encoder reranker.
     ///
     /// Called after the kernel is fully booted. Safe to call more than once.
+    #[cfg(feature = "memory-candle")]
     pub async fn activate_reranker(&mut self, model_id: &str, cuda_device: Option<u32>) {
         use openfang_runtime::candle_reranker::CandleReranker;
         match CandleReranker::load(model_id, &self.config.home_dir, cuda_device).await {
@@ -1532,48 +1621,326 @@ impl OpenFangKernel {
         text: &str,
         memory_id: &str,
     ) {
-        let Some(ref ner) = self.ner_driver else { return };
+        #[cfg(not(feature = "memory-candle"))]
+        {
+            let _ = (agent_id, text, memory_id);
+            return;
+        }
 
-        match ner.extract_entities(text, 0.70).await {
-            Ok(entities) => {
-                for entity in entities {
-                    use openfang_types::memory::{Entity, Relation, RelationType};
-                    use chrono::Utc;
+        #[cfg(feature = "memory-candle")]
+        {
+            let Some(ref ner) = self.ner_driver else { return };
 
-                    let entity_id = format!("{}-{}", agent_id, entity.text.to_lowercase().replace(' ', "_"));
-                    let e = Entity {
-                        id: entity_id.clone(),
-                        entity_type: entity.entity_type,
-                        name: entity.text.clone(),
-                        properties: std::collections::HashMap::new(),
-                        created_at: Utc::now(),
-                        updated_at: Utc::now(),
-                    };
+            match ner.extract_entities(text, 0.70).await {
+                Ok(entities) => {
+                    let mut entity_ids: Vec<String> = Vec::new();
 
-                    if let Err(err) = self.memory.add_entity(e).await {
-                        tracing::debug!(error = %err, "Failed to add entity to KG");
+                    for entity in &entities {
+                        use chrono::Utc;
+                        use openfang_types::memory::Entity;
+
+                        let entity_id = format!(
+                            "{}-{}",
+                            agent_id,
+                            entity.text.to_lowercase().replace(' ', "_")
+                        );
+                        let e = Entity {
+                            id: entity_id.clone(),
+                            entity_type: entity.entity_type.clone(),
+                            name: entity.text.clone(),
+                            properties: std::collections::HashMap::new(),
+                            created_at: Utc::now(),
+                            updated_at: Utc::now(),
+                        };
+
+                        match self.memory.add_entity(e).await {
+                            Ok(_) => entity_ids.push(entity_id),
+                            Err(err) => {
+                                tracing::debug!(error = %err, "Failed to add entity to KG");
+                            }
+                        }
+                    }
+
+                    // Back-link entity IDs into the memory record's metadata.
+                    // Uses a nested-field SET so other metadata keys are preserved.
+                    if !entity_ids.is_empty() && !memory_id.is_empty() {
+                        if let Err(err) = self.memory.set_metadata_entities(memory_id, entity_ids.clone()).await {
+                            tracing::debug!(error = %err, memory_id, "Failed to back-link entities in metadata");
+                        } else {
+                            tracing::debug!(
+                                memory_id,
+                                entity_count = entity_ids.len(),
+                                "NER entity back-links written to memory metadata"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "NER extraction failed");
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // L1 Summarization
+    // -----------------------------------------------------------------
+
+    /// Run one round of L1 summarization for all agents that have old, unsummarised
+    /// episodic memories.
+    ///
+    /// Called from the consolidation background loop (Phase 3a / 4d).
+    /// Fetches batches of episodic memories per agent, calls the default LLM driver
+    /// to generate a concise summary, and stores it as a `semantic` memory.
+    /// The source memories are then marked with `metadata.summarized_into` and their
+    /// confidence is reduced to accelerate natural decay.
+    pub async fn run_l1_summarization(&self) {
+        use openfang_types::message::{Message, MessageContent, Role};
+
+        let agent_ids = match self.memory.all_active_agent_ids().await {
+            Ok(ids) => ids,
+            Err(e) => {
+                debug!(error = %e, "L1 summarization: could not list active agents");
+                return;
+            }
+        };
+
+        for agent_id in agent_ids {
+            let batch = match self
+                .memory
+                .fetch_episodic_for_summarization(agent_id, 24, 20)
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    debug!(error = %e, %agent_id, "L1 summarization: fetch batch failed");
+                    continue;
+                }
+            };
+
+            if batch.len() < 5 {
+                continue;
+            }
+
+            let combined = batch
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n---\n");
+
+            let req = CompletionRequest {
+                model: self.config.default_model.model.clone(),
+                system: Some(
+                    "You are a memory consolidation engine. Produce a single concise paragraph \
+                     that preserves all important facts, preferences, and decisions from the \
+                     memories below. Omit greetings, filler, and repeated information."
+                        .to_string(),
+                ),
+                messages: vec![Message {
+                    role: Role::User,
+                    content: MessageContent::Text(combined),
+                }],
+                max_tokens: 512,
+                temperature: 0.3,
+                tools: vec![],
+                thinking: None,
+            };
+
+            match self.default_driver.complete(req).await {
+                Ok(resp) => {
+                    let summary_text: String = resp
+                        .content
+                        .iter()
+                        .filter_map(|b| {
+                            if let openfang_types::message::ContentBlock::Text { text, .. } = b {
+                                Some(text.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+
+                    if summary_text.is_empty() {
                         continue;
                     }
 
-                    // Link the entity back to the memory that mentioned it
-                    let relation = Relation {
-                        source: memory_id.to_string(),
-                        relation: RelationType::RelatedTo,
-                        target: entity_id,
-                        properties: {
-                            let mut m = std::collections::HashMap::new();
-                            m.insert("confidence".into(), serde_json::json!(entity.confidence));
-                            m
-                        },
-                        confidence: entity.confidence,
-                        created_at: Utc::now(),
-                    };
+                    let mem_ids: Vec<String> =
+                        batch.iter().map(|m| m.memory_id.clone()).collect();
 
-                    let _ = self.memory.add_relation(relation).await;
+                    match self
+                        .memory
+                        .write_l1_summary(agent_id, &summary_text, mem_ids.clone())
+                        .await
+                    {
+                        Ok(summary_id) => {
+                            let sid = summary_id.0.to_string();
+                            let _ = self
+                                .memory
+                                .mark_memories_summarized(&mem_ids, &sid, 0.3)
+                                .await;
+                            info!(
+                                %agent_id,
+                                summary_id = %summary_id.0,
+                                source_count = mem_ids.len(),
+                                "L1 semantic summary generated"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = %e, %agent_id, "L1 summarization: write summary failed");
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, %agent_id, "L1 summarization: LLM call failed");
+                }
+            }
+        }
+    }
+
+    /// Generate a session summary memory if the session has accumulated a multiple of
+    /// `SESSION_SUMMARY_EVERY_N` turns since start.
+    ///
+    /// Stores the summary as a `semantic` memory linked to the current session.
+    /// Called from `send_message` and `send_message_streaming` after each turn (Phase 3b).
+    async fn try_generate_session_summary(
+        &self,
+        agent_id: AgentId,
+        session_id: openfang_types::agent::SessionId,
+        messages: &[openfang_types::message::Message],
+    ) {
+        use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
+
+        // Only generate a summary every N turns (N = 10).
+        const SESSION_SUMMARY_EVERY_N: usize = 10;
+
+        let user_turns = messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .count();
+
+        if user_turns == 0 || user_turns % SESSION_SUMMARY_EVERY_N != 0 {
+            return;
+        }
+
+        // Build a transcript of the last N user+assistant turns for summarization.
+        let last_turns: Vec<&Message> = messages
+            .iter()
+            .filter(|m| matches!(m.role, Role::User | Role::Assistant))
+            .rev()
+            .take(SESSION_SUMMARY_EVERY_N * 2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        let transcript: String = last_turns
+            .iter()
+            .map(|m| {
+                let text = match &m.content {
+                    MessageContent::Text(t) => t.clone(),
+                    MessageContent::Blocks(blocks) => blocks
+                        .iter()
+                        .filter_map(|b| {
+                            if let ContentBlock::Text { text, .. } = b {
+                                Some(text.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                };
+                let role_str = match m.role {
+                    Role::User => "User",
+                    Role::Assistant => "Assistant",
+                    Role::System => "System",
+                };
+                format!("{}: {}", role_str, text)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let req = CompletionRequest {
+            model: self.config.default_model.model.clone(),
+            system: Some(
+                "Summarise the following conversation excerpt into a concise paragraph. \
+                 Focus on decisions made, facts established, and open questions. \
+                 Omit filler and pleasantries."
+                    .to_string(),
+            ),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text(transcript),
+            }],
+            max_tokens: 256,
+            temperature: 0.3,
+            tools: vec![],
+            thinking: None,
+        };
+
+        match self.default_driver.complete(req).await {
+            Ok(resp) => {
+                let summary_text: String = resp
+                    .content
+                    .iter()
+                    .filter_map(|b| {
+                        if let ContentBlock::Text { text, .. } = b {
+                            Some(text.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                if summary_text.is_empty() {
+                    return;
+                }
+
+                let mut meta = std::collections::HashMap::new();
+                meta.insert(
+                    "session_id".to_string(),
+                    serde_json::json!(session_id.0.to_string()),
+                );
+                meta.insert("source_role".to_string(), serde_json::json!("system"));
+                meta.insert("category".to_string(), serde_json::json!("observation"));
+                meta.insert(
+                    "classification_source".to_string(),
+                    serde_json::json!("session_summary"),
+                );
+                meta.insert(
+                    "turn_at_summary".to_string(),
+                    serde_json::json!(user_turns),
+                );
+
+                match self
+                    .memory
+                    .remember(
+                        agent_id,
+                        &summary_text,
+                        openfang_types::memory::MemorySource::System,
+                        openfang_types::memory::scope::SEMANTIC,
+                        meta,
+                    )
+                    .await
+                {
+                    Ok(mem_id) => {
+                        info!(
+                            %agent_id,
+                            session = %session_id.0,
+                            turn = user_turns,
+                            memory_id = %mem_id.0,
+                            "Session summary memory written"
+                        );
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "Session summary write failed");
+                    }
                 }
             }
             Err(e) => {
-                tracing::debug!(error = %e, "NER extraction failed");
+                debug!(error = %e, "Session summary LLM call failed");
             }
         }
     }
@@ -2114,6 +2481,12 @@ impl OpenFangKernel {
                 Some(&kernel_clone.web_ctx),
                 Some(&kernel_clone.browser_ctx),
                 kernel_clone.embedding_driver.as_deref(),
+                #[cfg(feature = "memory-candle")]
+                kernel_clone.reranker.as_deref(),
+                #[cfg(feature = "memory-candle")]
+                kernel_clone.ner_driver.as_deref(),
+                #[cfg(feature = "memory-candle")]
+                kernel_clone.classifier.as_deref(),
                 manifest.workspace.as_deref(),
                 Some(&phase_cb),
                 Some(&kernel_clone.media_engine),
@@ -2198,6 +2571,28 @@ impl OpenFangKernel {
                     let _ = kernel_clone
                         .registry
                         .set_state(agent_id, AgentState::Running);
+
+                    // NER: populate knowledge graph from the response (background, best-effort)
+                    #[cfg(feature = "memory-candle")]
+                    if kernel_clone.ner_driver.is_some() {
+                        let kc = kernel_clone.clone();
+                        let response_text = result.response.clone();
+                        let memory_id_for_ner = result.memory_id.clone().unwrap_or_default();
+                        tokio::spawn(async move {
+                            kc.populate_knowledge_graph(agent_id, &response_text, &memory_id_for_ner).await;
+                        });
+                    }
+
+                    // Session summary (Phase 3b): every N turns generate a semantic summary.
+                    {
+                        let kc = kernel_clone.clone();
+                        let messages_snap = session.messages.clone();
+                        let session_id = session.id;
+                        tokio::spawn(async move {
+                            kc.try_generate_session_summary(agent_id, session_id, &messages_snap)
+                                .await;
+                        });
+                    }
 
                     // Post-loop compaction check: if session now exceeds token threshold,
                     // trigger compaction in background for the next call.
@@ -2317,6 +2712,7 @@ impl OpenFangKernel {
             cost_usd: None,
             silent: false,
             directives: Default::default(),
+            memory_id: None,
         })
     }
 
@@ -2377,6 +2773,7 @@ impl OpenFangKernel {
             iterations: 1,
             silent: false,
             directives: Default::default(),
+            memory_id: None,
         })
     }
 
@@ -2693,6 +3090,12 @@ impl OpenFangKernel {
             Some(&self.web_ctx),
             Some(&self.browser_ctx),
             self.embedding_driver.as_deref(),
+            #[cfg(feature = "memory-candle")]
+            self.reranker.as_deref(),
+            #[cfg(feature = "memory-candle")]
+            self.ner_driver.as_deref(),
+            #[cfg(feature = "memory-candle")]
+            self.classifier.as_deref(),
             manifest.workspace.as_deref(),
             None, // on_phase callback
             Some(&self.media_engine),
@@ -2759,6 +3162,17 @@ impl OpenFangKernel {
                 cost,
                 "llm_call",
             )
+            .await;
+
+        // NER: populate knowledge graph from the response (best-effort)
+        #[cfg(feature = "memory-candle")]
+        {
+            let memory_id_for_ner = result.memory_id.as_deref().unwrap_or("");
+            self.populate_knowledge_graph(agent_id, &result.response, memory_id_for_ner).await;
+        }
+
+        // Session summary (Phase 3b): generate a semantic summary every N turns (background).
+        self.try_generate_session_summary(agent_id, session.id, &session.messages)
             .await;
 
         // Populate cost on the result based on usage_footer mode
@@ -4160,7 +4574,7 @@ impl OpenFangKernel {
             });
         }
 
-        // Periodic memory consolidation (decays stale memory confidence)
+        // Periodic memory consolidation (decays stale memory confidence + L1 summarization)
         {
             let interval_hours = self.config.memory.consolidation_interval_hours;
             if interval_hours > 0 {
@@ -4190,6 +4604,10 @@ impl OpenFangKernel {
                                 warn!("Memory consolidation failed: {e}");
                             }
                         }
+
+                        // L1 summarization (Phase 3a / 4d): batch old episodic memories
+                        // per agent and compress them into semantic summaries via the LLM.
+                        kernel.run_l1_summarization().await;
                     }
                 });
                 info!("Memory consolidation scheduled every {interval_hours} hour(s)");

@@ -19,7 +19,7 @@ use openfang_memory::MemorySubstrate;
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::agent::{AgentManifest, FallbackModel};
 use openfang_types::error::{OpenFangError, OpenFangResult};
-use openfang_types::memory::{Memory, MemoryFilter, MemorySource};
+use openfang_types::memory::{Memory, MemoryFilter, MemorySource, scope as mem_scope, category as mem_category};
 use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
 };
@@ -88,6 +88,84 @@ fn append_tool_error_guidance(tool_result_blocks: &mut Vec<ContentBlock>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Memory classification helpers
+// ---------------------------------------------------------------------------
+
+/// Rule-based memory scope classifier.
+///
+/// Derives `scope` and `category` from `MemorySource` and content signals.
+/// This runs on every write path before optional ML classification (Phase 5).
+///
+/// Returns `(scope, category, priority)`.
+fn classify_memory(content: &str, source: &MemorySource) -> (&'static str, &'static str, &'static str) {
+    let lower = content.to_lowercase();
+
+    let scope = match source {
+        MemorySource::UserProvided => mem_scope::DECLARATIVE,
+        MemorySource::Observation => mem_scope::PROCEDURAL,
+        MemorySource::System => mem_scope::SEMANTIC,
+        MemorySource::Conversation | MemorySource::Inference | MemorySource::Document => {
+            // Content heuristics to upgrade beyond episodic
+            if is_user_directive(&lower) {
+                mem_scope::DECLARATIVE
+            } else if lower.contains("how to")
+                || lower.contains("steps to")
+                || lower.contains("procedure")
+                || lower.contains("process")
+            {
+                mem_scope::PROCEDURAL
+            } else {
+                mem_scope::EPISODIC
+            }
+        }
+    };
+
+    let category = if lower.contains('?') {
+        mem_category::QUESTION
+    } else if matches!(source, MemorySource::Observation) {
+        mem_category::OBSERVATION
+    } else if is_user_directive(&lower) {
+        mem_category::PREFERENCE
+    } else if lower.contains("how to")
+        || lower.contains("steps to")
+        || lower.contains("must ")
+        || lower.contains("should always")
+        || lower.contains("never ")
+    {
+        mem_category::INSTRUCTION
+    } else {
+        mem_category::FACT
+    };
+
+    let priority = if is_user_directive(&lower) { "high" } else { "normal" };
+
+    (scope, category, priority)
+}
+
+/// Returns true when the text contains an explicit user memory directive.
+///
+/// Patterns like "remember that", "note that", "my preference is", etc.
+fn is_user_directive(lower: &str) -> bool {
+    const PATTERNS: &[&str] = &[
+        "remember that",
+        "remember this",
+        "please remember",
+        "don't forget",
+        "note that",
+        "note this",
+        "my preference is",
+        "my preference:",
+        "i prefer",
+        "i always",
+        "i never",
+        "keep in mind",
+        "important:",
+        "always remember",
+    ];
+    PATTERNS.iter().any(|p| lower.contains(p))
+}
+
 /// Strip a provider prefix from a model ID before sending to the API.
 ///
 /// Many models are stored as `provider/org/model` (e.g. `openrouter/google/gemini-2.5-flash`)
@@ -142,6 +220,12 @@ pub struct AgentLoopResult {
     pub silent: bool,
     /// Reply directives extracted from the agent's response.
     pub directives: openfang_types::message::ReplyDirectives,
+    /// The SurrealDB record ID of the memory fragment written for this interaction.
+    ///
+    /// Passed back to the kernel so `populate_knowledge_graph` can link extracted
+    /// entities to the correct memory record rather than a hardcoded string.
+    /// `None` when memory writing was skipped (no-reply, error path, etc.).
+    pub memory_id: Option<String>,
 }
 
 /// Run the agent execution loop for a single user message.
@@ -162,6 +246,12 @@ pub async fn run_agent_loop(
     web_ctx: Option<&WebToolsContext>,
     browser_ctx: Option<&crate::browser::BrowserManager>,
     embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
+    #[cfg(feature = "memory-candle")]
+    reranker: Option<&crate::candle_reranker::CandleReranker>,
+    #[cfg(feature = "memory-candle")]
+    ner_driver: Option<&crate::candle_ner::CandleNerDriver>,
+    #[cfg(feature = "memory-candle")]
+    classifier: Option<&crate::candle_classifier::CandleClassifier>,
     workspace_root: Option<&Path>,
     on_phase: Option<&PhaseCallback>,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
@@ -182,7 +272,7 @@ pub async fn run_agent_loop(
         .unwrap_or_default();
 
     // Recall relevant memories — prefer vector similarity search when embedding driver is available
-    let memories = if let Some(emb) = embedding_driver {
+    let mut memories = if let Some(emb) = embedding_driver {
         match emb.embed_one(user_message).await {
             Ok(query_vec) => {
                 debug!("Using vector recall (dims={})", query_vec.len());
@@ -228,8 +318,158 @@ pub async fn run_agent_loop(
             .unwrap_or_default()
     };
 
-    // Fire BeforePromptBuild hook
+    #[cfg(feature = "memory-candle")]
+    if let Some(rr) = reranker {
+        if memories.len() > 1 {
+            match rr.rerank(user_message, memories.clone()).await {
+                Ok(reranked) => {
+                    debug!(n = reranked.len(), "Cross-encoder reranked recall results");
+                    memories = reranked;
+                }
+                Err(e) => {
+                    warn!("Reranker failed, using original order: {e}");
+                }
+            }
+        }
+    }
+
+    // Graph-boosted recall: run NER on the query and promote memories that share entity overlap.
+    #[cfg(feature = "memory-candle")]
+    if let Some(ner) = ner_driver {
+        if !memories.is_empty() {
+            match ner.extract_entities(user_message, 0.60).await {
+                Ok(query_entities) if !query_entities.is_empty() => {
+                    use std::collections::HashSet;
+                    let query_names: HashSet<String> =
+                        query_entities.iter().map(|e| e.text.to_lowercase()).collect();
+                    let mut scored: Vec<(usize, openfang_types::memory::MemoryFragment)> = memories
+                        .into_iter()
+                        .map(|frag| {
+                            let overlap = frag
+                                .metadata
+                                .get("entities")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter(|v| {
+                                            v.as_str()
+                                                .map(|s| {
+                                                    let name_part = s
+                                                        .find('-')
+                                                        .map(|i| &s[i + 1..])
+                                                        .unwrap_or(s);
+                                                    query_names.contains(
+                                                        &name_part.replace('_', " "),
+                                                    ) || query_names
+                                                        .contains(&name_part.to_lowercase())
+                                                })
+                                                .unwrap_or(false)
+                                        })
+                                        .count()
+                                })
+                                .unwrap_or(0);
+                            (overlap, frag)
+                        })
+                        .collect();
+                    scored.sort_by(|(oa, _), (ob, _)| ob.cmp(oa));
+                    let boosted = scored.iter().filter(|(o, _)| *o > 0).count();
+                    memories = scored.into_iter().map(|(_, f)| f).collect();
+                    debug!(
+                        query_entities = query_entities.len(),
+                        graph_boosted = boosted,
+                        "Graph-boosted recall applied"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => debug!(error = %e, "NER on query failed, skipping graph boost"),
+            }
+        }
+    }
+
+    // Scope-weighted recall (Phase 2c): stable-sort so that information-dense summaries
+    // (`semantic`) and user-stated facts (`declarative`) surface above raw episodic turns.
+    // This runs unconditionally (no Candle feature required) and preserves the relative
+    // ordering within each scope group established by graph-boosting and reranking above.
+    if memories.len() > 1 {
+        let scope_rank = |frag: &openfang_types::memory::MemoryFragment| -> u8 {
+            match frag.scope.as_str() {
+                mem_scope::SEMANTIC => 0,
+                mem_scope::DECLARATIVE => 1,
+                _ => 2,
+            }
+        };
+        memories.sort_by_key(|f| scope_rank(f));
+        let semantic_n = memories.iter().filter(|f| f.scope == mem_scope::SEMANTIC).count();
+        let declarative_n = memories.iter().filter(|f| f.scope == mem_scope::DECLARATIVE).count();
+        if semantic_n > 0 || declarative_n > 0 {
+            debug!(
+                semantic = semantic_n,
+                declarative = declarative_n,
+                "Scope-weighted recall applied"
+            );
+        }
+    }
+
+    // Fire AfterMemoryRecall hook
     let agent_id_str = session.agent_id.0.to_string();
+    if let Some(hook_reg) = hooks {
+        let ctx = crate::hooks::HookContext {
+            agent_name: &manifest.name,
+            agent_id: agent_id_str.as_str(),
+            event: openfang_types::agent::HookEvent::AfterMemoryRecall,
+            data: serde_json::json!({
+                "query": user_message,
+                "result_count": memories.len(),
+                "retrieval_path": if embedding_driver.is_some() { "vector" } else { "text" },
+            }),
+        };
+        let _ = hook_reg.fire(&ctx);
+    }
+
+    // Detect user memory directives and store as declarative memories (Phase 1d).
+    // These are stored in addition to (not instead of) the regular episodic memory.
+    if is_user_directive(&user_message.to_lowercase()) {
+        let directive_source = MemorySource::UserProvided;
+        let (directive_scope, directive_category, _) =
+            classify_memory(user_message, &directive_source);
+        let mut directive_meta: HashMap<String, serde_json::Value> = HashMap::new();
+        directive_meta.insert(
+            "session_id".into(),
+            serde_json::json!(session.id.0.to_string()),
+        );
+        directive_meta.insert("source_role".into(), serde_json::json!("user_directive"));
+        directive_meta.insert("category".into(), serde_json::json!(directive_category));
+        directive_meta.insert("priority".into(), serde_json::json!("high"));
+        directive_meta.insert("classification_source".into(), serde_json::json!("rule"));
+
+        if let Some(emb) = embedding_driver {
+            if let Ok(vec) = emb.embed_one(user_message).await {
+                let _ = memory
+                    .remember_with_embedding_async(
+                        session.agent_id,
+                        user_message,
+                        directive_source,
+                        directive_scope,
+                        directive_meta,
+                        Some(&vec),
+                    )
+                    .await;
+            }
+        } else {
+            let _ = memory
+                .remember(
+                    session.agent_id,
+                    user_message,
+                    MemorySource::UserProvided,
+                    directive_scope,
+                    directive_meta,
+                )
+                .await;
+        }
+        debug!("User directive detected and stored as declarative memory");
+    }
+
+    // Fire BeforePromptBuild hook
     if let Some(hook_reg) = hooks {
         let ctx = crate::hooks::HookContext {
             agent_name: &manifest.name,
@@ -464,6 +704,7 @@ pub async fn run_agent_loop(
                             current_thread: parsed_directives.current_thread,
                             silent: true,
                         },
+                        memory_id: None,
                     });
                 }
 
@@ -546,48 +787,138 @@ pub async fn run_agent_loop(
                     .await
                     .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
-                // Remember this interaction (with embedding if available)
+                // Remember this interaction — classify scope/metadata, capture MemoryId.
                 let interaction_text = format!(
                     "User asked: {}\nI responded: {}",
                     user_message, final_response
                 );
-                if let Some(emb) = embedding_driver {
-                    match emb.embed_one(&interaction_text).await {
-                        Ok(vec) => {
-                            let _ = memory
-                                .remember_with_embedding_async(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    HashMap::new(),
-                                    Some(&vec),
-                                )
-                                .await;
+                let mem_source = MemorySource::Conversation;
+                let (rule_scope, rule_cat, mem_prio) =
+                    classify_memory(&interaction_text, &mem_source);
+                // Phase 5: attempt ML classification; fall back to rule-based on error/absence.
+                // Owned strings are required because &str from ClassificationResult
+                // would borrow a local that does not outlive the metadata block.
+                #[cfg(feature = "memory-candle")]
+                let (mem_scope_owned, mem_cat_owned, classification_src): (String, String, &'static str) =
+                    if let Some(clf) = classifier {
+                        match clf.classify(&interaction_text).await {
+                            Ok(result) => {
+                                debug!(
+                                    scope = %result.scope,
+                                    category = %result.category,
+                                    "Candle classifier overriding rule-based classification"
+                                );
+                                (result.scope, result.category, "candle")
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Candle classifier failed, using rule-based");
+                                (rule_scope.to_string(), rule_cat.to_string(), "rule")
+                            }
                         }
+                    } else {
+                        (rule_scope.to_string(), rule_cat.to_string(), "rule")
+                    };
+                #[cfg(feature = "memory-candle")]
+                let (mem_scope, mem_cat) = (mem_scope_owned.as_str(), mem_cat_owned.as_str());
+                #[cfg(not(feature = "memory-candle"))]
+                let (mem_scope, mem_cat, classification_src) = (rule_scope, rule_cat, "rule");
+                let turn_index = session.messages.len();
+                let mut mem_meta: HashMap<String, serde_json::Value> = HashMap::new();
+                mem_meta.insert(
+                    "session_id".into(),
+                    serde_json::json!(session.id.0.to_string()),
+                );
+                mem_meta.insert("source_role".into(), serde_json::json!("assistant"));
+                mem_meta.insert("turn_index".into(), serde_json::json!(turn_index));
+                mem_meta.insert(
+                    "token_count".into(),
+                    serde_json::json!(total_usage.total()),
+                );
+                mem_meta.insert("category".into(), serde_json::json!(mem_cat));
+                mem_meta.insert("priority".into(), serde_json::json!(mem_prio));
+                mem_meta.insert("classification_source".into(), serde_json::json!(classification_src));
+
+                let written_memory_id: Option<String> = if let Some(emb) = embedding_driver {
+                    match emb.embed_one(&interaction_text).await {
+                        Ok(vec) => match memory
+                            .remember_with_embedding_async(
+                                session.agent_id,
+                                &interaction_text,
+                                mem_source,
+                                mem_scope,
+                                mem_meta,
+                                Some(&vec),
+                            )
+                            .await
+                        {
+                            Ok(mid) => {
+                                debug!(
+                                    memory_id = %mid,
+                                    scope = mem_scope,
+                                    "Interaction stored in memory"
+                                );
+                                Some(mid.to_string())
+                            }
+                            Err(e) => {
+                                warn!("Memory write failed: {e}");
+                                None
+                            }
+                        },
                         Err(e) => {
                             warn!("Embedding for remember failed: {e}");
-                            let _ = memory
+                            match memory
                                 .remember(
                                     session.agent_id,
                                     &interaction_text,
                                     MemorySource::Conversation,
-                                    "episodic",
+                                    mem_scope,
                                     HashMap::new(),
                                 )
-                                .await;
+                                .await
+                            {
+                                Ok(mid) => Some(mid.to_string()),
+                                Err(e2) => {
+                                    warn!("Fallback memory write failed: {e2}");
+                                    None
+                                }
+                            }
                         }
                     }
                 } else {
-                    let _ = memory
+                    match memory
                         .remember(
                             session.agent_id,
                             &interaction_text,
                             MemorySource::Conversation,
-                            "episodic",
+                            mem_scope,
                             HashMap::new(),
                         )
-                        .await;
+                        .await
+                    {
+                        Ok(mid) => Some(mid.to_string()),
+                        Err(e) => {
+                            warn!("Memory write failed: {e}");
+                            None
+                        }
+                    }
+                };
+
+                // Fire AfterMemoryStore hook
+                if let Some(hook_reg) = hooks {
+                    if let Some(ref mid) = written_memory_id {
+                        let ctx = crate::hooks::HookContext {
+                            agent_name: &manifest.name,
+                            agent_id: agent_id_str.as_str(),
+                            event: openfang_types::agent::HookEvent::AfterMemoryStore,
+                            data: serde_json::json!({
+                                "memory_id": mid,
+                                "scope": mem_scope,
+                                "source": "conversation",
+                                "category": mem_cat,
+                            }),
+                        };
+                        let _ = hook_reg.fire(&ctx);
+                    }
                 }
 
                 // Notify phase: Done
@@ -623,6 +954,7 @@ pub async fn run_agent_loop(
                     cost_usd: None,
                     silent: false,
                     directives: Default::default(),
+                    memory_id: written_memory_id,
                 });
             }
             StopReason::ToolUse => {
@@ -789,6 +1121,38 @@ pub async fn run_agent_loop(
                         let _ = hook_reg.fire(&ctx);
                     }
 
+                    // Store significant tool results as procedural memories (Phase 4b).
+                    // Skip errors and very short results (likely empty/trivial).
+                    if !result.is_error && result.content.len() > 50 {
+                        let tool_mem_content = format!(
+                            "Tool '{}' produced: {}",
+                            tool_call.name,
+                            if result.content.len() > 500 {
+                                &result.content[..500]
+                            } else {
+                                &result.content
+                            }
+                        );
+                        let mut tool_meta: HashMap<String, serde_json::Value> = HashMap::new();
+                        tool_meta.insert("tool_name".into(), serde_json::json!(&tool_call.name));
+                        tool_meta.insert(
+                            "session_id".into(),
+                            serde_json::json!(session.id.0.to_string()),
+                        );
+                        tool_meta.insert("category".into(), serde_json::json!("observation"));
+                        tool_meta.insert("priority".into(), serde_json::json!("normal"));
+                        tool_meta.insert("classification_source".into(), serde_json::json!("rule"));
+                        let _ = memory
+                            .remember(
+                                session.agent_id,
+                                &tool_mem_content,
+                                MemorySource::Observation,
+                                mem_scope::PROCEDURAL,
+                                tool_meta,
+                            )
+                            .await;
+                    }
+
                     // Dynamic truncation based on context budget (replaces flat MAX_TOOL_RESULT_CHARS)
                     let content = truncate_tool_result_dynamic(&result.content, &context_budget);
 
@@ -903,6 +1267,7 @@ pub async fn run_agent_loop(
                         cost_usd: None,
                         silent: false,
                         directives: Default::default(),
+                        memory_id: None,
                     });
                 }
                 // Model hit token limit — add partial response and continue
@@ -1322,6 +1687,12 @@ pub async fn run_agent_loop_streaming(
     web_ctx: Option<&WebToolsContext>,
     browser_ctx: Option<&crate::browser::BrowserManager>,
     embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
+    #[cfg(feature = "memory-candle")]
+    reranker: Option<&crate::candle_reranker::CandleReranker>,
+    #[cfg(feature = "memory-candle")]
+    ner_driver: Option<&crate::candle_ner::CandleNerDriver>,
+    #[cfg(feature = "memory-candle")]
+    classifier: Option<&crate::candle_classifier::CandleClassifier>,
     workspace_root: Option<&Path>,
     on_phase: Option<&PhaseCallback>,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
@@ -1342,7 +1713,7 @@ pub async fn run_agent_loop_streaming(
         .unwrap_or_default();
 
     // Recall relevant memories — prefer vector similarity search when embedding driver is available
-    let memories = if let Some(emb) = embedding_driver {
+    let mut memories = if let Some(emb) = embedding_driver {
         match emb.embed_one(user_message).await {
             Ok(query_vec) => {
                 debug!("Using vector recall (streaming, dims={})", query_vec.len());
@@ -1388,8 +1759,155 @@ pub async fn run_agent_loop_streaming(
             .unwrap_or_default()
     };
 
-    // Fire BeforePromptBuild hook
+    #[cfg(feature = "memory-candle")]
+    if let Some(rr) = reranker {
+        if memories.len() > 1 {
+            match rr.rerank(user_message, memories.clone()).await {
+                Ok(reranked) => {
+                    debug!(n = reranked.len(), "Cross-encoder reranked recall results (streaming)");
+                    memories = reranked;
+                }
+                Err(e) => {
+                    warn!("Reranker failed (streaming), using original order: {e}");
+                }
+            }
+        }
+    }
+
+    // Graph-boosted recall: run NER on the query and promote memories sharing entity overlap.
+    #[cfg(feature = "memory-candle")]
+    if let Some(ner) = ner_driver {
+        if !memories.is_empty() {
+            match ner.extract_entities(user_message, 0.60).await {
+                Ok(query_entities) if !query_entities.is_empty() => {
+                    use std::collections::HashSet;
+                    let query_names: HashSet<String> =
+                        query_entities.iter().map(|e| e.text.to_lowercase()).collect();
+                    let mut scored: Vec<(usize, openfang_types::memory::MemoryFragment)> = memories
+                        .into_iter()
+                        .map(|frag| {
+                            let overlap = frag
+                                .metadata
+                                .get("entities")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter(|v| {
+                                            v.as_str()
+                                                .map(|s| {
+                                                    let name_part = s
+                                                        .find('-')
+                                                        .map(|i| &s[i + 1..])
+                                                        .unwrap_or(s);
+                                                    query_names.contains(
+                                                        &name_part.replace('_', " "),
+                                                    ) || query_names
+                                                        .contains(&name_part.to_lowercase())
+                                                })
+                                                .unwrap_or(false)
+                                        })
+                                        .count()
+                                })
+                                .unwrap_or(0);
+                            (overlap, frag)
+                        })
+                        .collect();
+                    scored.sort_by(|(oa, _), (ob, _)| ob.cmp(oa));
+                    let boosted = scored.iter().filter(|(o, _)| *o > 0).count();
+                    memories = scored.into_iter().map(|(_, f)| f).collect();
+                    debug!(
+                        query_entities = query_entities.len(),
+                        graph_boosted = boosted,
+                        "Graph-boosted recall applied (streaming)"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => debug!(error = %e, "NER on query failed (streaming), skipping graph boost"),
+            }
+        }
+    }
+
+    // Scope-weighted recall (Phase 2c): stable-sort so that information-dense summaries
+    // (`semantic`) and user-stated facts (`declarative`) surface above raw episodic turns.
+    if memories.len() > 1 {
+        let scope_rank = |frag: &openfang_types::memory::MemoryFragment| -> u8 {
+            match frag.scope.as_str() {
+                mem_scope::SEMANTIC => 0,
+                mem_scope::DECLARATIVE => 1,
+                _ => 2,
+            }
+        };
+        memories.sort_by_key(|f| scope_rank(f));
+        let semantic_n = memories.iter().filter(|f| f.scope == mem_scope::SEMANTIC).count();
+        let declarative_n = memories.iter().filter(|f| f.scope == mem_scope::DECLARATIVE).count();
+        if semantic_n > 0 || declarative_n > 0 {
+            debug!(
+                semantic = semantic_n,
+                declarative = declarative_n,
+                "Scope-weighted recall applied (streaming)"
+            );
+        }
+    }
+
+    // Fire AfterMemoryRecall hook
     let agent_id_str = session.agent_id.0.to_string();
+    if let Some(hook_reg) = hooks {
+        let ctx = crate::hooks::HookContext {
+            agent_name: &manifest.name,
+            agent_id: agent_id_str.as_str(),
+            event: openfang_types::agent::HookEvent::AfterMemoryRecall,
+            data: serde_json::json!({
+                "query": user_message,
+                "result_count": memories.len(),
+                "retrieval_path": if embedding_driver.is_some() { "vector" } else { "text" },
+            }),
+        };
+        let _ = hook_reg.fire(&ctx);
+    }
+
+    // Detect user memory directives and store as declarative memories (Phase 1d).
+    if is_user_directive(&user_message.to_lowercase()) {
+        let directive_source = MemorySource::UserProvided;
+        let (directive_scope, directive_category, _) =
+            classify_memory(user_message, &directive_source);
+        let mut directive_meta: HashMap<String, serde_json::Value> = HashMap::new();
+        directive_meta.insert(
+            "session_id".into(),
+            serde_json::json!(session.id.0.to_string()),
+        );
+        directive_meta.insert("source_role".into(), serde_json::json!("user_directive"));
+        directive_meta.insert("category".into(), serde_json::json!(directive_category));
+        directive_meta.insert("priority".into(), serde_json::json!("high"));
+        directive_meta.insert("classification_source".into(), serde_json::json!("rule"));
+
+        if let Some(emb) = embedding_driver {
+            if let Ok(vec) = emb.embed_one(user_message).await {
+                let _ = memory
+                    .remember_with_embedding_async(
+                        session.agent_id,
+                        user_message,
+                        directive_source,
+                        directive_scope,
+                        directive_meta,
+                        Some(&vec),
+                    )
+                    .await;
+            }
+        } else {
+            let _ = memory
+                .remember(
+                    session.agent_id,
+                    user_message,
+                    MemorySource::UserProvided,
+                    directive_scope,
+                    directive_meta,
+                )
+                .await;
+        }
+        debug!("User directive detected and stored as declarative memory (streaming)");
+    }
+
+    // Fire BeforePromptBuild hook
     if let Some(hook_reg) = hooks {
         let ctx = crate::hooks::HookContext {
             agent_name: &manifest.name,
@@ -1632,6 +2150,7 @@ pub async fn run_agent_loop_streaming(
                             current_thread: parsed_directives_s.current_thread,
                             silent: true,
                         },
+                        memory_id: None,
                     });
                 }
 
@@ -1693,48 +2212,136 @@ pub async fn run_agent_loop_streaming(
                     .await
                     .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
-                // Remember this interaction (with embedding if available)
+                // Remember this interaction — classify scope/metadata, capture MemoryId.
                 let interaction_text = format!(
                     "User asked: {}\nI responded: {}",
                     user_message, final_response
                 );
-                if let Some(emb) = embedding_driver {
-                    match emb.embed_one(&interaction_text).await {
-                        Ok(vec) => {
-                            let _ = memory
-                                .remember_with_embedding_async(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    HashMap::new(),
-                                    Some(&vec),
-                                )
-                                .await;
+                let mem_source_s = MemorySource::Conversation;
+                let (rule_scope_s, rule_cat_s, mem_prio_s) =
+                    classify_memory(&interaction_text, &mem_source_s);
+                // Phase 5: attempt ML classification; fall back to rule-based on error/absence.
+                #[cfg(feature = "memory-candle")]
+                let (mem_scope_s_owned, mem_cat_s_owned, classification_src_s): (String, String, &'static str) =
+                    if let Some(clf) = classifier {
+                        match clf.classify(&interaction_text).await {
+                            Ok(result) => {
+                                debug!(
+                                    scope = %result.scope,
+                                    category = %result.category,
+                                    "Candle classifier overriding rule-based classification (streaming)"
+                                );
+                                (result.scope, result.category, "candle")
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Candle classifier failed (streaming), using rule-based");
+                                (rule_scope_s.to_string(), rule_cat_s.to_string(), "rule")
+                            }
                         }
+                    } else {
+                        (rule_scope_s.to_string(), rule_cat_s.to_string(), "rule")
+                    };
+                #[cfg(feature = "memory-candle")]
+                let (mem_scope_s, mem_cat_s) = (mem_scope_s_owned.as_str(), mem_cat_s_owned.as_str());
+                #[cfg(not(feature = "memory-candle"))]
+                let (mem_scope_s, mem_cat_s, classification_src_s) = (rule_scope_s, rule_cat_s, "rule");
+                let turn_index_s = session.messages.len();
+                let mut mem_meta_s: HashMap<String, serde_json::Value> = HashMap::new();
+                mem_meta_s.insert(
+                    "session_id".into(),
+                    serde_json::json!(session.id.0.to_string()),
+                );
+                mem_meta_s.insert("source_role".into(), serde_json::json!("assistant"));
+                mem_meta_s.insert("turn_index".into(), serde_json::json!(turn_index_s));
+                mem_meta_s.insert(
+                    "token_count".into(),
+                    serde_json::json!(total_usage.total()),
+                );
+                mem_meta_s.insert("category".into(), serde_json::json!(mem_cat_s));
+                mem_meta_s.insert("priority".into(), serde_json::json!(mem_prio_s));
+                mem_meta_s.insert("classification_source".into(), serde_json::json!(classification_src_s));
+
+                let written_memory_id_s: Option<String> = if let Some(emb) = embedding_driver {
+                    match emb.embed_one(&interaction_text).await {
+                        Ok(vec) => match memory
+                            .remember_with_embedding_async(
+                                session.agent_id,
+                                &interaction_text,
+                                mem_source_s,
+                                mem_scope_s,
+                                mem_meta_s,
+                                Some(&vec),
+                            )
+                            .await
+                        {
+                            Ok(mid) => {
+                                debug!(
+                                    memory_id = %mid,
+                                    scope = mem_scope_s,
+                                    "Interaction stored in memory (streaming)"
+                                );
+                                Some(mid.to_string())
+                            }
+                            Err(e) => {
+                                warn!("Memory write failed (streaming): {e}");
+                                None
+                            }
+                        },
                         Err(e) => {
                             warn!("Embedding for remember failed (streaming): {e}");
-                            let _ = memory
+                            match memory
                                 .remember(
                                     session.agent_id,
                                     &interaction_text,
                                     MemorySource::Conversation,
-                                    "episodic",
+                                    mem_scope_s,
                                     HashMap::new(),
                                 )
-                                .await;
+                                .await
+                            {
+                                Ok(mid) => Some(mid.to_string()),
+                                Err(e2) => {
+                                    warn!("Fallback memory write failed (streaming): {e2}");
+                                    None
+                                }
+                            }
                         }
                     }
                 } else {
-                    let _ = memory
+                    match memory
                         .remember(
                             session.agent_id,
                             &interaction_text,
                             MemorySource::Conversation,
-                            "episodic",
+                            mem_scope_s,
                             HashMap::new(),
                         )
-                        .await;
+                        .await
+                    {
+                        Ok(mid) => Some(mid.to_string()),
+                        Err(e) => {
+                            warn!("Memory write failed (streaming): {e}");
+                            None
+                        }
+                    }
+                };
+
+                // Fire AfterMemoryStore hook
+                if let Some(hook_reg) = hooks {
+                    if let Some(ref mid) = written_memory_id_s {
+                        let ctx = crate::hooks::HookContext {
+                            agent_name: &manifest.name,
+                            agent_id: agent_id_str.as_str(),
+                            event: openfang_types::agent::HookEvent::AfterMemoryStore,
+                            data: serde_json::json!({
+                                "memory_id": mid,
+                                "scope": mem_scope_s,
+                                "source": "conversation",
+                                "category": mem_cat_s,
+                            }),
+                        };
+                        let _ = hook_reg.fire(&ctx);
+                    }
                 }
 
                 // Notify phase: Done
@@ -1770,6 +2377,7 @@ pub async fn run_agent_loop_streaming(
                     cost_usd: None,
                     silent: false,
                     directives: Default::default(),
+                    memory_id: written_memory_id_s,
                 });
             }
             StopReason::ToolUse => {
@@ -1932,6 +2540,37 @@ pub async fn run_agent_loop_streaming(
                         let _ = hook_reg.fire(&ctx);
                     }
 
+                    // Store significant tool results as procedural memories (Phase 4b).
+                    if !result.is_error && result.content.len() > 50 {
+                        let tool_mem_content = format!(
+                            "Tool '{}' produced: {}",
+                            tool_call.name,
+                            if result.content.len() > 500 {
+                                &result.content[..500]
+                            } else {
+                                &result.content
+                            }
+                        );
+                        let mut tool_meta: HashMap<String, serde_json::Value> = HashMap::new();
+                        tool_meta.insert("tool_name".into(), serde_json::json!(&tool_call.name));
+                        tool_meta.insert(
+                            "session_id".into(),
+                            serde_json::json!(session.id.0.to_string()),
+                        );
+                        tool_meta.insert("category".into(), serde_json::json!("observation"));
+                        tool_meta.insert("priority".into(), serde_json::json!("normal"));
+                        tool_meta.insert("classification_source".into(), serde_json::json!("rule"));
+                        let _ = memory
+                            .remember(
+                                session.agent_id,
+                                &tool_mem_content,
+                                MemorySource::Observation,
+                                mem_scope::PROCEDURAL,
+                                tool_meta,
+                            )
+                            .await;
+                    }
+
                     // Dynamic truncation based on context budget (replaces flat MAX_TOOL_RESULT_CHARS)
                     let content = truncate_tool_result_dynamic(&result.content, &context_budget);
 
@@ -2058,6 +2697,7 @@ pub async fn run_agent_loop_streaming(
                         cost_usd: None,
                         silent: false,
                         directives: Default::default(),
+                        memory_id: None,
                     });
                 }
                 let text = response.text();

@@ -39,6 +39,12 @@ api_key_env = "GROQ_API_KEY"
 embedding_model = "all-MiniLM-L6-v2"
 consolidation_threshold = 10000
 decay_rate = 0.1
+# embedding_provider = "ollama"   # openai | ollama | candle | …
+# ner_backend = "auto"            # auto | candle | none — candle NER even with HTTP embeddings
+# reranker_backend = "auto"
+# ner_model = "dslim/bert-base-NER"
+# reranker_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+# cuda_device = 0                 # omit for CPU (all Candle memory inference)
 
 # --- Network (OFP Wire Protocol) ---
 [network]

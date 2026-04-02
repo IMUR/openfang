@@ -80,6 +80,20 @@ pub async fn sw_js() -> impl IntoResponse {
     )
 }
 
+/// Embedded voice chat HTML.
+const VOICE_HTML: &str = include_str!("../static/voice.html");
+
+/// GET /voice — Serve the OpenFang Voice chat page.
+pub async fn voice_page() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        VOICE_HTML,
+    )
+}
+
 /// GET / — Serve the OpenFang Dashboard single-page application.
 ///
 /// Generates a unique CSP nonce on every request and injects it into both

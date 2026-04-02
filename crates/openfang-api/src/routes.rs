@@ -3323,6 +3323,219 @@ pub async fn delete_agent_kv_key(
     }
 }
 
+/// POST /api/memory/backfill — Re-run NER, classification, and metadata enrichment
+/// on existing memory fragments.
+///
+/// Request body (all optional):
+/// ```json
+/// { "agent_id": "<uuid>", "dry_run": false, "batch_size": 50 }
+/// ```
+///
+/// - `agent_id`: restrict backfill to a single agent (omit to process all agents)
+/// - `dry_run`: if true, report how many fragments would be updated without writing
+/// - `batch_size`: fragments per page (default 50, max 200)
+///
+/// Returns:
+/// ```json
+/// { "processed": N, "updated": N, "errors": N, "dry_run": false }
+/// ```
+pub async fn memory_backfill(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let dry_run = body.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let batch_size = body
+        .get("batch_size")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.min(200) as usize)
+        .unwrap_or(50);
+
+    // Resolve agent IDs to process
+    let agent_ids: Vec<openfang_types::agent::AgentId> = if let Some(id_str) = body
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+    {
+        match uuid::Uuid::parse_str(id_str) {
+            Ok(u) => vec![openfang_types::agent::AgentId(u)],
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "invalid agent_id UUID"})),
+                );
+            }
+        }
+    } else {
+        match state.kernel.memory.all_active_agent_ids().await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!("Backfill: could not list agents: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "failed to list agents"})),
+                );
+            }
+        }
+    };
+
+    let mut total_processed: usize = 0;
+    let mut total_updated: usize = 0;
+    let mut total_errors: usize = 0;
+
+    for agent_id in agent_ids {
+        let mut offset = 0usize;
+        loop {
+            let fragments = match state
+                .kernel
+                .memory
+                .list_fragments(agent_id, offset, batch_size)
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id.0, "Backfill list_fragments failed: {e}");
+                    total_errors += 1;
+                    break;
+                }
+            };
+
+            if fragments.is_empty() {
+                break;
+            }
+
+            let batch_len = fragments.len();
+            total_processed += batch_len;
+
+            if !dry_run {
+                for frag in &fragments {
+                    let memory_id_str = frag.id.0.to_string();
+
+                    // Rebuild metadata: start from existing, re-classify, add missing keys
+                    let mut new_meta = frag.metadata.clone();
+
+                    // Rule-based classification
+                    let source = frag.source.clone();
+                    let (scope, category, priority) = {
+                        use openfang_types::memory::MemorySource;
+                        let s = match &source {
+                            MemorySource::Conversation => "episodic",
+                            MemorySource::UserProvided => "declarative",
+                            MemorySource::System => "semantic",
+                            MemorySource::Document => "semantic",
+                            MemorySource::Observation => "procedural",
+                            MemorySource::Inference => "semantic",
+                        };
+                        let c = "observation";
+                        let p = "normal";
+                        (s, c, p)
+                    };
+
+                    // Only overwrite classification if not already ML-classified
+                    let already_ml = new_meta
+                        .get("classification_source")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == "candle")
+                        .unwrap_or(false);
+
+                    if !already_ml {
+                        new_meta.insert("category".to_string(), serde_json::json!(category));
+                        new_meta.insert("priority".to_string(), serde_json::json!(priority));
+                        new_meta
+                            .entry("scope".to_string())
+                            .or_insert_with(|| serde_json::json!(scope));
+                        new_meta.insert(
+                            "classification_source".to_string(),
+                            serde_json::json!("rule_backfill"),
+                        );
+                    }
+
+                    // Apply Candle ML classification if available
+                    #[cfg(feature = "memory-candle")]
+                    if let Some(clf) = state.kernel.classifier.as_deref() {
+                        match clf.classify(&frag.content).await {
+                            Ok(result) => {
+                                new_meta.insert(
+                                    "category".to_string(),
+                                    serde_json::json!(result.category),
+                                );
+                                new_meta.insert(
+                                    "classification_source".to_string(),
+                                    serde_json::json!("candle_backfill"),
+                                );
+                                // Preserve existing scope if already set by rule_backfill unless
+                                // candle produces a different, confident result.
+                                new_meta.insert(
+                                    "scope".to_string(),
+                                    serde_json::json!(result.scope),
+                                );
+                            }
+                            Err(e) => {
+                                tracing::debug!(error = %e, "Backfill: Candle classifier skipped for fragment");
+                            }
+                        }
+                    }
+
+                    // Patch in NER entity links if NER driver available
+                    #[cfg(feature = "memory-candle")]
+                    if let Some(ner) = state.kernel.ner_driver.as_deref() {
+                        if !new_meta.contains_key("entities")
+                            || new_meta
+                                .get("entities")
+                                .and_then(|v| v.as_array())
+                                .map(|a| a.is_empty())
+                                .unwrap_or(true)
+                        {
+                            match ner.extract_entities(&frag.content, 0.60).await {
+                                Ok(entities) if !entities.is_empty() => {
+                                    let names: Vec<serde_json::Value> = entities
+                                        .iter()
+                                        .map(|e| serde_json::json!(e.text))
+                                        .collect();
+                                    new_meta.insert(
+                                        "entities".to_string(),
+                                        serde_json::Value::Array(names),
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    match state
+                        .kernel
+                        .memory
+                        .update_metadata(&memory_id_str, new_meta)
+                        .await
+                    {
+                        Ok(()) => total_updated += 1,
+                        Err(e) => {
+                            tracing::warn!(memory_id = %memory_id_str, "Backfill update_metadata failed: {e}");
+                            total_errors += 1;
+                        }
+                    }
+                }
+            } else {
+                // Dry run — just count
+                total_updated += batch_len;
+            }
+
+            offset += batch_len;
+            if batch_len < batch_size {
+                break;
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "processed": total_processed,
+            "updated": total_updated,
+            "errors": total_errors,
+            "dry_run": dry_run,
+        })),
+    )
+}
+
 /// GET /api/health — Minimal liveness probe (public, no auth required).
 /// Returns only status and version to prevent information leakage.
 /// Use GET /api/health/detail for full diagnostics (requires auth).
@@ -3374,8 +3587,15 @@ pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoRespo
         .unwrap_or("none");
     let embedding_model = &state.kernel.config.memory.embedding_model;
     let embedding_active = state.kernel.embedding_driver.is_some();
+    #[cfg(feature = "memory-candle")]
     let ner_active = state.kernel.ner_driver.is_some();
+    #[cfg(not(feature = "memory-candle"))]
+    let ner_active = false;
+    #[cfg(feature = "memory-candle")]
     let reranker_active = state.kernel.reranker.is_some();
+    #[cfg(not(feature = "memory-candle"))]
+    let reranker_active = false;
+    let memory_candle_feature = cfg!(feature = "memory-candle");
     let cuda_device = state.kernel.config.memory.cuda_device;
     let models_cached = {
         let models_dir = state.kernel.config.home_dir.join("models");
@@ -3398,8 +3618,11 @@ pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoRespo
             "embedding_provider": embedding_provider,
             "embedding_model": embedding_model,
             "embedding_active": embedding_active,
+            "ner_backend": state.kernel.config.memory.ner_backend,
+            "reranker_backend": state.kernel.config.memory.reranker_backend,
             "ner_active": ner_active,
             "reranker_active": reranker_active,
+            "memory_candle_binary": memory_candle_feature,
             "cuda_device": cuda_device,
             "models_cached": models_cached,
         }

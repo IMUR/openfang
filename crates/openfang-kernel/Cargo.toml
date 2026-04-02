@@ -5,10 +5,15 @@ edition.workspace = true
 license.workspace = true
 description = "Core kernel for the OpenFang Agent OS"
 
+[features]
+default = []
+# In-process Candle (CUDA) memory intelligence. Propagates to openfang-runtime.
+memory-candle = ["openfang-runtime/memory-candle"]
+
 [dependencies]
 openfang-types = { path = "../openfang-types" }
 openfang-memory = { path = "../openfang-memory" }
-openfang-runtime = { path = "../openfang-runtime" }
+openfang-runtime = { path = "../openfang-runtime", default-features = false }
 openfang-skills = { path = "../openfang-skills" }
 openfang-hands = { path = "../openfang-hands" }
 openfang-extensions = { path = "../openfang-extensions" }
