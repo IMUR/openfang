@@ -978,6 +978,7 @@ mark.search-highlight {
 
 .input-area textarea {
   flex: 1;
+  width: 100%;
   background: var(--surface);
   color: var(--text);
   border: 1px solid var(--border);
@@ -1046,6 +1047,56 @@ mark.search-highlight {
 }
 .btn-stop:hover { background: var(--error); color: #fff; transform: scale(1.05); }
 .btn-stop:active { transform: scale(0.92); }
+
+/* Voice chat mode */
+.voice-indicator {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+  flex-shrink: 0;
+}
+.voice-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: voice-bounce 1.4s ease-in-out infinite;
+}
+.voice-dot:nth-child(2) { animation-delay: 0.2s; }
+.voice-dot:nth-child(3) { animation-delay: 0.4s; }
+@keyframes voice-bounce {
+  0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); }
+  40% { opacity: 1; transform: scale(1.2); }
+}
+
+.voice-transcript-overlay {
+  display: block;
+  padding: 10px 14px;
+  font-size: 0.9rem;
+  color: var(--text-dim);
+  font-style: italic;
+  line-height: 1.4;
+  min-height: 38px;
+}
+
+.btn-voice-end {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 2px solid var(--error);
+  background: transparent;
+  color: var(--error);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.2s var(--ease-spring);
+  animation: recording-pulse 1.5s ease-in-out infinite;
+}
+.btn-voice-end:hover { background: var(--error); color: #fff; transform: scale(1.05); }
+.btn-voice-end:active { transform: scale(0.92); }
 
 .input-footer {
   display: flex;

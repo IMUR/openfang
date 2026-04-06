@@ -23,12 +23,21 @@ function chatPage() {
     sessionsOpen: false,
     searchOpen: false,
     searchQuery: '',
-    // Voice recording state
+    // Voice recording state (push-to-talk)
     recording: false,
     _mediaRecorder: null,
     _audioChunks: [],
     recordingTime: 0,
     _recordingTimer: null,
+    // Voice chat mode state (real-time streaming)
+    voiceActive: false,
+    voiceTranscript: '',
+    _audioCtx: null,
+    _mediaStream: null,
+    _processorNode: null,
+    _playQueue: [],
+    _playing: false,
+    _ttsPlaying: false,
     // Model autocomplete state
     showModelPicker: false,
     modelPickerList: [],
@@ -599,9 +608,11 @@ function chatPage() {
           Alpine.store('app').wsConnected = true;
         },
         onMessage: function(data) { self.handleWsMessage(data); },
+        onBinary: function(buf) { self.handleVoiceBinary(buf); },
         onClose: function() {
           Alpine.store('app').wsConnected = false;
           self._wsAgent = null;
+          if (self.voiceActive) self.stopVoiceMode();
         },
         onError: function() {
           Alpine.store('app').wsConnected = false;
@@ -891,6 +902,18 @@ function chatPage() {
           canvasHtml += '<iframe sandbox="allow-scripts" srcdoc="' + (data.html || '').replace(/"/g, '&quot;') + '" ';
           canvasHtml += 'style="width:100%;min-height:300px;border:none;background:#fff;" loading="lazy"></iframe></div>';
           this.messages.push({ id: ++msgId, role: 'agent', text: canvasHtml, meta: 'canvas', isHtml: true, tools: [] });
+          this.scrollToBottom();
+          break;
+
+        case 'voice_transcript':
+          // User's speech was transcribed — show as a user message in chat
+          this.voiceTranscript = '';
+          this.messages.push({ id: ++msgId, role: 'user', text: data.content, meta: '', tools: [], ts: Date.now() });
+          this.scrollToBottom();
+          break;
+
+        case 'voice_status':
+          this.messages.push({ id: ++msgId, role: 'system', text: data.text || data.content || '', meta: '', tools: [] });
           this.scrollToBottom();
           break;
 
@@ -1213,6 +1236,133 @@ function chatPage() {
       try { return JSON.stringify(JSON.parse(text), null, 2); }
       catch(e) { return text; }
     },
+
+    // ── Voice Chat Mode (real-time streaming) ──
+
+    startVoiceMode: async function() {
+      if (this.voiceActive || !this.currentAgent || this.sending) return;
+      var self = this;
+      try {
+        var AudioCtx = window.AudioContext || window.webkitAudioContext;
+        self._audioCtx = new AudioCtx({ sampleRate: 16000 });
+        if (self._audioCtx.state === 'suspended') await self._audioCtx.resume();
+
+        self._mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+        });
+
+        var source = self._audioCtx.createMediaStreamSource(self._mediaStream);
+        self._processorNode = self._audioCtx.createScriptProcessor(512, 1, 1);
+        self._processorNode.onaudioprocess = function(e) {
+          if (!self.voiceActive || self._ttsPlaying) return;
+          var float32 = e.inputBuffer.getChannelData(0);
+          var pcm = new Int16Array(float32.length);
+          for (var i = 0; i < float32.length; i++) {
+            var s = Math.max(-1, Math.min(1, float32[i]));
+            pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+          }
+          var frame = new Uint8Array(1 + pcm.byteLength);
+          frame[0] = 0x01; // AudioDataIn
+          frame.set(new Uint8Array(pcm.buffer), 1);
+          OpenFangAPI.wsSendBinary(frame.buffer);
+        };
+        source.connect(self._processorNode);
+        self._processorNode.connect(self._audioCtx.destination);
+
+        // Send SessionInit
+        var init = JSON.stringify({ sample_rate: 16000, codec: 'pcm16', channels: 1 });
+        var initBytes = new TextEncoder().encode(init);
+        var initFrame = new Uint8Array(1 + initBytes.length);
+        initFrame[0] = 0x20; // SessionInit
+        initFrame.set(initBytes, 1);
+        OpenFangAPI.wsSendBinary(initFrame.buffer);
+
+        self.voiceActive = true;
+        self.voiceTranscript = 'Listening...';
+        self.messages.push({ id: ++msgId, role: 'system', text: 'Voice mode active — speak to begin', meta: '', tools: [] });
+        self.scrollToBottom();
+      } catch(e) {
+        self._stopVoiceCapture();
+        OpenFangToast.error('Microphone error: ' + (e.message || 'access denied'));
+      }
+    },
+
+    stopVoiceMode: function() {
+      if (!this.voiceActive) return;
+      this._stopVoiceCapture();
+      this.voiceActive = false;
+      this.voiceTranscript = '';
+      this._ttsPlaying = false;
+      this._playQueue = [];
+      this._playing = false;
+      this.messages.push({ id: ++msgId, role: 'system', text: 'Voice mode ended', meta: '', tools: [] });
+      this.scrollToBottom();
+    },
+
+    _stopVoiceCapture: function() {
+      if (this._processorNode) { this._processorNode.disconnect(); this._processorNode = null; }
+      if (this._mediaStream) { this._mediaStream.getTracks().forEach(function(t) { t.stop(); }); this._mediaStream = null; }
+      if (this._audioCtx) { this._audioCtx.close(); this._audioCtx = null; }
+    },
+
+    handleVoiceBinary: function(buf) {
+      var data = new Uint8Array(buf);
+      if (data.length < 1) return;
+      var type = data[0];
+      var payload = data.slice(1);
+
+      switch (type) {
+        case 0x02: // AudioDataOut — PCM16 LE
+          var pcm = new Int16Array(payload.buffer, payload.byteOffset, payload.byteLength / 2);
+          this._playQueue.push(pcm);
+          if (!this._playing) this._drainPlayQueue();
+          break;
+        case 0x10: // SpeechStart — agent TTS begins
+          this._ttsPlaying = true;
+          break;
+        case 0x11: // SpeechEnd — agent TTS finished
+          this._ttsPlaying = false;
+          break;
+        case 0x21: // SessionAck
+          try {
+            var ack = JSON.parse(new TextDecoder().decode(payload));
+            this.messages.push({ id: ++msgId, role: 'system', text: 'Voice session: ' + ack.session_id.slice(0, 8) + '...', meta: '', tools: [] });
+            this.scrollToBottom();
+          } catch(e) {}
+          break;
+        case 0x30: // VadSpeechStart
+          this.voiceTranscript = 'Listening...';
+          break;
+        case 0x31: // VadSpeechEnd
+          this.voiceTranscript = 'Transcribing...';
+          break;
+        case 0xF0: // Error
+          var errMsg = new TextDecoder().decode(payload);
+          OpenFangToast.error('Voice error: ' + errMsg);
+          this.stopVoiceMode();
+          break;
+      }
+    },
+
+    _drainPlayQueue: function() {
+      if (!this._playQueue.length || !this._audioCtx) { this._playing = false; return; }
+      this._playing = true;
+      var pcm = this._playQueue.shift();
+      var float32 = new Float32Array(pcm.length);
+      for (var i = 0; i < pcm.length; i++) {
+        float32[i] = pcm[i] / 32768.0;
+      }
+      var buf = this._audioCtx.createBuffer(1, float32.length, 16000);
+      buf.getChannelData(0).set(float32);
+      var src = this._audioCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(this._audioCtx.destination);
+      var self = this;
+      src.onended = function() { self._drainPlayQueue(); };
+      src.start();
+    },
+
+    // ── Voice Recording (push-to-talk) ──
 
     // Voice: start recording
     startRecording: async function() {

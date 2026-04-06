@@ -225,6 +225,7 @@ var OpenFangAPI = (function() {
       var url = WS_BASE + '/api/agents/' + agentId + '/ws';
       if (_authToken) url += '?token=' + encodeURIComponent(_authToken);
       var socket = new WebSocket(url);
+      socket.binaryType = 'arraybuffer';
       _ws = socket;
 
       socket.onopen = function() {
@@ -241,6 +242,10 @@ var OpenFangAPI = (function() {
       };
 
       socket.onmessage = function(e) {
+        if (e.data instanceof ArrayBuffer) {
+          if (_wsCallbacks.onBinary) _wsCallbacks.onBinary(e.data);
+          return;
+        }
         try {
           var data = JSON.parse(e.data);
         } catch(parseErr) {
@@ -301,6 +306,14 @@ var OpenFangAPI = (function() {
     return false;
   }
 
+  function wsSendBinary(arrayBuffer) {
+    if (_ws && _ws.readyState === WebSocket.OPEN) {
+      _ws.send(arrayBuffer);
+      return true;
+    }
+    return false;
+  }
+
   function isWsConnected() { return _wsConnected; }
 
   function getConnectionState() { return _connectionState; }
@@ -336,6 +349,7 @@ var OpenFangAPI = (function() {
     wsConnect: wsConnect,
     wsDisconnect: wsDisconnect,
     wsSend: wsSend,
+    wsSendBinary: wsSendBinary,
     isWsConnected: isWsConnected,
     getConnectionState: getConnectionState,
     onConnectionChange: onConnectionChange
