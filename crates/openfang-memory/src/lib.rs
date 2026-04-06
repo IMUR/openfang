@@ -12,6 +12,8 @@
 
 pub mod consolidation;
 pub mod db;
+#[cfg(feature = "http-memory")]
+pub mod http_client;
 pub mod knowledge;
 pub mod semantic;
 pub mod session;

@@ -18,6 +18,13 @@ use tracing::{debug, warn};
 /// Maximum inter-agent call depth to prevent infinite recursion (A->B->C->...).
 const MAX_AGENT_CALL_DEPTH: u32 = 5;
 
+/// Check if a tool name refers to a shell execution tool.
+///
+/// Used to determine whether exec_policy settings should bypass the approval gate.
+fn is_shell_tool(name: &str) -> bool {
+    name == "shell_exec"
+}
+
 /// Check if a shell command should be blocked by taint tracking.
 ///
 /// Layer 1: Shell metacharacter injection (backticks, `$(`, `${`, etc.)
@@ -133,9 +140,28 @@ pub async fn execute_tool(
         }
     }
 
-    // Approval gate: check if this tool requires human approval before execution
+    // Approval gate: check if this tool requires human approval before execution.
+    //
+    // When exec_policy.mode = "full" (or allowlist with allowed_commands = ["*"]),
+    // the user has explicitly opted into unrestricted shell access. In that case,
+    // shell_exec should bypass the approval gate — requiring approval for commands
+    // the user already whitelisted is contradictory (GitHub issue #772).
+    let exec_policy_bypasses_approval = is_shell_tool(tool_name)
+        && exec_policy.is_some_and(|p| {
+            p.mode == openfang_types::config::ExecSecurityMode::Full
+                || (p.mode == openfang_types::config::ExecSecurityMode::Allowlist
+                    && p.allowed_commands.iter().any(|c| c == "*"))
+        });
+
+    if exec_policy_bypasses_approval {
+        debug!(
+            tool_name,
+            "Approval bypassed: exec_policy grants unrestricted shell access"
+        );
+    }
+
     if let Some(kh) = kernel {
-        if kh.requires_approval(tool_name) {
+        if !exec_policy_bypasses_approval && kh.requires_approval(tool_name) {
             let agent_id_str = caller_agent_id.unwrap_or("unknown");
             let input_str = input.to_string();
             let summary = format!(
@@ -2451,7 +2477,7 @@ async fn tool_a2a_discover(input: &serde_json::Value) -> Result<String, String> 
     let url = input["url"].as_str().ok_or("Missing 'url' parameter")?;
 
     // SSRF protection: block private/metadata IPs
-    if crate::web_fetch::check_ssrf(url).is_err() {
+    if crate::web_fetch::check_ssrf(url, &[]).is_err() {
         return Err("SSRF blocked: URL resolves to a private or metadata address".to_string());
     }
 
@@ -2474,7 +2500,7 @@ async fn tool_a2a_send(
     // Resolve agent URL: either directly provided or looked up by name
     let url = if let Some(url) = input["agent_url"].as_str() {
         // SSRF protection
-        if crate::web_fetch::check_ssrf(url).is_err() {
+        if crate::web_fetch::check_ssrf(url, &[]).is_err() {
             return Err("SSRF blocked: URL resolves to a private or metadata address".to_string());
         }
         url.to_string()
@@ -3651,10 +3677,12 @@ mod tests {
             None, // process_manager
         )
         .await;
-        // Should NOT be "Permission denied" — it should normalize to file_write
-        // and pass the capability check. It will fail for other reasons (path validation).
+        // Should NOT be the capability-enforcement "Permission denied" — it should
+        // normalize to file_write and pass the capability check.  It may still fail
+        // for filesystem reasons (e.g. OS "Permission denied (os error 13)"), so we
+        // check specifically for the capability-gate message.
         assert!(
-            !result.content.contains("Permission denied"),
+            !result.content.contains("Permission denied: agent"),
             "fs-write should normalize to file_write and pass capability check, got: {}",
             result.content
         );

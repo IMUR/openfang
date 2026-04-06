@@ -44,6 +44,20 @@ const BASE_RETRY_DELAY_MS: u64 = 1000;
 /// Raised from 60s to 120s for browser automation and long-running builds.
 const TOOL_TIMEOUT_SECS: u64 = 120;
 
+/// Timeout for inter-agent tool calls (seconds).
+/// Agent delegation (agent_send, agent_spawn) can involve a full agent loop on the
+/// target, so these need a significantly longer timeout than regular tools.
+const AGENT_TOOL_TIMEOUT_SECS: u64 = 600;
+
+/// Returns the appropriate timeout duration for a given tool name.
+/// Inter-agent calls get a longer timeout since they may trigger full agent loops.
+fn tool_timeout_for(tool_name: &str) -> Duration {
+    match tool_name {
+        "agent_send" | "agent_spawn" => Duration::from_secs(AGENT_TOOL_TIMEOUT_SECS),
+        _ => Duration::from_secs(TOOL_TIMEOUT_SECS),
+    }
+}
+
 /// Maximum consecutive MaxTokens continuations before returning partial response.
 /// Raised from 3 to 5 to allow longer-form generation.
 const MAX_CONTINUATIONS: u32 = 5;
@@ -70,6 +84,13 @@ fn phantom_action_detected(text: &str) -> bool {
     let has_action = action_verbs.iter().any(|v| lower.contains(v));
     let has_channel = channel_refs.iter().any(|c| lower.contains(c));
     has_action && has_channel
+}
+
+/// Returns true when the agent response text indicates an intentional silent completion.
+/// Matches `NO_REPLY` (exact) and `[SILENT]` (case-insensitive).
+fn is_silent_token(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed == "NO_REPLY" || trimmed.eq_ignore_ascii_case("[silent]")
 }
 
 /// Extra guidance injected after failed tool calls to prevent fabricated follow-up actions.
@@ -630,6 +651,12 @@ pub async fn run_agent_loop(
             cb(LoopPhase::Thinking);
         }
 
+        // Stamp last_active before the (potentially long) LLM call so the
+        // heartbeat monitor doesn't flag us as unresponsive mid-iteration.
+        if let Some(k) = &kernel {
+            k.touch_agent(&agent_id_str);
+        }
+
         // Call LLM with retry, error classification, and circuit breaker
         let provider_name = manifest.model.provider.as_str();
         let mut response = call_with_retry(
@@ -683,8 +710,9 @@ pub async fn run_agent_loop(
                     crate::reply_directives::parse_directives(&text);
                 let text = cleaned_text;
 
-                // NO_REPLY: agent intentionally chose not to reply
-                if text.trim() == "NO_REPLY" || parsed_directives.silent {
+                // NO_REPLY / [SILENT]: agent intentionally chose not to reply.
+                // [SILENT] must not be stored literally — it reinforces silence in future turns.
+                if is_silent_token(&text) || parsed_directives.silent {
                     debug!(agent = %manifest.name, "Agent chose NO_REPLY/silent — silent completion");
                     session
                         .messages
@@ -1064,8 +1092,10 @@ pub async fn run_agent_loop(
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
                     // Timeout-wrapped execution
+                    let timeout = tool_timeout_for(&tool_call.name);
+                    let timeout_secs = timeout.as_secs();
                     let result = match tokio::time::timeout(
-                        Duration::from_secs(TOOL_TIMEOUT_SECS),
+                        timeout,
                         tool_runner::execute_tool(
                             &tool_call.id,
                             &tool_call.name,
@@ -1094,12 +1124,12 @@ pub async fn run_agent_loop(
                     {
                         Ok(result) => result,
                         Err(_) => {
-                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s", TOOL_TIMEOUT_SECS);
+                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s", timeout_secs);
                             openfang_types::tool::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
                                 content: format!(
                                     "Tool '{}' timed out after {}s.",
-                                    tool_call.name, TOOL_TIMEOUT_SECS
+                                    tool_call.name, timeout_secs
                                 ),
                                 is_error: true,
                             }
@@ -2051,6 +2081,14 @@ pub async fn run_agent_loop_streaming(
             }
         }
 
+        // Re-validate tool_call/tool_result pairing after overflow drains
+        // which may have broken assistant→tool ordering invariants.
+        // (Matches the non-streaming loop; fixes Qwen3.5-plus "tool_calls must
+        // be followed by tool messages" errors after context overflow recovery.)
+        if recovery != RecoveryStage::None {
+            messages = crate::session_repair::validate_and_repair(&messages);
+        }
+
         // Context guard: compact oversized tool results before LLM call
         apply_context_guard(&mut messages, &context_budget, available_tools);
 
@@ -2129,8 +2167,9 @@ pub async fn run_agent_loop_streaming(
                     crate::reply_directives::parse_directives(&text);
                 let text = cleaned_text_s;
 
-                // NO_REPLY: agent intentionally chose not to reply
-                if text.trim() == "NO_REPLY" || parsed_directives_s.silent {
+                // NO_REPLY / [SILENT]: agent intentionally chose not to reply.
+                // [SILENT] must not be stored literally — it reinforces silence in future turns.
+                if is_silent_token(&text) || parsed_directives_s.silent {
                     debug!(agent = %manifest.name, "Agent chose NO_REPLY/silent (streaming) — silent completion");
                     session
                         .messages
@@ -2483,8 +2522,10 @@ pub async fn run_agent_loop_streaming(
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
                     // Timeout-wrapped execution
+                    let timeout = tool_timeout_for(&tool_call.name);
+                    let timeout_secs = timeout.as_secs();
                     let result = match tokio::time::timeout(
-                        Duration::from_secs(TOOL_TIMEOUT_SECS),
+                        timeout,
                         tool_runner::execute_tool(
                             &tool_call.id,
                             &tool_call.name,
@@ -2513,12 +2554,12 @@ pub async fn run_agent_loop_streaming(
                     {
                         Ok(result) => result,
                         Err(_) => {
-                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", TOOL_TIMEOUT_SECS);
+                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", timeout_secs);
                             openfang_types::tool::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
                                 content: format!(
                                     "Tool '{}' timed out after {}s.",
-                                    tool_call.name, TOOL_TIMEOUT_SECS
+                                    tool_call.name, timeout_secs
                                 ),
                                 is_error: true,
                             }
@@ -2748,6 +2789,7 @@ pub async fn run_agent_loop_streaming(
 /// 11. `Action: tool\nAction Input: {"key":"value"}` — ReAct-style (LM Studio, GPT-OSS)
 /// 12. `tool_name\n{"key":"value"}` — bare name + JSON on next line (Llama 4 Scout)
 /// 13. `<tool_use>{"name":"tool","arguments":{...}}</tool_use>` — Llama 3.1+ variant
+/// 14. `<function=tool><parameter=name>value</parameter></function>` — nested XML parameter style
 ///
 /// Validates tool names against available tools and returns synthetic `ToolCall` entries.
 fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Vec<ToolCall> {
@@ -2785,13 +2827,16 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
             continue;
         }
 
-        // Parse JSON input
+        // Parse JSON input, or fall back to nested XML parameter blocks.
         let input: serde_json::Value = match serde_json::from_str(json_body) {
             Ok(v) => v,
-            Err(e) => {
-                warn!(tool = tool_name, error = %e, "Failed to parse text-based tool call JSON — skipping");
-                continue;
-            }
+            Err(json_err) => match parse_xml_parameter_blocks(json_body) {
+                Some(v) => v,
+                None => {
+                    warn!(tool = tool_name, error = %json_err, "Failed to parse text-based tool call payload — skipping");
+                    continue;
+                }
+            },
         };
 
         info!(
@@ -3359,6 +3404,42 @@ fn parse_json_tool_call_object(
     Some((name.to_string(), args))
 }
 
+fn unescape_xml_entities(text: &str) -> String {
+    text.replace("&quot;", "\"")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&apos;", "'")
+}
+
+fn parse_xml_parameter_blocks(text: &str) -> Option<serde_json::Value> {
+    use regex_lite::Regex;
+
+    let re = Regex::new(r#"(?s)<parameter=([A-Za-z0-9_.:-]+)>\s*(.*?)\s*</parameter>"#).unwrap();
+    let mut params = serde_json::Map::new();
+
+    for caps in re.captures_iter(text) {
+        let Some(name) = caps.get(1).map(|m| m.as_str().trim()) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+
+        let raw_value = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let value_text = unescape_xml_entities(raw_value).trim().to_string();
+        let value =
+            serde_json::from_str(&value_text).unwrap_or(serde_json::Value::String(value_text));
+        params.insert(name.to_string(), value);
+    }
+
+    if params.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(params))
+    }
+}
+
 /// Parse the custom arrow syntax used by some Ollama models:
 /// `{tool => "name", args => {--key "value"}}` or `{tool => "name", args => {"key":"value"}}`
 fn parse_arrow_syntax_tool_call(
@@ -3614,6 +3695,15 @@ mod tests {
     #[test]
     fn test_tool_timeout_constant() {
         assert_eq!(TOOL_TIMEOUT_SECS, 120);
+        assert_eq!(AGENT_TOOL_TIMEOUT_SECS, 600);
+    }
+
+    #[test]
+    fn test_tool_timeout_for_agent_tools() {
+        assert_eq!(tool_timeout_for("agent_send"), Duration::from_secs(600));
+        assert_eq!(tool_timeout_for("agent_spawn"), Duration::from_secs(600));
+        assert_eq!(tool_timeout_for("file_read"), Duration::from_secs(120));
+        assert_eq!(tool_timeout_for("shell_exec"), Duration::from_secs(120));
     }
 
     #[test]
@@ -4236,6 +4326,44 @@ mod tests {
         assert_eq!(calls[0].name, "web_search");
         assert_eq!(calls[0].input["query"], "rust async");
         assert!(calls[0].id.starts_with("recovered_"));
+    }
+
+    #[test]
+    fn test_recover_text_tool_calls_xml_parameters() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = r#"<function=shell_exec><parameter=command>python3 "/tmp/run.py" --flag value</parameter></function>"#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(
+            calls[0].input["command"],
+            r#"python3 "/tmp/run.py" --flag value"#
+        );
+    }
+
+    #[test]
+    fn test_recover_text_tool_calls_xml_parameters_with_wrapper() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        let text = r#"<tool_call>
+<function=shell_exec>
+<parameter=command>python3 "/tmp/poll.py" --job-id "abc123"</parameter>
+</function>
+</tool_call>"#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(
+            calls[0].input["command"],
+            r#"python3 "/tmp/poll.py" --job-id "abc123""#
+        );
     }
 
     #[test]
@@ -5004,6 +5132,56 @@ mod tests {
         }
     }
 
+    /// Mock driver that emits nested XML parameter-style tool calls as plain text.
+    struct NestedXmlTextToolCallDriver {
+        call_count: AtomicU32,
+    }
+
+    impl NestedXmlTextToolCallDriver {
+        fn new() -> Self {
+            Self {
+                call_count: AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmDriver for NestedXmlTextToolCallDriver {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            let call = self.call_count.fetch_add(1, Ordering::Relaxed);
+            if call == 0 {
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "<tool_call><function=web_search><parameter=query>rust async</parameter></function></tool_call>".to_string(),
+                        provider_metadata: None,
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    tool_calls: vec![],
+                    usage: TokenUsage {
+                        input_tokens: 18,
+                        output_tokens: 10,
+                    },
+                })
+            } else {
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "Recovered nested XML tool call successfully.".to_string(),
+                        provider_metadata: None,
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    tool_calls: vec![],
+                    usage: TokenUsage {
+                        input_tokens: 24,
+                        output_tokens: 8,
+                    },
+                })
+            }
+        }
+    }
+
     #[async_trait]
     impl LlmDriver for TextToolCallDriver {
         async fn complete(
@@ -5114,6 +5292,81 @@ mod tests {
             result.response.contains("search results") || result.response.contains("Rust async"),
             "Expected final response text, got: {:?}",
             result.response
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nested_xml_text_tool_call_recovery_e2e() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = openfang_memory::session::Session {
+            id: openfang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        let manifest = test_manifest();
+        let driver: Arc<dyn LlmDriver> = Arc::new(NestedXmlTextToolCallDriver::new());
+
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search the web".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                }
+            }),
+        }];
+
+        let result = run_agent_loop(
+            &manifest,
+            "Search for rust async programming",
+            &mut session,
+            &memory,
+            driver,
+            &tools,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("Agent loop should recover nested XML tool calls");
+
+        assert!(
+            !result.response.contains("<tool_call>"),
+            "Response should not contain raw tool_call tags, got: {:?}",
+            result.response
+        );
+        assert!(
+            !result.response.contains("<function="),
+            "Response should not contain raw function tags, got: {:?}",
+            result.response
+        );
+        assert!(
+            result
+                .response
+                .contains("Recovered nested XML tool call successfully."),
+            "Expected final response text, got: {:?}",
+            result.response
+        );
+        assert!(
+            result.iterations >= 2,
+            "Should have at least 2 iterations (tool call + final response), got: {}",
+            result.iterations
         );
     }
 
@@ -5246,5 +5499,37 @@ mod tests {
             events.push(ev);
         }
         assert!(!events.is_empty(), "Should have received stream events");
+    }
+
+    #[test]
+    fn test_silent_detection_uppercase() {
+        assert!(is_silent_token("[SILENT]"));
+    }
+
+    #[test]
+    fn test_silent_detection_lowercase() {
+        assert!(is_silent_token("[silent]"));
+    }
+
+    #[test]
+    fn test_silent_detection_mixed_case() {
+        assert!(is_silent_token("[Silent]"));
+    }
+
+    #[test]
+    fn test_silent_detection_with_whitespace() {
+        assert!(is_silent_token("  [SILENT]  "));
+    }
+
+    #[test]
+    fn test_silent_detection_no_reply() {
+        assert!(is_silent_token("NO_REPLY"));
+    }
+
+    #[test]
+    fn test_silent_detection_rejects_normal_text() {
+        assert!(!is_silent_token("Hello, how can I help?"));
+        assert!(!is_silent_token("SILENT"));
+        assert!(!is_silent_token(""));
     }
 }

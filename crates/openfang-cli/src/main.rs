@@ -237,6 +237,9 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Dashboard authentication [*].
+    #[command(subcommand)]
+    Auth(AuthCommands),
     /// Security tools and audit trail [*].
     #[command(subcommand)]
     Security(SecurityCommands),
@@ -680,6 +683,12 @@ enum CronCommands {
 }
 
 #[derive(Subcommand)]
+enum AuthCommands {
+    /// Generate an Argon2id password hash for dashboard authentication.
+    HashPassword,
+}
+
+#[derive(Subcommand)]
 enum SecurityCommands {
     /// Show security status summary.
     Status {
@@ -1072,6 +1081,9 @@ fn main() {
         Some(Commands::Sessions { agent, json }) => cmd_sessions(agent.as_deref(), json),
         Some(Commands::Logs { lines, follow }) => cmd_logs(lines, follow),
         Some(Commands::Health { json }) => cmd_health(json),
+        Some(Commands::Auth(sub)) => match sub {
+            AuthCommands::HashPassword => cmd_auth_hash_password(),
+        },
         Some(Commands::Security(sub)) => match sub {
             SecurityCommands::Status { json } => cmd_security_status(json),
             SecurityCommands::Audit { limit, json } => cmd_security_audit(limit, json),
@@ -2616,7 +2628,8 @@ decay_rate = 0.05
                                         checks.push(serde_json::json!({"check": "mcp_server_config", "status": "warn", "name": server.name}));
                                     }
                                 }
-                                openfang_types::config::McpTransportEntry::Sse { url } => {
+                                openfang_types::config::McpTransportEntry::Sse { url }
+                                | openfang_types::config::McpTransportEntry::Http { url } => {
                                     if url.is_empty() {
                                         if !json {
                                             ui::check_warn(&format!(
@@ -2662,9 +2675,7 @@ decay_rate = 0.05
         // Check workspace skills if home dir available
         if skills_dir.exists() {
             match skill_reg.load_workspace_skills(&skills_dir) {
-                Ok(_) => {
-                    let total = skill_reg.count();
-                    let ws_count = total.saturating_sub(bundled_count);
+                Ok(ws_count) => {
                     if ws_count > 0 {
                         if !json {
                             ui::check_ok(&format!("Workspace skills loaded: {ws_count}"));
@@ -3533,6 +3544,7 @@ fn cmd_skill_install(source: &str) {
                             std::process::exit(1);
                         }
                         println!("Installed OpenClaw skill: {}", manifest.skill.name);
+                        notify_daemon_skill_reload();
                     }
                     Err(e) => {
                         eprintln!("Failed to convert OpenClaw skill: {e}");
@@ -3562,6 +3574,7 @@ fn cmd_skill_install(source: &str) {
             "Installed skill: {} v{}",
             manifest.skill.name, manifest.skill.version
         );
+        notify_daemon_skill_reload();
     } else if source.starts_with("https://")
         || source.starts_with("http://")
         || source.starts_with("git@")
@@ -3611,6 +3624,7 @@ fn cmd_skill_install(source: &str) {
                             std::process::exit(1);
                         }
                         println!("Installed OpenClaw skill: {}", manifest.skill.name);
+                        notify_daemon_skill_reload();
                     }
                     Err(e) => {
                         eprintln!("Failed to convert OpenClaw skill: {e}");
@@ -3639,6 +3653,7 @@ fn cmd_skill_install(source: &str) {
             "Installed skill: {} v{}",
             manifest.skill.name, manifest.skill.version
         );
+        notify_daemon_skill_reload();
     } else {
         // Remote install from FangHub
         println!("Installing {source} from FangHub...");
@@ -3647,12 +3662,34 @@ fn cmd_skill_install(source: &str) {
             openfang_skills::marketplace::MarketplaceConfig::default(),
         );
         match rt.block_on(client.install(source, &skills_dir)) {
-            Ok(version) => println!("Installed {source} {version}"),
+            Ok(version) => {
+                println!("Installed {source} {version}");
+                notify_daemon_skill_reload();
+            }
             Err(e) => {
                 eprintln!("Failed to install skill: {e}");
                 std::process::exit(1);
             }
         }
+    }
+}
+
+/// Notify the running daemon to hot-reload its skill registry after a CLI install.
+///
+/// If the daemon is not running, this is a no-op with a hint to the user.
+fn notify_daemon_skill_reload() {
+    if let Some(base) = find_daemon() {
+        let client = daemon_client();
+        match client.post(format!("{base}/api/skills/reload")).send() {
+            Ok(resp) if resp.status().is_success() => {
+                ui::step("Daemon notified — skill registry reloaded.");
+            }
+            _ => {
+                ui::check_warn("Could not notify daemon. Restart with: openfang restart");
+            }
+        }
+    } else {
+        ui::hint("Start the daemon to make this skill available to agents: openfang start");
     }
 }
 
@@ -5980,6 +6017,28 @@ fn cmd_health(json: bool) {
             std::process::exit(1);
         }
     }
+}
+
+fn cmd_auth_hash_password() {
+    let password = prompt_input("Enter password: ");
+    if password.is_empty() {
+        ui::error("Empty password.");
+        std::process::exit(1);
+    }
+    let confirm = prompt_input("Confirm password: ");
+    if password != confirm {
+        ui::error("Passwords do not match.");
+        std::process::exit(1);
+    }
+    let hash = openfang_api::session_auth::hash_password(&password);
+    println!();
+    ui::success("Argon2id hash generated. Add this to your config.toml:");
+    println!();
+    println!("  [auth]");
+    println!("  enabled = true");
+    println!("  password_hash = \"{}\"", hash);
+    println!();
+    ui::hint("Restart the daemon after updating config.toml");
 }
 
 fn cmd_security_status(json: bool) {
