@@ -107,8 +107,9 @@ fn surreal_err(e: surrealdb::Error) -> OpenFangError {
 /// Raw entity record as returned by a graph traversal hop.
 #[derive(Debug, Serialize, Deserialize)]
 struct RawEntity {
+    /// Record ID as returned by v3 graph expansion — string like "entities:acme".
     #[serde(rename = "id")]
-    raw_id: Option<surrealdb::types::RecordId>,
+    raw_id: Option<serde_json::Value>,
     entity_type: Option<EntityType>,
     name: Option<String>,
     #[serde(default)]
@@ -141,14 +142,17 @@ fn collect_hop(
     nodes: &mut Vec<TraversalNode>,
 ) {
     for re in raw_ents {
+        // raw_id is a string like "entities:acme" or a RecordId object — extract the key part.
         let eid = re
             .raw_id
             .as_ref()
-            .map(|rid| match &rid.key {
-                surrealdb::types::RecordIdKey::String(s) => s.clone(),
-                surrealdb::types::RecordIdKey::Number(n) => n.to_string(),
-                surrealdb::types::RecordIdKey::Uuid(u) => u.to_string(),
-                other => format!("{other:?}"),
+            .and_then(|v| match v {
+                serde_json::Value::String(s) => {
+                    // "entities:acme" → "acme"
+                    s.split_once(':').map(|(_, key)| key.to_string())
+                        .or_else(|| Some(s.clone()))
+                }
+                _ => Some(format!("{v}"))
             })
             .unwrap_or_default();
         if eid.is_empty() || !seen.insert(eid.clone()) {
@@ -525,4 +529,5 @@ mod tests {
             .unwrap();
         assert!(!rel_id.is_empty());
     }
+
 }
