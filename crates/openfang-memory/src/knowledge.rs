@@ -209,11 +209,12 @@ impl KnowledgeStore {
         let mut bindings: Vec<(String, serde_json::Value)> = Vec::new();
 
         if let Some(ref source) = pattern.source {
-            conditions.push("(source_id = $source_filter OR s.name = $source_filter)");
+            // `in` is the source record link on the edge; compare by id string or name
+            conditions.push("(meta::id(in) = $source_filter OR in.name = $source_filter)");
             bindings.push(("source_filter".into(), serde_json::json!(source)));
         }
         if let Some(ref relation) = pattern.relation {
-            conditions.push("r.relation_type = $rel_filter");
+            conditions.push("relation_type = $rel_filter");
             bindings.push((
                 "rel_filter".into(),
                 serde_json::to_value(relation)
@@ -221,7 +222,8 @@ impl KnowledgeStore {
             ));
         }
         if let Some(ref target) = pattern.target {
-            conditions.push("(target_id = $target_filter OR t.name = $target_filter)");
+            // `out` is the target record link on the edge
+            conditions.push("(meta::id(out) = $target_filter OR out.name = $target_filter)");
             bindings.push(("target_filter".into(), serde_json::json!(target)));
         }
 
@@ -231,18 +233,21 @@ impl KnowledgeStore {
             format!(" WHERE {}", conditions.join(" AND "))
         };
 
+        // SurrealDB edge records have `in` (source RecordId) and `out` (target RecordId).
+        // Using `in.*` / `out.*` auto-fetches the linked entity fields in a single query.
+        // `relations` must be backtick-quoted because it is a reserved word in SurrealDB.
+        // The LET-alias pattern used previously is not valid SurrealQL syntax.
         let sql = format!(
             "SELECT
-                s.* AS source,
-                r.* AS relation,
-                t.* AS target,
-                meta::id(s.id) AS source_id,
-                meta::id(t.id) AS target_id,
-                r.in AS relation_source,
-                r.out AS relation_target
-             FROM relations r
-             LET s = r.in,
-                 t = r.out
+                in.* AS source,
+                out.* AS target,
+                {{ relation_type: relation_type, properties: properties,
+                   confidence: confidence, created_at: created_at }} AS relation,
+                meta::id(in) AS source_id,
+                meta::id(out) AS target_id,
+                meta::id(in) AS relation_source,
+                meta::id(out) AS relation_target
+             FROM `relations`
              {where_clause}
              LIMIT 100"
         );
