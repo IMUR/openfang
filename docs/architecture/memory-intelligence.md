@@ -8,7 +8,7 @@
 
 ## Overview
 
-The memory layer is a multi-model substrate built on embedded SurrealDB (SurrealKV). Every agent has access to six stores that persist across sessions. **Dense embeddings** (vectors for HNSW) can come from **any** provider that implements the kernel’s `EmbeddingDriver`: local **Ollama / vLLM / LM Studio** over HTTP, cloud OpenAI-compatible APIs, or **optional in-process Candle** when the binary is built with the `memory-candle` feature.
+The memory layer is a multi-model substrate built on embedded SurrealDB (SurrealKV). Every agent has access to six stores that persist across sessions. **Dense embeddings** (vectors for HNSW) can come from **any** provider that implements the kernel's `EmbeddingDriver`: local **Ollama / vLLM / LM Studio** over HTTP, cloud OpenAI-compatible APIs, or **optional in-process Candle** when the binary is built with the `memory-candle` feature.
 
 The design principle: **the agent loop and kernel are unchanged**. `kernel.send_message_streaming()` is unmodified. Voice, text, API, and channel interactions all flow through the same path. The memory layer enriches context silently — the agent receives better recall results without knowing how embeddings were produced.
 
@@ -19,14 +19,14 @@ No rebuild is required to change **model** or **HTTP backend** — edit `~/.open
 | Goal | What to set |
 |------|------------------|
 | Local Ollama embeddings | `embedding_provider = "ollama"`, `embedding_model = "nomic-embed-text"` (or any model Ollama serves), `[provider_urls]` `ollama = "http://…:11434/v1"` if non-default |
-| vLLM / LM Studio / other OpenAI-compatible | `embedding_provider` to the matching name, `embedding_model` to the server’s embedding model id, URL under `provider_urls` |
+| vLLM / LM Studio / other OpenAI-compatible | `embedding_provider` to the matching name, `embedding_model` to the server's embedding model id, URL under `provider_urls` |
 | In-process Candle (CUDA/CPU) | Build with `cargo build -p openfang-cli --release --features memory-candle`, then `embedding_provider = "candle"` and `embedding_model` = HF id (e.g. `BAAI/bge-small-en-v1.5`) |
 
 **HNSW dimension** must match the model output (e.g. 384 for BGE-small, 768 for nomic-embed-text). The SurrealDB DDL in `openfang-memory` defines the index dimension; change provider/model and DDL together when switching embedding size.
 
-**NER + cross-encoder reranking** use in-process Candle when the binary includes `memory-candle`. They are **not** tied to the embedding provider: set `ner_backend = "candle"` and/or `reranker_backend = "candle"` to run them alongside HTTP embeddings (e.g. Ollama for vectors, Candle on CPU for NER). Omit or `auto` keeps legacy behavior (Candle NER/rerank only when `embedding_provider = "candle"`). Use `none` to force-disable while keeping model ids in the file. A future sidecar or HTTP inference service could add non-Candle backends.
+**NER + cross-encoder reranking + ML classification** use in-process Candle when the binary includes `memory-candle`. They are **not** tied to the embedding provider: set `ner_backend`, `reranker_backend`, and `classification_backend` to `"candle"` to run them alongside HTTP embeddings. Omit or `auto` keeps legacy behavior. Use `none` to force-disable while keeping model ids in the file.
 
-Health detail includes `memory_candle_binary: true|false` so operators know whether NER/rerank can ever be active.
+Health detail includes `memory_candle_binary: true|false` so operators know whether NER/rerank/classification can ever be active.
 
 ---
 
@@ -39,7 +39,7 @@ Health detail includes `memory_candle_binary: true|false` so operators know whet
 | GTX 1080 #2 | 8GB | 6.1 | Ollama LLMs | Active |
 | GTX 970 #3 | 4GB (3.5GB fast) | 5.2 | **Voice inference** — Kokoro / Whisper / LFM2.5-Audio | Active (see `voice-intelligence.md`) |
 
-Memory intelligence runs on **CPU** (i9-9900X with AVX-512). All three Candle BERT models load FP32 in-process with `cuda_device` omitted.
+Memory intelligence runs on **CPU** (i9-9900X with AVX-512). All Candle BERT models load FP32 in-process with `cuda_device` omitted.
 
 All four GPUs are **Maxwell/Pascal** (pre-Volta, CC 5.2–6.1). None have Tensor Cores. The Candle inference library is patched at `git.ism.la:6666/rtr/candle-kernels` to support pre-Volta hardware.
 
@@ -80,22 +80,21 @@ All six stores share one embedded SurrealDB handle backed by SurrealKV at `~/.op
 
 ## Candle Inference Backend (CPU)
 
-Three BERT-family models run in-process via HuggingFace Candle (0.10.0) on the **CPU** (FP32). Models download automatically on first boot to `~/.openfang/models/{model_id}/`. Set `cuda_device = <ordinal>` to use a GPU instead (FP16).
+Four BERT-family models run in-process via HuggingFace Candle (0.10.0) on the **CPU** (FP32). Models download automatically on first boot to `~/.openfang/models/{model_id}/`. Set `cuda_device = <ordinal>` to use a GPU instead (FP16).
 
-### Phase 1 Models — Active
+### Active Models
 
 | Model | Params | RAM (FP32, CPU) | VRAM (FP16, GPU) | Task |
 |-------|--------|-----------------|------------------|------|
 | `BAAI/bge-small-en-v1.5` | 33M | ~133MB | ~85MB | Sentence embeddings (384d) |
 | `dslim/bert-base-NER` | 110M | ~433MB | ~270MB | Named entity extraction |
 | `cross-encoder/ms-marco-MiniLM-L-6-v2` | 22M | ~91MB | ~60MB | HNSW candidate reranking |
-| **Total** | **165M** | **~657MB** | **~715MB** (+ ~300MB CUDA ctx) | |
+| `typeform/distilbert-base-uncased-mnli` | 67M | ~135MB | ~90MB | Zero-shot NLI memory classification |
+| **Total** | **232M** | **~792MB** | **~505MB** (+ ~300MB CUDA ctx) | |
 
 Currently running on **CPU (FP32)**. GPU column retained for reference if `cuda_device` is restored.
 
-The kernel holds optional `Arc<>` handles (`ner_driver`, `reranker`) according to `ner_backend` / `reranker_backend` and `MemoryConfig::wants_candle_*`. These are **independent of the embedding provider** — you can use HTTP embeddings with Candle NER/rerank, or all three on Candle, or any mix. When `cuda_device` is set, models load as FP16 on the GPU; when omitted, they load as FP32 on CPU.
-
-Omit `cuda_device` in `[memory]` to force **CPU** inference for Candle (no VRAM; slower, but avoids GPU driver/runtime mismatches).
+The kernel holds optional `Arc<>` handles (`ner_driver`, `reranker`, `classifier`) according to config and `MemoryConfig::wants_candle_*`. These are **independent of the embedding provider** — you can use HTTP embeddings with any combination of Candle NER/rerank/classify, or all four on Candle, or any mix.
 
 ### CUDA Compatibility Patch
 
@@ -113,6 +112,57 @@ candle-kernels = { git = "ssh://git@git.ism.la:6666/rtr/candle-kernels.git", bra
 
 ---
 
+## Agent Interface to Memory
+
+Agents interact with the memory system through **three distinct layers**. Understanding which layer does what matters when debugging context issues or extending agent behaviour.
+
+### Layer 1 — Automatic Pre-Turn Injection (transparent, semantic store)
+
+At the start of every turn, before the LLM is called, `agent_loop.rs` automatically runs a full recall pipeline against the user's message and appends the results to the system prompt as a `## Memory` section. The agent never explicitly requests this — it just sees recalled memories as part of its instructions.
+
+The recall pipeline in order:
+1. Embed the user message → HNSW KNN search (falls back to BM25 text search if no embedding driver)
+2. Cross-encoder reranking of candidates (`memory-candle`)
+3. Graph-boosted re-ordering via NER entity overlap (`memory-candle`)
+4. Scope-weighted stable-sort (`semantic` first, then `declarative`, then `episodic`)
+5. Top-5 fragments injected via `prompt_builder::build_memory_section()`
+
+This layer queries the **semantic store** (`memories` table — HNSW + BM25). It is assembled in `crates/openfang-runtime/src/prompt_builder.rs`.
+
+### Layer 2 — Explicit Tool Calls (agent-driven, KV store)
+
+Agents are granted up to four memory tools depending on their manifest capabilities:
+
+| Tool | Store | Operation |
+|------|-------|-----------|
+| `memory_store(key, value)` | **KV store** (`kv` table) | Write a structured key/value fact |
+| `memory_recall(key)` | **KV store** (`kv` table) | Read a specific key by name |
+| `memory_delete(key)` | **KV store** (`kv` table) | Remove a key |
+| `memory_list` | **KV store** (`kv` table) | Enumerate stored keys |
+
+**Critical distinction:** tool-driven memory targets the **KV store** (`structured_get` / `structured_set`), not the semantic store. The automatic pre-turn injection (Layer 1) targets the **semantic store** (HNSW/BM25). These are two completely separate SurrealDB tables with different access patterns. An agent can `memory_store` a fact via tool call and then see it surfaced automatically next turn via vector recall only if it was also written to the semantic store during the agent loop's write path — the KV store is not vectorised.
+
+Tool calls are capability-checked against `MemoryRead(key)` / `MemoryWrite(key)` before execution. Implementation lives in `crates/openfang-runtime/src/host_functions.rs` → `KernelHandle`.
+
+Typical use: agents use `memory_store` to persist structured user preferences (`user_name`, `preferred_language`, etc.) that they want to look up by exact key in future sessions.
+
+### Layer 3 — Static Workspace Context Files (loaded at session build time)
+
+When a session is built, the kernel loads a set of markdown files from the agent's workspace directory (`~/.openfang/workspaces/<workspace>/`) and injects them as static sections in the system prompt via `PromptContext`. These are loaded once — not queried per turn.
+
+| File | System prompt section | Purpose |
+|------|-----------------------|---------|
+| `SOUL.md` | `## Persona` | Tone and personality |
+| `IDENTITY.md` | `## Identity` | At-a-glance personality summary |
+| `USER.md` | `## User Context` | Static facts about the user |
+| `MEMORY.md` | `## Long-Term Memory` | Curated persistent knowledge |
+| `AGENTS.md` | injected inline | Behavioural guidelines |
+| `BOOTSTRAP.md` | `## First-Run Protocol` | First-session ritual (suppressed once `user_name` is known) |
+
+All three layers are assembled in `crates/openfang-runtime/src/prompt_builder.rs` → `build_system_prompt()`. The canonical context summary (session compaction) is injected as a separate user-turn message rather than in the system prompt, to preserve provider prompt-cache hits across turns.
+
+---
+
 ## Data Flows
 
 ### Write Path (per conversation turn)
@@ -122,22 +172,45 @@ Agent Loop (agent_loop.rs)
     │
     ├─ 1. Session write ──────────────────────────► sessions (SurrealDB)
     │
-    ├─ 2. Embedding
-    │       └─ CandleEmbeddingDriver.embed_one(text)
-    │               (spawn_blocking → CPU, FP32)
-    │               BertModel forward → mean-pool → L2-norm → Vec<f32> 384d
+    ├─ 2. Rule-based classification
+    │       classify_memory(content, source)
+    │           → (scope, category, priority)        e.g. "episodic", "observation", "normal"
     │
-    ├─ 3. Memory write ───────────────────────────► memories (SurrealDB)
-    │       content + embedding → HNSW auto-indexes
-    │       content → BM25 auto-indexes
+    ├─ 2b. ML classification (Phase 5, if classifier loaded)
+    │       CandleClassifier.classify(content)        [cfg(feature = "memory-candle")]
+    │           (spawn_blocking → CPU, FP32)
+    │           DistilBERT NLI: content vs. scope/category hypotheses
+    │           → overrides rule-based (scope, category) when available
+    │           classification_source = "candle" | "rule"
     │
-    └─ 4. NER extraction (post-loop, best-effort)
+    ├─ 3. Embedding
+    │       EmbeddingDriver.embed_one(text)
+    │           (HTTP: Ollama/vLLM/OpenAI) OR (Candle: spawn_blocking → CPU, FP32)
+    │           → Vec<f32> 384d
+    │
+    ├─ 4. Memory write ───────────────────────────► memories (SurrealDB)
+    │       content + embedding + metadata (session_id, turn_index, source_role,
+    │       token_count, scope, category, priority, classification_source)
+    │       → HNSW auto-indexes, BM25 auto-indexes
+    │
+    ├─ 5. AfterMemoryStore hook fired
+    │
+    ├─ 6. User directive detection (Phase 1d)
+    │       is_user_directive(text) → store additional declarative memory
+    │           scope = "declarative", source = UserProvided
+    │
+    ├─ 7. Tool result memories (Phase 4b)
+    │       Successful tool executions stored as procedural memories
+    │           scope = "procedural", source = Observation
+    │
+    └─ 8. NER extraction (post-loop, best-effort)
             kernel.populate_knowledge_graph(agent_id, response_text, memory_id)
-                CandleNerDriver.extract_entities(text)
+                CandleNerDriver.extract_entities(text)   [cfg(feature = "memory-candle")]
                     (spawn_blocking → CPU, FP32)
                     BertModel + token-classification head → BIO tags → entity spans
                         knowledge.add_entity()   → entities (SurrealDB)
                         knowledge.add_relation() → relations (SurrealDB)
+                    set_metadata_entities(memory_id, entity_ids)
             Streaming: spawned as background tokio task after loop returns
             Non-streaming: inline await after loop returns
 ```
@@ -147,7 +220,7 @@ Agent Loop (agent_loop.rs)
 ```
 Recall Query (agent_loop.rs, top of run_agent_loop / run_agent_loop_streaming)
     │
-    ├─ CandleEmbeddingDriver.embed_one(query) → Vec<f32> 384d
+    ├─ EmbeddingDriver.embed_one(query) → Vec<f32> 384d
     │
     ├─ Parallel SurrealDB queries
     │   ├─ sessions:   ORDER BY accessed_at DESC
@@ -162,26 +235,70 @@ Recall Query (agent_loop.rs, top of run_agent_loop / run_agent_loop_streaming)
     │   weighted score: 0.6 × vector_rank + 0.4 × text_rank
     │   dedup by record ID, sort, truncate
     │
-    └─ Cross-encoder reranking (when reranker loaded)
-            CandleReranker.rerank(query, candidates)
-                (spawn_blocking → CPU, FP32)
-                BertModel (query, doc) pairs → [CLS] → Linear(1) → score
-                sorted descending → MemoryFragment[]
+    ├─ Cross-encoder reranking (Phase 2, if reranker loaded)   [cfg(feature = "memory-candle")]
+    │       CandleReranker.rerank(query, candidates)
+    │           (spawn_blocking → CPU, FP32)
+    │           BertModel (query, doc) pairs → [CLS] → Linear(1) → score
+    │           sorted descending → MemoryFragment[]
+    │
+    ├─ Graph-boosted recall (Phase 2b)   [cfg(feature = "memory-candle")]
+    │       CandleNerDriver.extract_entities(query, threshold=0.60)
+    │           query entity names matched against memories.metadata.entities
+    │           memories with entity overlap sorted to front
+    │
+    ├─ Scope-weighted recall (Phase 2c, unconditional)
+    │       stable-sort: semantic(0) > declarative(1) > others(2)
+    │       information-dense summaries and user facts surface first
+    │
+    └─ AfterMemoryRecall hook fired
 ```
 
 ### Consolidation Path (background, periodic)
 
 ```
-ConsolidationEngine.run_for_all_agents()
+Kernel background loop (start_background_agents)
     │
-    ├─ SELECT DISTINCT agent_id FROM memories WHERE deleted = false
+    ├─ ConsolidationEngine.run_for_all_agents()
+    │   │
+    │   ├─ SELECT DISTINCT agent_id FROM memories WHERE deleted = false
+    │   │
+    │   └─ Per agent:
+    │           decay_confidence()  confidence × (1 − 0.05)
+    │               WHERE accessed_at < now − 7 days
+    │           prune()  SET deleted = true
+    │               WHERE confidence < 0.1
     │
-    └─ Per agent:
-            decay_confidence()  confidence × (1 − 0.05)
-                WHERE accessed_at < now − 7 days
-            prune()  SET deleted = true
-                WHERE confidence < 0.1
+    ├─ L1 Summarization (Phase 3a)
+    │       kernel.run_l1_summarization(agent_id)
+    │           fetch_episodic_for_summarization() → EpisodicBatchItem[]
+    │               (episodic memories older than 24h, not yet summarized)
+    │           LLM prompt: "Summarize these N interactions..."
+    │           write_l1_summary(agent_id, summary_text, source_ids)
+    │               → stored as semantic memory, scope="semantic", category="observation"
+    │           mark_memories_summarized(source_ids, summary_id)
+    │               → confidence reduced, metadata.summarized=true
+    │
+    └─ Session summaries (Phase 4d)
+            try_generate_session_summary(agent_id, session)
+                triggered after every N turns (configurable)
+                LLM prompt: "Summarize this conversation..."
+                → stored as semantic memory
 ```
+
+---
+
+## Memory Scope Vocabulary
+
+All memories carry a `scope` field that drives weighted recall.
+
+| Scope | Source | Written By | Description |
+|-------|--------|-----------|-------------|
+| `episodic` | Conversation | Agent loop (default) | Raw conversation turns |
+| `declarative` | UserProvided | User directive detection | Explicit user facts ("remember that...") |
+| `semantic` | System/Inference | L1 consolidation, session summaries | Distilled knowledge |
+| `procedural` | Tool results | Tool execution path | How-to knowledge from tool use |
+
+Scope constants live in `openfang_types::memory::scope`.
 
 ---
 
@@ -194,9 +311,7 @@ ConsolidationEngine.run_for_all_agents()
 | Candle CPU (`cuda_device` omitted) | ~5–15ms typical | In-process; depends on CPU (e.g. AVX-512) |
 | **No embedding driver** (Candle init failed) | — | Recall uses BM25 / text / recent paths only — **no new vector writes** until a working embedding driver is restored |
 
-Rough order-of-magnitude vs Ollama HTTP for local GPU: **~100–1000×** lower per-call latency when CUDA is working.
-
-BERT weights load at driver init (boot), not lazily on first `remember()` — first `remember()` may still pay tokenization and a cold GPU kernel.
+BERT weights load at driver init (boot), not lazily on first `remember()`.
 
 ---
 
@@ -206,31 +321,76 @@ BERT weights load at driver init (boot), not lazily on first `remember()` — fi
 OpenFangKernel
 ├─ embedding_driver: Option<Arc<dyn EmbeddingDriver>>
 │       CandleEmbeddingDriver — provider="candle", model="BAAI/bge-small-en-v1.5"
-│       create_candle_embedding_driver() called at boot (CPU, FP32)
 │
-├─ ner_driver: Option<Arc<CandleNerDriver>>       [cfg(feature = "memory-candle")]
-│       loaded at boot when ner_backend = "candle" (or "auto" + embedding_provider = "candle")
-│       passed to populate_knowledge_graph() after each agent loop completes
+├─ ner_driver: Option<Arc<CandleNerDriver>>          [cfg(feature = "memory-candle")]
+│       loaded at boot when ner_backend = "candle"
+│       used in populate_knowledge_graph() and graph-boosted recall
 │
-├─ reranker: Option<Arc<CandleReranker>>           [cfg(feature = "memory-candle")]
-│       loaded at boot when reranker_backend = "candle" (or "auto" + embedding_provider = "candle")
-│       passed into run_agent_loop / run_agent_loop_streaming, reranks recall results
+├─ reranker: Option<Arc<CandleReranker>>             [cfg(feature = "memory-candle")]
+│       loaded at boot when reranker_backend = "candle"
+│       passed into run_agent_loop / run_agent_loop_streaming
+│
+├─ classifier: Option<Arc<CandleClassifier>>         [cfg(feature = "memory-candle")]
+│       loaded at boot when classification_backend = "candle"
+│       zero-shot NLI: DistilBERT-MNLI classifies scope + category at write time
+│       falls back to rule-based when classifier = None or inference fails
 │
 └─ populate_knowledge_graph(agent_id, text, memory_id)
         called after agent loop returns (streaming: background spawn; non-streaming: inline)
 ```
 
-All three Candle handles are `Option` — the system degrades gracefully if a model fails to load.
+All four Candle handles are `Option` — the system degrades gracefully if a model fails to load.
 
 | Subsystem | If `None` / inactive |
 |-----------|----------------------|
 | `embedding_driver` | No dense vectors on write; recall skips the HNSW leg (BM25 + structured paths still work). |
-| `ner_driver` | No automatic entity/relation extraction after `remember()`. |
+| `ner_driver` | No automatic entity/relation extraction; no graph-boosted recall scoring. |
 | `reranker` | HNSW/BM25 ordering unchanged (no cross-encoder rescoring). |
+| `classifier` | Rule-based classification used instead (scope from source role, fixed category/priority). |
 
 ---
 
-## Health & observability
+## Hook Events
+
+Two hook events fire on every memory operation, enabling custom observability and extensions.
+
+| Event | When | Payload |
+|-------|------|---------|
+| `AfterMemoryStore` | After each interaction is written to SurrealDB | `memory_id`, `scope`, `source`, `category` |
+| `AfterMemoryRecall` | After recall results are returned | `query`, `result_count`, `retrieval_path` |
+
+---
+
+## Backfill CLI
+
+Existing memories written before classification/NER were active can be re-enriched without a full reset:
+
+```bash
+# Dry run — report what would be updated
+openfang memory backfill --dry-run
+
+# Backfill all agents
+openfang memory backfill
+
+# Backfill a single agent
+openfang memory backfill --agent <uuid>
+
+# Scripting
+openfang memory backfill --json
+```
+
+API: `POST /api/memory/backfill` — body `{ "agent_id": "...", "dry_run": false, "batch_size": 50 }`.
+
+The backfill pipeline:
+1. Paginates all non-deleted fragments via `MemorySubstrate::list_fragments`
+2. Applies rule-based scope/category if not already ML-classified
+3. Upgrades to Candle ML classification if `classifier` is loaded
+4. Populates empty `entities` metadata via NER if `ner_driver` is loaded
+5. Writes updated metadata via `update_metadata`
+
+---
+
+## Health & Observability
 
 Authenticated **GET** `/api/health/detail` includes a `memory_intelligence` object:
 
@@ -239,13 +399,15 @@ Authenticated **GET** `/api/health/detail` includes a `memory_intelligence` obje
 | `embedding_provider` | Config string, e.g. `candle` |
 | `embedding_model` | Configured model id |
 | `embedding_active` | `true` only if `embedding_driver` initialized |
-| `ner_backend` / `reranker_backend` | Raw config: `auto`, `candle`, `none`, etc. |
+| `ner_backend` | Raw config value: `auto`, `candle`, `none`, etc. |
+| `reranker_backend` | Raw config value: `auto`, `candle`, `none`, etc. |
 | `ner_active` | NER model loaded |
 | `reranker_active` | Cross-encoder loaded |
-| `cuda_device` | Config value (JSON `null` if unset) |
+| `memory_candle_binary` | `true` if compiled with `--features memory-candle` |
+| `cuda_device` | Config value (JSON `null` if unset — CPU mode) |
 | `models_cached` | Heuristic: `~/.openfang/models/<embedding_model>/model.safetensors` exists |
 
-Cross-check with `journalctl --user -u openfang` for Candle load warnings (CUDA errors, tokenizer issues).
+> **Note:** `classification_backend` and `classifier_active` are not yet surfaced by the health endpoint despite being wired in the kernel. They should be added to the `memory_intelligence` block in `server.rs` when the health response is next revised.
 
 ---
 
@@ -253,26 +415,50 @@ Cross-check with `journalctl --user -u openfang` for Candle load warnings (CUDA 
 
 ```toml
 [memory]
-embedding_model    = "BAAI/bge-small-en-v1.5"
-embedding_provider = "candle"
-# cuda_device      = 0                  # Omitted = CPU; integer = CUDA ordinal for GPU
-ner_backend        = "candle"           # auto | candle | none
-reranker_backend   = "candle"
-# ner_model        = "dslim/bert-base-NER"           # default; set null to disable
-# reranker_model   = "cross-encoder/ms-marco-MiniLM-L-6-v2"  # default; set null to disable
+embedding_model        = "BAAI/bge-small-en-v1.5"
+embedding_provider     = "candle"
+# cuda_device          = 0                   # Omitted = CPU; integer = CUDA ordinal for GPU
+ner_backend            = "candle"            # auto | candle | none
+reranker_backend       = "candle"
+classification_backend = "candle"            # auto | candle | none
+# ner_model            = "dslim/bert-base-NER"
+# reranker_model       = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+# classification_model = "typeform/distilbert-base-uncased-mnli"
 consolidation_threshold = 10000
-decay_rate         = 0.05
+decay_rate             = 0.05
 ```
 
-All three subsystems active on CPU. Verify via `/api/health/detail`:
+All four subsystems active on CPU. Verify via `/api/health/detail` (actual response shape):
 ```json
 "memory_intelligence": {
+  "embedding_provider": "candle",
+  "embedding_model": "BAAI/bge-small-en-v1.5",
   "embedding_active": true,
+  "ner_backend": "candle",
+  "reranker_backend": "candle",
   "ner_active": true,
   "reranker_active": true,
-  "cuda_device": null
+  "memory_candle_binary": true,
+  "cuda_device": null,
+  "models_cached": true
 }
 ```
+
+`classifier_active` / `classification_backend` are not yet in the response — see note in Health & Observability section above.
+
+---
+
+## Phase Completion Status
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| 0 | KG wiring — real MemoryId, entity back-links, traverse_from | ✅ Complete |
+| 1 | Rich write path — scope vocab, metadata, rule-based classification, user directives | ✅ Complete |
+| 2 | Graph-boosted recall — NER on query, entity overlap scoring, scope-weighted sort | ✅ Complete |
+| 3 | Tiered memory — L1 consolidation summarization, session summaries | ✅ Complete |
+| 4 | Memory automation — AfterMemoryStore/Recall hooks, tool result memories | ✅ Complete |
+| 5 | Candle classification driver — zero-shot NLI override at write time | ✅ Complete |
+| Backfill | CLI + API to re-enrich existing memories | ✅ Complete |
 
 ---
 
@@ -285,12 +471,13 @@ All three subsystems active on CPU. Verify via `/api/health/detail`:
 | Session compaction | `LiquidAI/LFM2-2.6B-Transcript` ONNX Q4 | Same `protoc` requirement |
 | SurrealML in-query inference | `ml::` salience scoring + `DEFINE EVENT` auto-tagging | `surrealml-core` ort/ndarray version triangle — needs `surrealdb` 2.7+ |
 | Consolidation scheduling | Timer invoking `consolidate()` every N hours | `consolidation_interval_hours` config field exists, no scheduler wired |
+| Runtime-swappable inference | Trait-based HTTP/Candle backends for NER, rerank, classify without rebuild | Deferred — all three currently in-process Candle only |
 
 ---
 
-## Deployment & troubleshooting
+## Deployment & Troubleshooting
 
-**Replacing the daemon binary:** stop the user service before copying over `~/.local/bin/openfang`, otherwise `cp` fails with “Text file busy” (the running process keeps the executable mapped):
+**Replacing the daemon binary:** stop the user service before copying:
 
 ```bash
 systemctl --user stop openfang
@@ -298,11 +485,11 @@ cp target/release/openfang ~/.local/bin/openfang
 systemctl --user start openfang
 ```
 
-**CUDA init failures** (e.g. `CUDA_ERROR_NOT_FOUND`, “named symbol not found” at `BertModel::load`): usually a mismatch between the NVIDIA driver, the CUDA runtime Candle was built against, and/or stale GPU state. Confirm `nvidia-smi`, rebuild after driver upgrades, or temporarily omit `cuda_device` to run Candle on CPU.
+**CUDA init failures** (`CUDA_ERROR_NOT_FOUND`, "named symbol not found" at `BertModel::load`): usually driver/runtime mismatch. Confirm `nvidia-smi`, rebuild after driver upgrades, or omit `cuda_device` to run on CPU.
 
-**NER tokenizer:** some HF repos (e.g. `dslim/bert-base-NER`) omit `tokenizer.json`. `model_cache::resolve_model` now falls back to downloading `tokenizer.json` from **`bert-base-cased`** when the primary repo returns 404. You can still place a file manually under `~/.openfang/models/<model_id>/tokenizer.json` if needed.
+**NER tokenizer:** some HF repos (e.g. `dslim/bert-base-NER`) omit `tokenizer.json`. `model_cache::resolve_model` falls back to downloading from `bert-base-cased` when the primary repo returns 404. You can place a file manually under `~/.openfang/models/<model_id>/tokenizer.json`.
 
-**Cargo / SSH:** workspace `.cargo/config.toml` sets `git-fetch-with-cli = true` so `[patch]` git deps (e.g. `candle-kernels`) fetch via the system `git` + SSH agent. Optional `sccache` + `lld` there speed rebuilds.
+**Cargo / SSH:** workspace `.cargo/config.toml` sets `git-fetch-with-cli = true` so `[patch]` git deps fetch via the system `git` + SSH agent.
 
 ---
 
@@ -316,4 +503,4 @@ systemctl --user start openfang
 | `~/.openfang/data/openfang.db/` | SurrealKV data (live) |
 | `~/.openfang/models/` | HF model cache |
 
-Long-lived feature branches may **diverge from** `origin/main`; merge or cherry-pick upstream fixes (API, security, channels) deliberately rather than blind fast-forward.
+Long-lived feature branches may **diverge from** `origin/main`; merge or cherry-pick upstream fixes deliberately rather than blind fast-forward.

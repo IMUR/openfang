@@ -1,18 +1,19 @@
 # OpenFang Voice Intelligence Architecture
 
 **Date:** 2026-04-01
-**Status:** Active — all three services running on GPU #3 (GTX 970)
+**Status:** Active — voice transport implemented, services running on GPU #3 (GTX 970)
 
 ---
 
 ## Overview
 
-Voice inference runs as three standalone Python services on **GTX 970 #3**, each exposing an OpenAI-compatible HTTP API. OpenFang's voice transport layer (planned in `voice.rs` / `ws.rs`) calls these services over HTTP — it does not manage model loading, GPU allocation, or inference directly.
+Voice in OpenFang is a **presentation layer** — the kernel, agent loop, and memory system are completely unchanged. Audio arrives at the WebSocket endpoint, gets transcribed via a local STT service, is fed to the agent as text, and the agent's response is synthesized via a local TTS service and streamed back as audio frames.
 
-This separation means:
-- Voice models can be updated, restarted, or swapped without touching OpenFang
-- The same services can be called by any other cluster process that needs TTS/ASR
-- OpenFang's voice layer is pure transport: Opus codec, WebSocket binary frames, HTTP clients to these endpoints
+Two complementary layers handle voice:
+
+1. **Voice inference services** — three standalone Python services on **GTX 970 #3**, each exposing an OpenAI-compatible HTTP API. OpenFang calls these over HTTP and does not manage model loading or GPU allocation directly.
+
+2. **Voice transport layer** — implemented in `crates/openfang-api/src/voice.rs` and `ws.rs`. Handles the binary WebSocket protocol, VAD, codec, STT/TTS client calls, sentence buffering, and the full conversation turn loop.
 
 ---
 
@@ -32,7 +33,7 @@ All three services are pinned to GPU #3 via `CUDA_VISIBLE_DEVICES=GPU-34b14196-8
 
 ---
 
-## Services
+## Inference Services
 
 ### Kokoro TTS — port 7744
 
@@ -40,10 +41,10 @@ Replaced from PyTorch `kokoro 0.9.4` (~2835MB) to ONNX Runtime GPU (~150MB).
 
 ```
 /opt/services/kokoro-tts/
-├── app.py           ← ONNX implementation (updated)
+├── app.py           ← ONNX implementation
 ├── venv-onnx/       ← Python 3.13 venv
 │   └── (onnxruntime-gpu, misaki[en], huggingface-hub, soundfile, flask)
-└── venv -> venv-onnx  ← symlink (updated)
+└── venv -> venv-onnx  ← symlink
 ```
 
 **Inference pipeline:**
@@ -54,9 +55,6 @@ text → misaki G2P → phoneme token IDs
          outputs: audio [1, samples]
      → 24kHz WAV
 ```
-
-**Model download:** `onnx-community/Kokoro-82M-v1.0-ONNX` → `~/.cache/kokoro-onnx/`
-Auto-downloads on first request.
 
 **API:**
 ```
@@ -74,12 +72,10 @@ Returns: {"status": "ok", "model": "onnx-community/Kokoro-82M-v1.0-ONNX", "loade
 
 ### Whisper STT — port 7733
 
-Existing service, repinned from **GPU #1** to **GPU #3**.
-
 ```
 /opt/services/whisper-stt/
 ├── app.py           ← unchanged (faster-whisper, distil-large-v3, int8)
-└── venv/            → venv.old.3.12 (Python 3.12, faster-whisper)
+└── venv/            → Python 3.12, faster-whisper
 ```
 
 **Model:** `distil-whisper/distil-large-v3` — 756M params, int8 via CTranslate2.
@@ -106,7 +102,7 @@ Returns: {"status": "ok", "model": "distil-large-v3"}
 
 ### LFM2.5-Audio — port 7722
 
-New service. Liquid AI's flagship 1.5B interleaved audio+text model.
+Liquid AI's 1.5B interleaved audio+text model. Runs in parallel with Kokoro/Whisper for evaluation; planned Phase 8 replacement.
 
 ```
 /opt/services/lfm25-audio/
@@ -115,9 +111,7 @@ New service. Liquid AI's flagship 1.5B interleaved audio+text model.
     └── (onnxruntime-gpu, transformers, tokenizers, librosa, soundfile, flask)
 ```
 
-**Model:** `LiquidAI/LFM2.5-Audio-1.5B-ONNX` Q4 quantization.
-
-**Architecture (from config.json):**
+**Architecture:**
 ```
 Lfm2AudioForConditionalGeneration
 ├── audio_encoder_q4.onnx      Conformer, 128-feat mel@16kHz → latent (115M params)
@@ -127,101 +121,201 @@ Lfm2AudioForConditionalGeneration
 └── vocoder_depthformer_q4.onnx  8 codebooks → 24kHz waveform (6-layer, dim=1024)
 ```
 
-Token interleaving: 6 text : 12 audio tokens per cycle.
-Preprocessor: 16kHz input, 128 mel bins, 25ms window, 10ms stride.
-
-**TTS pipeline:**
-```
-text → tokenize → decoder (autoregressive, generates interleaved tokens)
-     → filter audio tokens (above vocab midpoint)
-     → audio_detokenizer → 8-codebook codes
-     → vocoder_depthformer → 24kHz waveform
-```
-
-**ASR pipeline:**
-```
-audio → mel spectrogram (librosa, 128-feat, 16kHz)
-      → audio_encoder → hidden states
-      → audio_embedding → decoder conditioning
-      → decoder (generates text tokens) → detokenize → transcript
-```
-
-**Model download:** `LiquidAI/LFM2.5-Audio-1.5B-ONNX` (Q4 files only) → `~/.cache/lfm25-audio-onnx/`
-Downloads ~850MB on first start. The service logs exact ONNX tensor I/O specs at startup for debugging.
-
 **API:**
 ```
 POST /v1/audio/speech
 Body: {"input": "Hello world", "speed": 1.0}
-Returns: audio/wav (24kHz)
 
 POST /v1/audio/transcriptions
 Form: file=<audio>
-Returns: {"text": "..."}
 
 GET /health
-Returns: {"status": "ok", "model": "LiquidAI/LFM2.5-Audio-1.5B-ONNX", "loaded": true}
+Returns: {"status": "ok", "model": "LiquidAI/LFM2.5-Audio-1.5B-ONNX", ...}
 ```
-
-**Note:** LFM2.5-Audio is the Phase 8 upgrade for voice chat — it unifies STT+TTS into one model for lower latency and more natural voice interaction. During Phase 1–7 of the voice plan, Kokoro (7744) and Whisper (7733) are the active services. LFM2.5-Audio (7722) runs in parallel for evaluation and gradual cutover.
 
 ---
 
-## Activation History
+## OpenFang Voice Transport Layer
 
-Activated 2026-04-01. Services were started via:
+### WebSocket Endpoint
 
-```bash
-sudo systemctl stop kokoro-tts          # freed 2.6GB (old PyTorch Kokoro)
-# Updated drop-ins: Kokoro + Whisper repinned to GPU #3, LFM2.5 service installed
-sudo systemctl daemon-reload
-sudo systemctl start kokoro-tts whisper-stt
-sudo systemctl enable --now lfm25-audio
-sudo systemctl restart whisper-stt      # forced pickup of new GPU pin (old process was stale)
+Voice chat uses the existing agent WebSocket: `GET /api/ws/{agent_id}`.
+
+The same WS connection that handles text chat also handles voice — the protocol is multiplexed by message type: JSON text frames for chat, **binary frames** for voice audio.
+
+```
+wss://vox.ism.la/api/ws/{agent_id}
+     Authorization: Bearer <token>
 ```
 
-**Current state:**
+The web UI is served at `https://vox.ism.la/` (GET `/voice` → `voice.html`, embedded in the binary at compile time).
+
+### Binary Frame Protocol
+
+| Byte 0 | Name | Direction | Payload |
+|--------|------|-----------|---------|
+| `0x01` | AudioDataIn | client→server | Audio frame (Opus or PCM16) |
+| `0x02` | AudioDataOut | server→client | Audio frame (Opus or PCM16) |
+| `0x10` | SpeechStart | server→client | empty |
+| `0x11` | SpeechEnd | server→client | empty |
+| `0x20` | SessionInit | client→server | JSON config |
+| `0x21` | SessionAck | server→client | JSON `{"session_id":"..."}` |
+| `0x30` | VadSpeechStart | server→client | empty (energy threshold crossed) |
+| `0x31` | VadSpeechEnd | server→client | empty (silence after speech) |
+| `0x40` | Interrupt | client→server | empty (barge-in) |
+| `0xF0` | Error | server→client | UTF-8 error string |
+
+### SessionInit Payload
+
+Sent by the client as `0x20` frame payload (JSON):
+
+```json
+{
+  "sample_rate": 16000,
+  "codec": "opus",
+  "channels": 1
+}
 ```
-$ systemctl is-active kokoro-tts whisper-stt lfm25-audio
-active
-active
-active
 
-$ curl localhost:7744/health
-{"loaded":false,"model":"onnx-community/Kokoro-82M-v1.0-ONNX","status":"ok","variant":"onnx/model_q8f16.onnx"}
+- `codec`: `"opus"` (default, uses opus-rs encoder/decoder) or `"pcm16"` (raw little-endian i16; used by iOS Safari via ScriptProcessorNode)
+- `sample_rate`: default 16000
 
-$ curl localhost:7733/health
-{"device":"uninitialized","model":"distil-large-v3","status":"ok"}
+### Codec Support
 
-$ curl localhost:7722/health
-{"loaded":false,"model":"LiquidAI/LFM2.5-Audio-1.5B-ONNX","quantization":"q4","status":"ok","sub_models":[]}
+| Codec | Client Capture | Server Processing |
+|-------|---------------|-------------------|
+| `opus` | MediaRecorder / WebRTC | opus-rs decode → PCM16 |
+| `pcm16` | ScriptProcessorNode (iOS Safari compatible) | Direct i16 LE interpretation |
+
+TTS output is resampled from the service's 24kHz to 16kHz before encoding for return. When `codec=opus`, the output is encoded via opus-rs. When `codec=pcm16`, raw bytes are returned.
+
+### Voice Turn Pipeline
+
+```
+Client sends 0x01 AudioDataIn frames
+    │
+    ├─ VoiceSession.decode_audio(data)
+    │       Opus: decode packet → Vec<i16>
+    │       PCM16: parse LE bytes → Vec<i16>
+    │
+    ├─ VoiceSession.handle_audio(pcm)
+    │       Energy-based VAD (RMS vs. vad_energy_threshold)
+    │       ├─ Speech detected: accumulate pcm_buffer, send 0x30 VadSpeechStart
+    │       └─ Silence after speech (≥ vad_silence_ms): return Transcribe(buffer)
+    │              Also force-transcribes at max_utterance_secs
+    │
+    ├─ VoiceAction::Transcribe(pcm_buffer)
+    │       pcm_to_wav(pcm, 16000) → WAV bytes
+    │       SttClient.transcribe(wav) → POST /v1/audio/transcriptions → text
+    │       Send JSON text frame: {"type": "voice_transcript", "content": text}
+    │
+    ├─ kernel.send_message_streaming(agent_id, text, ...)
+    │       StreamEvent::TextDelta → pushed into sentence_buffer
+    │       SentenceBuffer splits on [.!?] boundaries
+    │
+    └─ Per sentence:
+            TtsClient.synthesize(sentence) → POST /v1/audio/speech → WAV
+            resample 24kHz → 16kHz
+            encode_pcm_to_frames(pcm, use_opus)
+            ├─ Opus: chunk 320-sample 20ms frames → encode → 0x02 AudioDataOut
+            └─ PCM16: single 0x02 frame with all LE bytes
+            Send 0x10 SpeechStart before first frame
+            Send 0x11 SpeechEnd after last frame
 ```
 
-Models are lazy-loaded on first request. GPU #3 sits at ~5MB idle; reaches ~2.5GB once all three are warm.
+### Barge-in (Interrupt)
+
+When the client sends `0x40 Interrupt`:
+- Current TTS synthesis is abandoned
+- `VoiceSession.reset_to_idle()` clears pcm_buffer and sentence_buffer
+- Ready for next utterance immediately
+
+### Session State Machine
+
+```
+Idle ──[SessionInit]──► Listening
+  ▲                          │
+  │              [VAD silence]│
+  │                          ▼
+  │                    Transcribing
+  │                          │
+  │                [STT complete]
+  │                          ▼
+  │                    Processing
+  │                          │
+  │               [LLM response]
+  │                          ▼
+  └──────────[TTS done]── Speaking
+```
 
 ---
 
-## Integration with OpenFang Voice Layer
+## Voice Web UI (`/voice`)
 
-The voice transport plan (from `~/.claude/plans/wobbly-crafting-hamming.md`) connects to these services via HTTP at these endpoints:
+The voice page is embedded in the binary at compile time via `include_str!("../static/voice.html")` and served at `GET /voice` (public endpoint — no API token required for the page itself).
 
-| Phase | Service | Endpoint | Used For |
-|-------|---------|----------|---------|
-| 3 | Whisper (7733) | `POST /v1/audio/transcriptions` | PCM16 → text after VAD detects speech end |
-| 4 | Kokoro (7744) | `POST /v1/audio/speech` | TextDelta stream → WAV → Opus frames back to client |
-| 8 | LFM2.5-Audio (7722) | Both endpoints | Unified STT+TTS, replaces Phases 3+4 |
+**Features:**
+- Agent selector dropdown (fetches from `GET /api/agents`)
+- API token input (persisted in `sessionStorage`)
+- Call / hang up button — connects WebSocket, sends `SessionInit` with `codec: "pcm16"` for iOS Safari compatibility
+- Mute button
+- Transcript view — user speech via `voice_transcript` events, agent responses via `text_delta` accumulation
+- Audio playback — receives PCM16 binary frames, queues sequential playback via `AudioContext`
+- Uses `ScriptProcessorNode` for mic capture (deprecated but universally supported on iOS Safari)
 
-OpenFang voice config (`~/.openfang/config.toml`, to be added):
+**Access:**
+```
+https://vox.ism.la/             # voice UI
+https://vox.ism.la/api/ws/...   # voice + chat WebSocket
+https://vox.ism.la/stt/...      # proxied to Whisper on :7733
+https://vox.ism.la/tts/...      # proxied to Kokoro on :7744
+```
+
+---
+
+## Caddy Configuration (`crtr:/etc/caddy/Caddyfile`)
+
+`vox.ism.la` proxies to OpenFang on prtr via Tailscale:
+
+```caddy
+vox.ism.la {
+    encode zstd gzip
+
+    handle_path /stt/* {
+        reverse_proxy http://100.64.0.7:7733
+    }
+
+    handle_path /tts/* {
+        reverse_proxy http://100.64.0.7:7744
+    }
+
+    reverse_proxy http://100.64.0.7:4477 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+    }
+}
+```
+
+Previously pointed to clawdio on `:5544` (dead). Updated 2026-04-01 to route all traffic to OpenFang's port 4477.
+
+---
+
+## OpenFang Voice Configuration (`~/.openfang/config.toml`)
+
 ```toml
 [voice]
-enabled        = false          # enable when voice.rs is implemented
-stt_endpoint   = "http://localhost:7733"
-tts_endpoint   = "http://localhost:7744"
-stt_model      = "distil-large-v3"
-tts_voice      = "af_heart"
-tts_speed      = 1.0
-vad_silence_ms = 800
+enabled               = true
+stt_endpoint          = "http://localhost:7733"
+tts_endpoint          = "http://localhost:7744"
+stt_model             = "distil-large-v3"
+tts_voice             = "af_heart"
+tts_speed             = 1.0
+vad_silence_ms        = 800
+vad_energy_threshold  = 0.01
+max_utterance_secs    = 30
 ```
+
+All fields have defaults; only `enabled = true` is required to activate voice.
 
 ---
 
@@ -238,5 +332,37 @@ vad_silence_ms = 800
 | Kokoro GPU pin | `/etc/systemd/system/kokoro-tts.service.d/gpu-pinning.conf` |
 | Whisper systemd | `/etc/systemd/system/whisper-stt.service` |
 | Whisper GPU pin | `/etc/systemd/system/whisper-stt.service.d/gpu-pinning.conf` |
-| LFM2.5 systemd | `/etc/systemd/system/lfm25-audio.service` (pending sudo install) |
-| Drop-in staging | `/tmp/voice-services/` |
+| LFM2.5 systemd | `/etc/systemd/system/lfm25-audio.service` |
+| Voice transport | `crates/openfang-api/src/voice.rs` |
+| WS handler | `crates/openfang-api/src/ws.rs` |
+| Voice UI | `crates/openfang-api/static/voice.html` |
+
+---
+
+## Implementation Status
+
+| Component | Status |
+|-----------|--------|
+| Binary frame protocol parser/encoder | ✅ Complete (`voice.rs`) |
+| Opus codec (16kHz mono, 20ms frames) | ✅ Complete |
+| PCM16 codec (iOS Safari) | ✅ Complete |
+| Energy-based VAD | ✅ Complete |
+| SttClient (Whisper HTTP) | ✅ Complete |
+| TtsClient (Kokoro HTTP, 24→16kHz resample) | ✅ Complete |
+| SentenceBuffer (split on `.!?` for streaming TTS) | ✅ Complete |
+| Markdown stripper (for TTS-safe text) | ✅ Complete |
+| VoiceSession state machine | ✅ Complete |
+| Barge-in / interrupt handling | ✅ Complete |
+| WS integration in `ws.rs` | ✅ Complete |
+| Voice UI (`/voice`) embedded in binary | ✅ Complete |
+| Auth: `/voice` page is public | ✅ Complete |
+| Caddy routing (`vox.ism.la → :4477`) | ✅ Complete |
+| LFM2.5-Audio cutover (unified STT+TTS) | ⏳ Phase 8 — evaluation running |
+
+---
+
+## Activation History
+
+- **2026-04-01:** GPU #3 voice services activated (Kokoro ONNX, Whisper repinned, LFM2.5 new)
+- **2026-04-01:** Voice transport layer implemented in `voice.rs` / `ws.rs`
+- **2026-04-01:** `/voice` page embedded and `vox.ism.la` Caddy block updated to OpenFang
