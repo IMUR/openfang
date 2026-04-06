@@ -6,6 +6,7 @@ use chrono::Utc;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use serde::{Deserialize, Serialize};
+use surrealdb::types::SurrealValue;
 use std::collections::HashMap;
 
 use crate::db::SurrealDb;
@@ -17,7 +18,7 @@ pub struct UsageStore {
 }
 
 /// A single usage event record.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, SurrealValue)]
 pub struct UsageRecord {
     pub agent_id: String,
     pub provider: String,
@@ -30,7 +31,7 @@ pub struct UsageRecord {
 }
 
 /// Aggregated usage summary.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, SurrealValue)]
 pub struct UsageSummary {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
@@ -229,7 +230,7 @@ impl UsageStore {
             return Ok(Vec::new());
         }
 
-        #[derive(Deserialize)]
+        #[derive(Deserialize, SurrealValue)]
         struct UsageEventRow {
             created_at: String,
             input_tokens: u64,
@@ -295,7 +296,7 @@ impl UsageStore {
 
     /// Get the timestamp of the earliest recorded usage event.
     pub async fn first_event_date(&self) -> OpenFangResult<Option<String>> {
-        #[derive(Deserialize)]
+        #[derive(Deserialize, SurrealValue)]
         struct FirstEventRow {
             created_at: String,
         }
@@ -332,7 +333,7 @@ impl UsageStore {
         }
         let mut result = q.await.map_err(surreal_err)?;
 
-        #[derive(Deserialize)]
+        #[derive(Deserialize, SurrealValue)]
         struct Row {
             total: Option<f64>,
         }
@@ -342,7 +343,7 @@ impl UsageStore {
 }
 
 /// Usage breakdown per model (returned by `query_by_model`).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, SurrealValue)]
 pub struct ModelUsage {
     pub model: String,
     pub input_tokens: u64,

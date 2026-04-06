@@ -35,7 +35,7 @@ DEFINE TABLE IF NOT EXISTS sessions SCHEMALESS;
 DEFINE FIELD IF NOT EXISTS agent_id ON sessions TYPE string;
 DEFINE FIELD IF NOT EXISTS messages ON sessions TYPE array;
 DEFINE FIELD IF NOT EXISTS context_window_tokens ON sessions TYPE int;
-DEFINE FIELD IF NOT EXISTS label ON sessions TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS label ON sessions TYPE option<string> | null;
 DEFINE FIELD IF NOT EXISTS created_at ON sessions TYPE string;
 DEFINE FIELD IF NOT EXISTS updated_at ON sessions TYPE string;
 
@@ -44,22 +44,22 @@ DEFINE TABLE IF NOT EXISTS canonical_sessions SCHEMALESS;
 DEFINE FIELD IF NOT EXISTS agent_id ON canonical_sessions TYPE string;
 DEFINE FIELD IF NOT EXISTS messages ON canonical_sessions TYPE array;
 DEFINE FIELD IF NOT EXISTS compaction_cursor ON canonical_sessions TYPE int;
-DEFINE FIELD IF NOT EXISTS compacted_summary ON canonical_sessions TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS compacted_summary ON canonical_sessions TYPE option<string> | null;
 DEFINE FIELD IF NOT EXISTS updated_at ON canonical_sessions TYPE string;
 
 -- Memories table (semantic store)
 DEFINE TABLE IF NOT EXISTS memories SCHEMALESS;
 DEFINE FIELD IF NOT EXISTS agent_id ON memories TYPE string;
 DEFINE FIELD IF NOT EXISTS content ON memories TYPE string;
-DEFINE FIELD IF NOT EXISTS source ON memories FLEXIBLE TYPE any;
+DEFINE FIELD IF NOT EXISTS source ON memories TYPE any;
 DEFINE FIELD IF NOT EXISTS scope ON memories TYPE string;
 DEFINE FIELD IF NOT EXISTS confidence ON memories TYPE float;
-DEFINE FIELD IF NOT EXISTS metadata ON memories FLEXIBLE TYPE object;
+DEFINE FIELD IF NOT EXISTS metadata ON memories TYPE object FLEXIBLE;
 DEFINE FIELD IF NOT EXISTS created_at ON memories TYPE string;
 DEFINE FIELD IF NOT EXISTS accessed_at ON memories TYPE string;
 DEFINE FIELD IF NOT EXISTS access_count ON memories TYPE int;
 DEFINE FIELD IF NOT EXISTS deleted ON memories TYPE bool;
-DEFINE FIELD IF NOT EXISTS embedding ON memories TYPE option<array<float>>;
+DEFINE FIELD IF NOT EXISTS embedding ON memories TYPE option<array<float>> | null DEFAULT NONE;
 
 -- HNSW vector index: 384 dimensions = BGE-small-en-v1.5 (Candle Phase 1).
 -- Explicitly removed and recreated to handle dimension migrations between providers.
@@ -71,13 +71,13 @@ DEFINE INDEX hnsw_embedding ON memories
 
 -- BM25 full-text index on content
 DEFINE INDEX IF NOT EXISTS ft_content ON memories
-    FIELDS content SEARCH ANALYZER memory_analyzer BM25(1.2, 0.75) HIGHLIGHTS;
+    FIELDS content FULLTEXT ANALYZER memory_analyzer BM25 HIGHLIGHTS;
 
 -- KV store (composite record IDs: kv:{agent_id}:{key})
 DEFINE TABLE IF NOT EXISTS kv SCHEMALESS;
 DEFINE FIELD IF NOT EXISTS agent_id ON kv TYPE string;
 DEFINE FIELD IF NOT EXISTS key ON kv TYPE string;
-DEFINE FIELD IF NOT EXISTS value ON kv FLEXIBLE TYPE any;
+DEFINE FIELD IF NOT EXISTS value ON kv TYPE any;
 DEFINE FIELD IF NOT EXISTS version ON kv TYPE int;
 DEFINE FIELD IF NOT EXISTS updated_at ON kv TYPE string;
 
@@ -99,16 +99,16 @@ DEFINE FIELD IF NOT EXISTS created_at ON usage TYPE string;
 
 -- Entities table (knowledge graph nodes)
 DEFINE TABLE IF NOT EXISTS entities SCHEMALESS;
-DEFINE FIELD IF NOT EXISTS entity_type ON entities FLEXIBLE TYPE any;
+DEFINE FIELD IF NOT EXISTS entity_type ON entities TYPE any;
 DEFINE FIELD IF NOT EXISTS name ON entities TYPE string;
-DEFINE FIELD IF NOT EXISTS properties ON entities FLEXIBLE TYPE object;
+DEFINE FIELD IF NOT EXISTS properties ON entities TYPE object FLEXIBLE;
 DEFINE FIELD IF NOT EXISTS created_at ON entities TYPE string;
 DEFINE FIELD IF NOT EXISTS updated_at ON entities TYPE string;
 
 -- Relations table (knowledge graph edges)
 DEFINE TABLE IF NOT EXISTS relations TYPE RELATION SCHEMALESS;
-DEFINE FIELD IF NOT EXISTS relation_type ON relations FLEXIBLE TYPE any;
-DEFINE FIELD IF NOT EXISTS properties ON relations FLEXIBLE TYPE object;
+DEFINE FIELD IF NOT EXISTS relation_type ON relations TYPE any;
+DEFINE FIELD IF NOT EXISTS properties ON relations TYPE object FLEXIBLE;
 DEFINE FIELD IF NOT EXISTS confidence ON relations TYPE float;
 DEFINE FIELD IF NOT EXISTS created_at ON relations TYPE string;
 
@@ -119,7 +119,7 @@ DEFINE FIELD IF NOT EXISTS display_name ON paired_devices TYPE string;
 DEFINE FIELD IF NOT EXISTS platform ON paired_devices TYPE string;
 DEFINE FIELD IF NOT EXISTS paired_at ON paired_devices TYPE string;
 DEFINE FIELD IF NOT EXISTS last_seen ON paired_devices TYPE string;
-DEFINE FIELD IF NOT EXISTS push_token ON paired_devices TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS push_token ON paired_devices TYPE option<string> | null;
 
 -- Task queue
 DEFINE TABLE IF NOT EXISTS task_queue SCHEMALESS;
@@ -130,8 +130,8 @@ DEFINE FIELD IF NOT EXISTS priority ON task_queue TYPE int;
 DEFINE FIELD IF NOT EXISTS assigned_to ON task_queue TYPE string;
 DEFINE FIELD IF NOT EXISTS created_by ON task_queue TYPE string;
 DEFINE FIELD IF NOT EXISTS created_at ON task_queue TYPE string;
-DEFINE FIELD IF NOT EXISTS completed_at ON task_queue TYPE option<string>;
-DEFINE FIELD IF NOT EXISTS result ON task_queue TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS completed_at ON task_queue TYPE option<string> | null;
+DEFINE FIELD IF NOT EXISTS result ON task_queue TYPE option<string> | null;
 
 -- Secondary indexes for common filter patterns
 DEFINE INDEX IF NOT EXISTS idx_memories_agent ON memories FIELDS agent_id;
@@ -209,8 +209,8 @@ mod tests {
 
         // Verify memories table has HNSW and BM25 indexes
         let mut result = db.query("INFO FOR TABLE memories").await.unwrap();
-        let info: surrealdb::Value = result.take(0).unwrap();
-        let info_str = format!("{info}");
+        let info: surrealdb::types::Value = result.take(0).unwrap();
+        let info_str = format!("{info:?}");
         assert!(
             info_str.contains("hnsw_embedding"),
             "HNSW index not found in: {info_str}"
@@ -227,12 +227,12 @@ mod tests {
 
         // Verify relations table is TYPE RELATION
         let mut result = db.query("INFO FOR TABLE relations").await.unwrap();
-        let _info: surrealdb::Value = result.take(0).unwrap();
+        let _info: surrealdb::types::Value = result.take(0).unwrap();
 
         // Verify analyzer exists
         let mut result = db.query("INFO FOR DB").await.unwrap();
-        let db_info: surrealdb::Value = result.take(0).unwrap();
-        let db_info_str = format!("{db_info}");
+        let db_info: surrealdb::types::Value = result.take(0).unwrap();
+        let db_info_str = format!("{db_info:?}");
         assert!(
             db_info_str.contains("memory_analyzer"),
             "Analyzer not found in: {db_info_str}"

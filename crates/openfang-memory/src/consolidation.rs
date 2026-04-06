@@ -6,6 +6,7 @@
 use chrono::Utc;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
+use surrealdb::types::SurrealValue;
 
 use crate::db::SurrealDb;
 
@@ -88,7 +89,7 @@ impl ConsolidationEngine {
 
     /// Return the distinct agent IDs that have at least one non-deleted memory.
     pub async fn all_agent_ids(&self) -> OpenFangResult<Vec<AgentId>> {
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, SurrealValue)]
         struct Row {
             agent_id: String,
         }
@@ -116,7 +117,7 @@ impl ConsolidationEngine {
         older_than_hours: i64,
         max_items: u64,
     ) -> OpenFangResult<Vec<EpisodicBatchItem>> {
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, SurrealValue)]
         struct Row {
             record_key: Option<String>,
             content: String,
@@ -173,7 +174,7 @@ impl ConsolidationEngine {
             let s = sid.clone();
             self.db
                 .query(
-                    "UPDATE type::thing('memories', $mid)
+                    "UPDATE type::record('memories', $mid)
                      SET metadata.summarized_into = $sid,
                          confidence = confidence * $factor",
                 )

@@ -31,6 +31,31 @@ use uuid::Uuid;
 
 use crate::db::SurrealDb;
 
+/// Implement `SurrealValue` for a type via a serde-json round-trip.
+///
+/// Used for structs whose fields contain custom openfang-types (EntityType, RelationType,
+/// Message, etc.) that do not themselves implement `SurrealValue`. The serde-json bridge
+/// preserves full fidelity because SurrealDB stores these fields as FLEXIBLE TYPE any.
+macro_rules! surreal_via_json {
+    ($t:ty) => {
+        impl surrealdb::types::SurrealValue for $t {
+            fn kind_of() -> surrealdb::types::Kind {
+                surrealdb::types::Kind::Any
+            }
+            fn into_value(self) -> surrealdb::types::Value {
+                let json = serde_json::to_value(self)
+                    .unwrap_or(serde_json::Value::Null);
+                surrealdb::types::SurrealValue::into_value(json)
+            }
+            fn from_value(value: surrealdb::types::Value) -> Result<Self, surrealdb::types::Error> {
+                let json = value.into_json_value();
+                serde_json::from_value(json)
+                    .map_err(|e| surrealdb::types::Error::internal(e.to_string()))
+            }
+        }
+    };
+}
+
 /// Knowledge graph store backed by SurrealDB.
 #[derive(Clone)]
 pub struct KnowledgeStore {
@@ -46,6 +71,7 @@ struct EntityRecord {
     created_at: String,
     updated_at: String,
 }
+surreal_via_json!(EntityRecord);
 
 /// Relation record for SurrealDB persistence.
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,9 +81,10 @@ struct RelationRecord {
     confidence: f32,
     created_at: String,
 }
+surreal_via_json!(RelationRecord);
 
 /// Raw graph query result row.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct GraphRow {
     source: EntityRecord,
     relation: RelationRecord,
@@ -67,6 +94,7 @@ struct GraphRow {
     relation_source: String,
     relation_target: String,
 }
+surreal_via_json!(GraphRow);
 
 fn surreal_err(e: surrealdb::Error) -> OpenFangError {
     OpenFangError::Memory(e.to_string())
@@ -77,10 +105,10 @@ fn surreal_err(e: surrealdb::Error) -> OpenFangError {
 // ---------------------------------------------------------------------------
 
 /// Raw entity record as returned by a graph traversal hop.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawEntity {
     #[serde(rename = "id")]
-    raw_id: Option<surrealdb::RecordId>,
+    raw_id: Option<surrealdb::types::RecordId>,
     entity_type: Option<EntityType>,
     name: Option<String>,
     #[serde(default)]
@@ -88,9 +116,10 @@ struct RawEntity {
     created_at: Option<String>,
     updated_at: Option<String>,
 }
+surreal_via_json!(RawEntity);
 
 /// Result row from the multi-hop traversal query.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct TraversalResult {
     #[allow(dead_code)]
     eid: Option<String>,
@@ -101,6 +130,7 @@ struct TraversalResult {
     #[serde(default)]
     hop3: Vec<RawEntity>,
 }
+surreal_via_json!(TraversalResult);
 
 /// Convert a batch of raw entities from one hop into `TraversalNode`s, deduplicating.
 fn collect_hop(
@@ -114,7 +144,12 @@ fn collect_hop(
         let eid = re
             .raw_id
             .as_ref()
-            .map(|rid| format!("{}", rid.key()))
+            .map(|rid| match &rid.key {
+                surrealdb::types::RecordIdKey::String(s) => s.clone(),
+                surrealdb::types::RecordIdKey::Number(n) => n.to_string(),
+                surrealdb::types::RecordIdKey::Uuid(u) => u.to_string(),
+                other => format!("{other:?}"),
+            })
             .unwrap_or_default();
         if eid.is_empty() || !seen.insert(eid.clone()) {
             continue;
@@ -183,7 +218,7 @@ impl KnowledgeStore {
         // Use SurrealQL RELATE to create a graph edge
         self.db
             .query(
-                "RELATE (type::thing('entities', $source))->(type::thing('relations', $id))->(type::thing('entities', $target))
+                "RELATE (type::record('entities', $source))->(type::record('relations', $id))->(type::record('entities', $target))
                  SET relation_type = $rel_type,
                      properties = $props,
                      confidence = $conf,
@@ -324,14 +359,14 @@ impl KnowledgeStore {
             1 => {
                 "SELECT meta::id(id) AS eid,
                         (->relations->entities.*) AS hop1
-                 FROM type::thing('entities', $src)"
+                 FROM type::record('entities', $src)"
                 .to_string()
             }
             2 => {
                 "SELECT meta::id(id) AS eid,
                         (->relations->entities.*) AS hop1,
                         (->relations->entities->relations->entities.*) AS hop2
-                 FROM type::thing('entities', $src)"
+                 FROM type::record('entities', $src)"
                 .to_string()
             }
             _ => {
@@ -339,7 +374,7 @@ impl KnowledgeStore {
                         (->relations->entities.*) AS hop1,
                         (->relations->entities->relations->entities.*) AS hop2,
                         (->relations->entities->relations->entities->relations->entities.*) AS hop3
-                 FROM type::thing('entities', $src)"
+                 FROM type::record('entities', $src)"
                 .to_string()
             }
         };

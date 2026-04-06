@@ -7,6 +7,7 @@ use chrono::Utc;
 use openfang_types::agent::{AgentEntry, AgentId};
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use serde::{Deserialize, Serialize};
+use surrealdb::types::SurrealValue;
 
 use crate::db::SurrealDb;
 
@@ -17,7 +18,7 @@ pub struct StructuredStore {
 }
 
 /// KV record stored in SurrealDB.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, SurrealValue)]
 struct KvRecord {
     agent_id: String,
     key: String,
@@ -27,7 +28,7 @@ struct KvRecord {
 }
 
 /// KV listing row (only key + value from SELECT).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, SurrealValue)]
 struct KvListRow {
     key: String,
     value: serde_json::Value,
@@ -36,14 +37,14 @@ struct KvListRow {
 /// Agent data wrapper for SurrealDB storage.
 /// AgentEntry is stored as a JSON string to avoid SurrealDB's
 /// serializer choking on Rust enum types (AgentState, etc.).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, SurrealValue)]
 struct AgentWrapper {
     name: String,
     data: String,
 }
 
 /// Lightweight agent listing row.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, SurrealValue)]
 struct AgentListRow {
     id: serde_json::Value,
     name: String,

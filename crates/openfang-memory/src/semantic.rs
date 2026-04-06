@@ -27,6 +27,28 @@ use tracing::debug;
 
 use crate::db::SurrealDb;
 
+/// Implement `SurrealValue` via serde-json round-trip for structs that contain
+/// `openfang-types` values (e.g. `MemorySource`) that don't implement `SurrealValue`.
+macro_rules! surreal_via_json {
+    ($t:ty) => {
+        impl surrealdb::types::SurrealValue for $t {
+            fn kind_of() -> surrealdb::types::Kind {
+                surrealdb::types::Kind::Any
+            }
+            fn into_value(self) -> surrealdb::types::Value {
+                let json = serde_json::to_value(self)
+                    .unwrap_or(serde_json::Value::Null);
+                surrealdb::types::SurrealValue::into_value(json)
+            }
+            fn from_value(value: surrealdb::types::Value) -> Result<Self, surrealdb::types::Error> {
+                let json = value.into_json_value();
+                serde_json::from_value(json)
+                    .map_err(|e| surrealdb::types::Error::internal(e.to_string()))
+            }
+        }
+    };
+}
+
 /// Semantic store backed by SurrealDB with hybrid vector + full-text search.
 #[derive(Clone)]
 pub struct SemanticStore {
@@ -51,9 +73,10 @@ struct MemoryRecord {
     deleted: bool,
     embedding: Option<Vec<f32>>,
 }
+surreal_via_json!(MemoryRecord);
 
 /// Row returned by the HNSW KNN query.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct KnnRow {
     record_key: Option<String>,
     agent_id: String,
@@ -76,9 +99,10 @@ struct KnnRow {
     #[serde(default)]
     distance: f64,
 }
+surreal_via_json!(KnnRow);
 
 /// Row returned by the BM25 full-text search query.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct BM25Row {
     record_key: Option<String>,
     agent_id: String,
@@ -98,6 +122,7 @@ struct BM25Row {
     #[serde(default)]
     relevance: f64,
 }
+surreal_via_json!(BM25Row);
 
 fn surreal_err(e: surrealdb::Error) -> OpenFangError {
     OpenFangError::Memory(e.to_string())
@@ -272,7 +297,7 @@ impl SemanticStore {
             let _ = self
                 .db
                 .query(
-                    "UPDATE type::thing('memories', $mid) SET access_count += 1, accessed_at = $now",
+                    "UPDATE type::record('memories', $mid) SET access_count += 1, accessed_at = $now",
                 )
                 .bind(("mid", frag.id.0.to_string()))
                 .bind(("now", Utc::now().to_rfc3339()))
@@ -490,7 +515,7 @@ impl SemanticStore {
     /// Soft-delete a memory fragment.
     pub async fn forget(&self, id: MemoryId) -> OpenFangResult<()> {
         self.db
-            .query("UPDATE type::thing('memories', $mid) SET deleted = true")
+            .query("UPDATE type::record('memories', $mid) SET deleted = true")
             .bind(("mid", id.0.to_string()))
             .await
             .map_err(surreal_err)?;
@@ -500,7 +525,7 @@ impl SemanticStore {
     /// Update the embedding for an existing memory.
     pub async fn update_embedding(&self, id: MemoryId, embedding: &[f32]) -> OpenFangResult<()> {
         self.db
-            .query("UPDATE type::thing('memories', $mid) SET embedding = $emb")
+            .query("UPDATE type::record('memories', $mid) SET embedding = $emb")
             .bind(("mid", id.0.to_string()))
             .bind(("emb", embedding.to_vec()))
             .await
@@ -519,7 +544,7 @@ impl SemanticStore {
     ) -> OpenFangResult<()> {
         let mid = memory_id.to_string();
         self.db
-            .query("UPDATE type::thing('memories', $mid) SET metadata.entities = $ents")
+            .query("UPDATE type::record('memories', $mid) SET metadata.entities = $ents")
             .bind(("mid", mid))
             .bind(("ents", entity_ids))
             .await
@@ -538,7 +563,7 @@ impl SemanticStore {
     ) -> OpenFangResult<()> {
         let mid = memory_id.to_string();
         self.db
-            .query("UPDATE type::thing('memories', $mid) SET metadata = $meta")
+            .query("UPDATE type::record('memories', $mid) SET metadata = $meta")
             .bind(("mid", mid))
             .bind(("meta", metadata))
             .await

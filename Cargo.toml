@@ -75,7 +75,7 @@ hf-hub = { version = "0.5", features = ["tokio"] }
 #   surrealml-core git main (0.1.9)   → ort rc.9 → ndarray 0.15.6 (type mismatch vs 0.16)
 # No combination of published/git surrealml-core compiles with surrealdb 2.6.5.
 # Re-enable when surrealdb publishes a release with aligned ml/ort/ndarray deps.
-surrealdb = { version = "2", features = ["kv-surrealkv", "kv-mem"], default-features = false }
+surrealdb = { version = "3", features = ["kv-surrealkv", "kv-mem"], default-features = false }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

@@ -21,6 +21,7 @@ use openfang_types::memory::{
     Memory, MemoryFilter, MemoryFragment, MemoryId, MemorySource, Relation,
 };
 use serde::{Deserialize, Serialize};
+use surrealdb::types::SurrealValue;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -29,7 +30,7 @@ fn surreal_err(e: surrealdb::Error) -> OpenFangError {
 }
 
 /// Paired device record for SurrealDB persistence.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, SurrealValue)]
 struct PairedDeviceRecord {
     device_id: String,
     display_name: String,
@@ -40,7 +41,7 @@ struct PairedDeviceRecord {
 }
 
 /// Task queue record for SurrealDB persistence.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, SurrealValue)]
 struct TaskRecord {
     title: String,
     description: String,
@@ -640,7 +641,7 @@ impl MemorySubstrate {
         let now = chrono::Utc::now().to_rfc3339();
         self.db
             .query(
-                "UPDATE type::thing('task_queue', $tid)
+                "UPDATE type::record('task_queue', $tid)
                  SET status = 'completed', result = $result, completed_at = $now",
             )
             .bind(("tid", task_id.to_string()))

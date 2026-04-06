@@ -14,6 +14,28 @@ use std::path::{Path, PathBuf};
 
 use crate::db::SurrealDb;
 
+/// Implement `SurrealValue` via serde-json round-trip for types that contain
+/// `openfang-types` structs (e.g. `Message`) which do not implement `SurrealValue`.
+macro_rules! surreal_via_json {
+    ($t:ty) => {
+        impl surrealdb::types::SurrealValue for $t {
+            fn kind_of() -> surrealdb::types::Kind {
+                surrealdb::types::Kind::Any
+            }
+            fn into_value(self) -> surrealdb::types::Value {
+                let json = serde_json::to_value(self)
+                    .unwrap_or(serde_json::Value::Null);
+                surrealdb::types::SurrealValue::into_value(json)
+            }
+            fn from_value(value: surrealdb::types::Value) -> Result<Self, surrealdb::types::Error> {
+                let json = value.into_json_value();
+                serde_json::from_value(json)
+                    .map_err(|e| surrealdb::types::Error::internal(e.to_string()))
+            }
+        }
+    };
+}
+
 /// A conversation session with message history.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -39,6 +61,7 @@ struct SessionRecord {
     created_at: String,
     updated_at: String,
 }
+surreal_via_json!(SessionRecord);
 
 /// Canonical session record for SurrealDB persistence.
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,9 +72,10 @@ struct CanonicalRecord {
     compacted_summary: Option<String>,
     updated_at: String,
 }
+surreal_via_json!(CanonicalRecord);
 
 /// Session listing row.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct SessionListRow {
     id: serde_json::Value,
     agent_id: String,
@@ -59,6 +83,7 @@ struct SessionListRow {
     created_at: String,
     label: Option<String>,
 }
+surreal_via_json!(SessionListRow);
 
 fn surreal_err(e: surrealdb::Error) -> OpenFangError {
     OpenFangError::Memory(e.to_string())
@@ -194,7 +219,7 @@ impl SessionStore {
         label: Option<&str>,
     ) -> OpenFangResult<()> {
         self.db
-            .query("UPDATE type::thing('sessions', $sid) SET label = $label, updated_at = $now")
+            .query("UPDATE type::record('sessions', $sid) SET label = $label, updated_at = $now")
             .bind(("sid", session_id.0.to_string()))
             .bind(("label", label.map(|s| s.to_string())))
             .bind(("now", Utc::now().to_rfc3339()))
