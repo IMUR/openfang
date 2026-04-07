@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use crate::voice::{self, VoiceAction, VoiceProtocol, VoiceSession};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// Per-IP WebSocket connection tracker.
@@ -236,6 +237,10 @@ async fn handle_agent_ws(
     // Voice session state — None for text-only clients, created on SessionInit.
     let mut voice_session: Option<VoiceSession> = None;
 
+    // Active voice task (TTS streaming) — tracked for barge-in cancellation.
+    let mut active_voice_task: Option<tokio::task::JoinHandle<String>> = None;
+    let mut voice_cancel = CancellationToken::new();
+
     // Send initial connection confirmation
     let _ = send_json(
         &sender,
@@ -365,12 +370,23 @@ async fn handle_agent_ws(
 
     // Main message loop with idle timeout
     loop {
+        // Poll the active voice task for completion alongside the WS receiver.
+        // This allows receiving Interrupt messages while TTS is streaming.
         let msg = tokio::select! {
             msg = receiver.next() => {
                 match msg {
                     Some(m) => m,
                     None => break, // Stream ended
                 }
+            }
+            _result = async { active_voice_task.as_mut().unwrap().await }, if active_voice_task.is_some() => {
+                // Voice task completed naturally
+                active_voice_task = None;
+                voice_cancel = CancellationToken::new();
+                if let Some(ref mut s) = voice_session {
+                    s.state = voice::VoiceSessionState::Idle;
+                }
+                continue;
             }
             _ = tokio::time::sleep(WS_IDLE_TIMEOUT.saturating_sub(last_activity.elapsed())) => {
                 info!(agent_id = %id_str, "WebSocket idle timeout (30 min)");
@@ -502,6 +518,42 @@ async fn handle_agent_ws(
                         // Feed PCM through VAD
                         match session.handle_audio(&pcm) {
                             VoiceAction::Continue => {}
+                            VoiceAction::SpeechStarted => {
+                                // Send VadSpeechStart to client
+                                let frame = voice::encode_binary_frame(
+                                    &VoiceProtocol::VadSpeechStart,
+                                );
+                                let mut s = sender.lock().await;
+                                let _ = s.send(Message::Binary(frame.into())).await;
+                            }
+                            VoiceAction::BargeIn => {
+                                info!(
+                                    agent_id = %id_str,
+                                    "Voice barge-in detected — cancelling TTS"
+                                );
+
+                                // Cancel active voice task
+                                voice_cancel.cancel();
+                                if let Some(task) = active_voice_task.take() {
+                                    task.abort();
+                                }
+                                voice_cancel = CancellationToken::new();
+
+                                // Send SpeechEnd to stop client playback
+                                {
+                                    let frame = voice::encode_binary_frame(
+                                        &VoiceProtocol::SpeechEnd,
+                                    );
+                                    let mut s = sender.lock().await;
+                                    let _ = s.send(Message::Binary(frame.into())).await;
+                                }
+
+                                // Reset session and start listening for the new utterance
+                                session.reset_to_idle();
+                                session.state = voice::VoiceSessionState::Listening;
+                                session.speech_detected = true;
+                                session.pcm_buffer.extend_from_slice(&pcm);
+                            }
                             VoiceAction::Transcribe(pcm_buffer) => {
                                 // Send VadSpeechEnd to client
                                 {
@@ -575,15 +627,24 @@ async fn handle_agent_ws(
                                         let tts_endpoint = session.config.tts_endpoint.clone();
                                         let tts_voice = session.config.tts_voice.clone();
                                         let tts_speed = session.config.tts_speed;
+                                        let tts_min_chunk = session.config.tts_min_chunk_chars;
                                         let use_opus = session.init.codec != "pcm16";
 
-                                        let voice_task = tokio::spawn(async move {
+                                        // Voice cloning: prefer session-level ref, fall back to config
+                                        let clone_ref = session.init.voice_clone_ref.clone()
+                                            .or_else(|| session.config.tts_voice_clone_ref.clone());
+
+                                        // Create a fresh cancel token for this voice task
+                                        voice_cancel = CancellationToken::new();
+                                        let cancel = voice_cancel.clone();
+
+                                        let task = tokio::spawn(async move {
                                             let tts_client = voice::TtsClient::new(
                                                 &tts_endpoint,
                                                 &tts_voice,
                                                 tts_speed,
-                                            );
-                                            let mut sentence_buf = voice::SentenceBuffer::new();
+                                            ).with_voice_clone_ref(clone_ref.as_deref());
+                                            let mut sentence_buf = voice::SentenceBuffer::with_min_chars(tts_min_chunk);
                                             let mut accumulated_text = String::new();
 
                                             // Send SpeechStart
@@ -596,6 +657,12 @@ async fn handle_agent_ws(
                                             }
 
                                             while let Some(event) = rx.recv().await {
+                                                // Check for barge-in cancellation
+                                                if cancel.is_cancelled() {
+                                                    debug!("Voice task cancelled (barge-in)");
+                                                    break;
+                                                }
+
                                                 match event {
                                                     StreamEvent::TextDelta { ref text } => {
                                                         accumulated_text.push_str(text);
@@ -607,6 +674,9 @@ async fn handle_agent_ws(
                                                         while let Some(sentence) =
                                                             sentence_buf.next_sentence()
                                                         {
+                                                            if cancel.is_cancelled() {
+                                                                break;
+                                                            }
                                                             if sentence.trim().is_empty() {
                                                                 continue;
                                                             }
@@ -616,6 +686,9 @@ async fn handle_agent_ws(
                                                             {
                                                                 Ok(pcm) => {
                                                                     for frame in voice::encode_pcm_to_frames(&pcm, use_opus) {
+                                                                        if cancel.is_cancelled() {
+                                                                            break;
+                                                                        }
                                                                         let mut s = sender_voice.lock().await;
                                                                         if s.send(Message::Binary(frame.into())).await.is_err() {
                                                                             return accumulated_text;
@@ -640,15 +713,17 @@ async fn handle_agent_ws(
                                                     }
                                                     StreamEvent::ContentComplete { .. } => {
                                                         // Flush remaining sentence buffer
-                                                        if let Some(tail) = sentence_buf.flush() {
-                                                            if !tail.trim().is_empty() {
-                                                                if let Ok(pcm) = tts_client
-                                                                    .synthesize(&tail)
-                                                                    .await
-                                                                {
-                                                                    for frame in voice::encode_pcm_to_frames(&pcm, use_opus) {
-                                                                        let mut s = sender_voice.lock().await;
-                                                                        let _ = s.send(Message::Binary(frame.into())).await;
+                                                        if !cancel.is_cancelled() {
+                                                            if let Some(tail) = sentence_buf.flush() {
+                                                                if !tail.trim().is_empty() {
+                                                                    if let Ok(pcm) = tts_client
+                                                                        .synthesize(&tail)
+                                                                        .await
+                                                                    {
+                                                                        for frame in voice::encode_pcm_to_frames(&pcm, use_opus) {
+                                                                            let mut s = sender_voice.lock().await;
+                                                                            let _ = s.send(Message::Binary(frame.into())).await;
+                                                                        }
                                                                     }
                                                                 }
                                                             }
@@ -675,8 +750,8 @@ async fn handle_agent_ws(
                                                 }
                                             }
 
-                                            // Send SpeechEnd
-                                            {
+                                            // Send SpeechEnd (only if not cancelled)
+                                            if !cancel.is_cancelled() {
                                                 let frame = voice::encode_binary_frame(
                                                     &VoiceProtocol::SpeechEnd,
                                                 );
@@ -687,8 +762,12 @@ async fn handle_agent_ws(
                                             accumulated_text
                                         });
 
-                                        // Wait for voice stream to finish, then let kernel cleanup in background
-                                        let _ = voice_task.await;
+                                        // Store task handle — do NOT await here.
+                                        // The main select! loop polls it for completion
+                                        // while still receiving WS messages (enabling barge-in).
+                                        active_voice_task = Some(task);
+
+                                        // Let kernel handle cleanup in background
                                         let sender_bg = Arc::clone(&sender);
                                         tokio::spawn(async move {
                                             if let Err(e) = handle.await {
@@ -704,9 +783,10 @@ async fn handle_agent_ws(
                                             }
                                         });
 
-                                        // Return to idle
+                                        // Set state to Speaking — the select! loop will
+                                        // transition to Idle when voice_task completes.
                                         if let Some(ref mut s) = voice_session {
-                                            s.state = voice::VoiceSessionState::Idle;
+                                            s.state = voice::VoiceSessionState::Speaking;
                                         }
                                     }
                                     Err(e) => {
@@ -729,10 +809,26 @@ async fn handle_agent_ws(
                             info!(
                                 agent_id = %id_str,
                                 session_id = %session.session_id,
-                                "Voice interrupt received"
+                                "Voice interrupt received — cancelling TTS"
                             );
-                            session.state = voice::VoiceSessionState::Idle;
-                            // TODO (Phase 5): cancel active TTS pipeline
+
+                            // Cancel the active voice task via CancellationToken
+                            voice_cancel.cancel();
+                            if let Some(task) = active_voice_task.take() {
+                                task.abort();
+                            }
+                            voice_cancel = CancellationToken::new();
+
+                            // Send SpeechEnd so client stops playback
+                            {
+                                let frame = voice::encode_binary_frame(
+                                    &VoiceProtocol::SpeechEnd,
+                                );
+                                let mut s = sender.lock().await;
+                                let _ = s.send(Message::Binary(frame.into())).await;
+                            }
+
+                            session.reset_to_idle();
                         }
                     }
                     Ok(other) => {
@@ -751,6 +847,10 @@ async fn handle_agent_ws(
     }
 
     // Cleanup
+    voice_cancel.cancel();
+    if let Some(task) = active_voice_task.take() {
+        task.abort();
+    }
     update_handle.abort();
     approval_handle.abort();
     info!(agent_id = %id_str, "WebSocket disconnected");

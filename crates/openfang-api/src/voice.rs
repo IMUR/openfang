@@ -20,9 +20,11 @@
 //! | 0x40   | Interrupt      | client→server   | empty                              |
 //! | 0xF0   | Error          | server→client   | UTF-8 error string                 |
 
+use crate::vad::SileroVad;
 use openfang_types::config::VoiceConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -63,6 +65,9 @@ pub struct SessionInitPayload {
     pub codec: String,
     #[serde(default = "default_channels")]
     pub channels: u8,
+    /// Optional base64-encoded WAV for voice cloning (overrides config).
+    #[serde(default)]
+    pub voice_clone_ref: Option<String>,
 }
 
 fn default_sample_rate() -> u32 {
@@ -81,6 +86,7 @@ impl Default for SessionInitPayload {
             sample_rate: 16000,
             codec: "opus".to_string(),
             channels: 1,
+            voice_clone_ref: None,
         }
     }
 }
@@ -271,8 +277,12 @@ pub enum VoiceSessionState {
 pub enum VoiceAction {
     /// Keep accumulating audio.
     Continue,
+    /// Speech onset detected (for VadSpeechStart notification).
+    SpeechStarted,
     /// Silence detected — transcribe this PCM buffer.
     Transcribe(Vec<i16>),
+    /// User started speaking during TTS playback — barge-in.
+    BargeIn,
 }
 
 /// A voice session associated with a WebSocket connection.
@@ -292,9 +302,15 @@ pub struct VoiceSession {
     /// Consecutive silent frames count (energy-based VAD).
     silence_frames: u32,
     /// Whether we've seen speech in the current utterance.
-    speech_detected: bool,
+    pub speech_detected: bool,
     /// Sentence buffer for TTS output.
     pub sentence_buffer: SentenceBuffer,
+    /// Neural VAD (Silero v5 via Candle). None = fallback to energy-based.
+    silero_vad: Option<SileroVad>,
+    /// Accumulates PCM for Silero VAD (needs 512-sample chunks).
+    vad_accumulator: Vec<i16>,
+    /// Last Silero VAD probability (for smooth state transitions).
+    last_vad_prob: f32,
 }
 
 impl VoiceSession {
@@ -305,6 +321,21 @@ impl VoiceSession {
         } else {
             Some(OpusCodec::new()?)
         };
+
+        let min_chunk_chars = config.tts_min_chunk_chars;
+
+        // Try to load Silero VAD; fall back to energy-based on failure
+        let silero_vad = match SileroVad::from_hub() {
+            Ok(vad) => {
+                info!("Silero VAD v5 loaded (candle, CPU)");
+                Some(vad)
+            }
+            Err(e) => {
+                warn!("Silero VAD load failed, using energy-based VAD: {e}");
+                None
+            }
+        };
+
         Ok(Self {
             session_id: Uuid::new_v4().to_string(),
             state: VoiceSessionState::Idle,
@@ -314,7 +345,10 @@ impl VoiceSession {
             config,
             silence_frames: 0,
             speech_detected: false,
-            sentence_buffer: SentenceBuffer::new(),
+            sentence_buffer: SentenceBuffer::with_min_chars(min_chunk_chars),
+            silero_vad,
+            vad_accumulator: Vec::with_capacity(512),
+            last_vad_prob: 0.0,
         })
     }
 
@@ -355,34 +389,39 @@ impl VoiceSession {
     /// Process incoming decoded PCM audio. Returns a `VoiceAction` indicating
     /// whether to keep listening or trigger transcription.
     pub fn handle_audio(&mut self, pcm: &[i16]) -> VoiceAction {
-        // Compute RMS energy
-        let rms = if pcm.is_empty() {
-            0.0
-        } else {
-            let sum_sq: f64 = pcm.iter().map(|&s| (s as f64) * (s as f64)).sum();
-            (sum_sq / pcm.len() as f64).sqrt() / 32768.0
-        };
+        // Barge-in: if we're in Speaking state and detect speech, interrupt
+        if self.state == VoiceSessionState::Speaking {
+            let is_speech = self.detect_speech(pcm);
+            if is_speech {
+                return VoiceAction::BargeIn;
+            }
+            return VoiceAction::Continue;
+        }
 
-        let threshold = self.config.vad_energy_threshold as f64;
+        let is_speech = self.detect_speech(pcm);
         let silence_threshold_frames =
-            (self.config.vad_silence_ms as f32 / 20.0).ceil() as u32; // 20ms per frame
+            (self.config.vad_silence_ms as f32 / 20.0).ceil() as u32;
         let max_samples = self.config.max_utterance_secs as usize * 16000;
 
-        if rms > threshold {
+        if is_speech {
             // Speech detected
-            if !self.speech_detected {
+            let was_silent = !self.speech_detected;
+            if was_silent {
                 self.speech_detected = true;
                 self.state = VoiceSessionState::Listening;
             }
             self.silence_frames = 0;
             self.pcm_buffer.extend_from_slice(pcm);
+
+            if was_silent {
+                return VoiceAction::SpeechStarted;
+            }
         } else if self.speech_detected {
             // Silence after speech
             self.silence_frames += 1;
-            self.pcm_buffer.extend_from_slice(pcm); // include trailing silence
+            self.pcm_buffer.extend_from_slice(pcm);
 
             if self.silence_frames >= silence_threshold_frames {
-                // End of utterance
                 self.state = VoiceSessionState::Transcribing;
                 self.speech_detected = false;
                 self.silence_frames = 0;
@@ -393,7 +432,6 @@ impl VoiceSession {
                 return VoiceAction::Transcribe(buffer);
             }
         }
-        // else: silence before any speech — ignore
 
         // Force transcription if buffer exceeds max duration
         if self.pcm_buffer.len() >= max_samples && self.speech_detected {
@@ -408,6 +446,39 @@ impl VoiceSession {
         VoiceAction::Continue
     }
 
+    /// Detect speech using Silero VAD (neural) or energy-based (fallback).
+    fn detect_speech(&mut self, pcm: &[i16]) -> bool {
+        if let Some(ref mut vad) = self.silero_vad {
+            // Accumulate samples for Silero (needs 512-sample chunks)
+            self.vad_accumulator.extend_from_slice(pcm);
+            while self.vad_accumulator.len() >= 512 {
+                let chunk: Vec<i16> = self.vad_accumulator.drain(..512).collect();
+                match vad.process_chunk(&chunk) {
+                    Ok(prob) => self.last_vad_prob = prob,
+                    Err(e) => {
+                        warn!("Silero VAD error: {e}");
+                        // Fall through to energy-based
+                        return self.detect_speech_energy(pcm);
+                    }
+                }
+            }
+            let threshold = self.config.vad_speech_threshold;
+            self.last_vad_prob > threshold
+        } else {
+            self.detect_speech_energy(pcm)
+        }
+    }
+
+    /// Energy-based speech detection (fallback when Silero unavailable).
+    fn detect_speech_energy(&self, pcm: &[i16]) -> bool {
+        if pcm.is_empty() {
+            return false;
+        }
+        let sum_sq: f64 = pcm.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        let rms = (sum_sq / pcm.len() as f64).sqrt() / 32768.0;
+        rms > self.config.vad_energy_threshold as f64
+    }
+
     /// Reset the session to idle state (e.g. after barge-in).
     pub fn reset_to_idle(&mut self) {
         self.state = VoiceSessionState::Idle;
@@ -415,6 +486,11 @@ impl VoiceSession {
         self.silence_frames = 0;
         self.pcm_buffer.clear();
         self.sentence_buffer = SentenceBuffer::new();
+        self.vad_accumulator.clear();
+        self.last_vad_prob = 0.0;
+        if let Some(ref mut vad) = self.silero_vad {
+            vad.reset();
+        }
     }
 }
 
@@ -511,12 +587,14 @@ impl SttClient {
 // TTS Client
 // ---------------------------------------------------------------------------
 
-/// HTTP client for the TTS service (Qwen3-TTS / Kokoro / any OpenAI-compatible).
+/// HTTP client for the TTS service (Chatterbox / Kokoro / any OpenAI-compatible).
 pub struct TtsClient {
     endpoint: String,
     voice: String,
     language: String,
     speed: f32,
+    /// Optional base64-encoded WAV for voice cloning (Chatterbox).
+    voice_clone_ref: Option<String>,
     client: reqwest::Client,
 }
 
@@ -527,8 +605,23 @@ impl TtsClient {
             voice: voice.to_string(),
             language: "English".to_string(),
             speed,
+            voice_clone_ref: None,
             client: reqwest::Client::new(),
         }
+    }
+
+    /// Set a voice cloning reference audio (base64-encoded WAV).
+    pub fn with_voice_clone_ref(mut self, ref_path: Option<&str>) -> Self {
+        if let Some(path) = ref_path {
+            if let Ok(bytes) = std::fs::read(path) {
+                use base64::Engine;
+                self.voice_clone_ref =
+                    Some(base64::engine::general_purpose::STANDARD.encode(&bytes));
+            } else {
+                warn!("Voice clone ref not found: {path}");
+            }
+        }
+        self
     }
 
     /// Synthesize text to PCM16 samples at 16kHz mono.
@@ -536,12 +629,15 @@ impl TtsClient {
     /// TTS service returns 24kHz WAV; we parse the WAV header, extract PCM16, and resample to 16kHz.
     pub async fn synthesize(&self, text: &str) -> Result<Vec<i16>, String> {
         let url = format!("{}/v1/audio/speech", self.endpoint);
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "input": text,
             "voice": self.voice,
             "speed": self.speed,
             "language": self.language,
         });
+        if let Some(ref clone_ref) = self.voice_clone_ref {
+            body["reference_audio"] = serde_json::Value::String(clone_ref.clone());
+        }
 
         let resp = self
             .client
@@ -655,11 +751,56 @@ pub fn parse_wav(data: &[u8]) -> Result<(Vec<i16>, u32), String> {
     Err("No data chunk found in WAV".into())
 }
 
-/// Resample PCM16 from one sample rate to another using linear interpolation.
+/// Resample PCM16 from one sample rate to another using windowed sinc interpolation.
+///
+/// Uses `rubato::SincFixedIn` for high-quality resampling (replaces linear interpolation).
 pub fn resample(pcm: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
     if from_rate == to_rate || pcm.is_empty() {
         return pcm.to_vec();
     }
+
+    use rubato::{SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction, Resampler};
+
+    let params = SincInterpolationParameters {
+        sinc_len: 256,
+        f_cutoff: 0.95,
+        interpolation: SincInterpolationType::Linear,
+        oversampling_factor: 256,
+        window: WindowFunction::BlackmanHarris2,
+    };
+
+    let ratio = to_rate as f64 / from_rate as f64;
+    let mut resampler = match SincFixedIn::<f64>::new(
+        ratio,
+        2.0,        // max relative ratio
+        params,
+        pcm.len(),  // chunk size = full input
+        1,          // mono
+    ) {
+        Ok(r) => r,
+        Err(_) => {
+            // Fallback to simple linear if rubato fails
+            return resample_linear(pcm, from_rate, to_rate);
+        }
+    };
+
+    // Convert i16 → f64
+    let input: Vec<f64> = pcm.iter().map(|&s| s as f64 / 32768.0).collect();
+    let waves_in = vec![input];
+
+    match resampler.process(&waves_in, None) {
+        Ok(waves_out) => {
+            waves_out[0]
+                .iter()
+                .map(|&s| (s * 32768.0).clamp(-32768.0, 32767.0) as i16)
+                .collect()
+        }
+        Err(_) => resample_linear(pcm, from_rate, to_rate),
+    }
+}
+
+/// Fallback linear interpolation resampler.
+fn resample_linear(pcm: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
     let ratio = from_rate as f64 / to_rate as f64;
     let out_len = (pcm.len() as f64 / ratio).ceil() as usize;
     let mut out = Vec::with_capacity(out_len);
@@ -835,17 +976,24 @@ fn count_char(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, target: char
 }
 
 // ---------------------------------------------------------------------------
-// Sentence Buffer
+// Clause Buffer
 // ---------------------------------------------------------------------------
 
-/// Lightweight sentence accumulator for TTS.
+/// Minimum characters before yielding a clause to TTS.
+const MIN_CLAUSE_CHARS: usize = 30;
+
+/// Clause-level text accumulator for TTS.
 ///
-/// Accumulates TextDelta fragments and yields complete sentences.
-/// Splits on `.!?` followed by whitespace or end-of-input.
-/// This is NOT the ElevenLabs paradigm — just "don't send half a word to TTS".
+/// Splits on clause boundaries (`,;:.!?\n—`) with a minimum character threshold
+/// to avoid micro-chunks. Produces more natural cadence than sentence-only splitting
+/// by feeding TTS with smaller, more frequent chunks.
+///
+/// Backward-compatible: provides the same `push()`/`next_sentence()`/`flush()` API
+/// as the old `SentenceBuffer` so ws.rs voice_task works without changes.
 pub struct SentenceBuffer {
     buffer: String,
     pending: VecDeque<String>,
+    min_chars: usize,
 }
 
 impl SentenceBuffer {
@@ -853,21 +1001,31 @@ impl SentenceBuffer {
         Self {
             buffer: String::new(),
             pending: VecDeque::new(),
+            min_chars: MIN_CLAUSE_CHARS,
         }
     }
 
-    /// Push a text delta. Internally splits on sentence boundaries.
-    pub fn push(&mut self, text: &str) {
-        self.buffer.push_str(text);
-        self.extract_sentences();
+    /// Create with custom minimum clause size.
+    pub fn with_min_chars(min_chars: usize) -> Self {
+        Self {
+            buffer: String::new(),
+            pending: VecDeque::new(),
+            min_chars,
+        }
     }
 
-    /// Pop the next complete sentence, if available.
+    /// Push a text delta. Internally splits on clause boundaries.
+    pub fn push(&mut self, text: &str) {
+        self.buffer.push_str(text);
+        self.extract_clauses();
+    }
+
+    /// Pop the next complete clause, if available.
     pub fn next_sentence(&mut self) -> Option<String> {
         self.pending.pop_front()
     }
 
-    /// Flush any remaining text as a final sentence.
+    /// Flush any remaining text as a final clause.
     pub fn flush(&mut self) -> Option<String> {
         let remaining = self.buffer.trim().to_string();
         self.buffer.clear();
@@ -878,15 +1036,19 @@ impl SentenceBuffer {
         }
     }
 
-    fn extract_sentences(&mut self) {
+    fn extract_clauses(&mut self) {
         loop {
-            let split_pos = self.find_sentence_end();
+            let split_pos = self.find_clause_end();
             match split_pos {
                 Some(pos) => {
-                    let sentence: String = self.buffer[..pos].trim().to_string();
-                    self.buffer = self.buffer[pos..].trim_start().to_string();
-                    if !sentence.is_empty() {
-                        self.pending.push_back(sentence);
+                    let clause: String = self.buffer[..pos].trim().to_string();
+                    self.buffer = self.buffer[pos..].to_string();
+                    // Trim leading whitespace but preserve for next iteration
+                    if self.buffer.starts_with(char::is_whitespace) {
+                        self.buffer = self.buffer.trim_start().to_string();
+                    }
+                    if !clause.is_empty() {
+                        self.pending.push_back(clause);
                     }
                 }
                 None => break,
@@ -894,14 +1056,36 @@ impl SentenceBuffer {
         }
     }
 
-    fn find_sentence_end(&self) -> Option<usize> {
+    fn find_clause_end(&self) -> Option<usize> {
         let bytes = self.buffer.as_bytes();
+
+        // Scan for split points. Sentence-ending punctuation (.!?) always splits.
+        // Clause breaks (,;:\n—) only split after min_chars threshold.
         for i in 0..bytes.len() {
-            if matches!(bytes[i], b'.' | b'!' | b'?') {
-                // Check if followed by whitespace or end
+            let is_sentence_end = matches!(bytes[i], b'.' | b'!' | b'?');
+            let is_clause_break = matches!(bytes[i], b',' | b';' | b':' | b'\n');
+            let is_dash = i + 2 < bytes.len()
+                && bytes[i] == b'\xe2'
+                && bytes[i + 1] == b'\x80'
+                && bytes[i + 2] == b'\x94'; // em dash '—' in UTF-8
+
+            if is_sentence_end {
                 let next = i + 1;
                 if next >= bytes.len() || bytes[next].is_ascii_whitespace() {
                     return Some(next);
+                }
+            }
+
+            // Clause breaks only split after min_chars threshold
+            if i >= self.min_chars {
+                if is_clause_break {
+                    let next = i + 1;
+                    if next >= bytes.len() || bytes[next].is_ascii_whitespace() {
+                        return Some(next);
+                    }
+                }
+                if is_dash {
+                    return Some(i + 3); // skip 3-byte em dash
                 }
             }
         }
@@ -970,6 +1154,7 @@ mod tests {
             sample_rate: 16000,
             codec: "opus".to_string(),
             channels: 1,
+            voice_clone_ref: None,
         });
         let encoded = encode_binary_frame(&original);
         let decoded = parse_binary_frame(&encoded).unwrap();
@@ -1074,10 +1259,17 @@ mod tests {
 
     #[test]
     fn test_resample_downsample() {
-        // 24kHz → 16kHz should produce 2/3 the samples
+        // 24kHz → 16kHz should produce approximately 2/3 the samples
         let pcm: Vec<i16> = vec![0; 2400];
         let out = resample(&pcm, 24000, 16000);
-        assert_eq!(out.len(), 1600);
+        // Rubato sinc resampler may produce slightly different lengths than exact 2/3
+        let expected = 1600;
+        let tolerance = 100; // ~6% tolerance for sinc edge effects
+        assert!(
+            (out.len() as i64 - expected as i64).unsigned_abs() < tolerance,
+            "Expected ~{expected} samples, got {}",
+            out.len()
+        );
     }
 
     // --- Markdown to speakable ---
@@ -1174,7 +1366,7 @@ mod tests {
         let silence = vec![0i16; OPUS_FRAME_SAMPLES];
         match session.handle_audio(&silence) {
             VoiceAction::Continue => {} // expected
-            VoiceAction::Transcribe(_) => panic!("Should not transcribe silence"),
+            other => panic!("Expected Continue for silence, got {:?}", std::mem::discriminant(&other)),
         }
         assert_eq!(session.state, VoiceSessionState::Idle);
     }
@@ -1187,10 +1379,13 @@ mod tests {
         let mut session =
             VoiceSession::new(SessionInitPayload::default(), config).unwrap();
 
-        // Send loud audio (speech)
+        // Send loud audio (speech) — first frame returns SpeechStarted
         let speech: Vec<i16> = (0..OPUS_FRAME_SAMPLES).map(|i| ((i % 50) as i16 * 500)).collect();
-        assert!(matches!(session.handle_audio(&speech), VoiceAction::Continue));
+        assert!(matches!(session.handle_audio(&speech), VoiceAction::SpeechStarted));
         assert_eq!(session.state, VoiceSessionState::Listening);
+
+        // Second speech frame returns Continue (already listening)
+        assert!(matches!(session.handle_audio(&speech), VoiceAction::Continue));
 
         // Send silence
         let silence = vec![0i16; OPUS_FRAME_SAMPLES];
@@ -1201,7 +1396,7 @@ mod tests {
                 assert!(!pcm.is_empty());
                 assert_eq!(session.state, VoiceSessionState::Transcribing);
             }
-            VoiceAction::Continue => panic!("Expected Transcribe after silence threshold"),
+            other => panic!("Expected Transcribe after silence threshold, got {:?}", std::mem::discriminant(&other)),
         }
     }
 

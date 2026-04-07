@@ -557,9 +557,17 @@ pub struct VoiceConfig {
     /// Minimum silence duration (ms) before treating as end-of-utterance. Default: 800.
     pub vad_silence_ms: u64,
     /// Energy threshold for speech detection (RMS, 0.0–1.0). Default: 0.01.
+    /// Used as fallback when neural VAD is unavailable.
     pub vad_energy_threshold: f32,
+    /// Neural VAD speech probability threshold (0.0–1.0). Default: 0.5.
+    /// Used by Silero VAD when available.
+    pub vad_speech_threshold: f32,
     /// Maximum utterance duration in seconds. Default: 30.
     pub max_utterance_secs: u32,
+    /// Minimum characters before sending a clause to TTS. Default: 30.
+    pub tts_min_chunk_chars: usize,
+    /// Path to a 10-30s reference WAV for voice cloning (Chatterbox). Optional.
+    pub tts_voice_clone_ref: Option<String>,
 }
 
 impl Default for VoiceConfig {
@@ -571,9 +579,12 @@ impl Default for VoiceConfig {
             stt_model: "distil-large-v3".to_string(),
             tts_voice: "af_heart".to_string(),
             tts_speed: 1.0,
-            vad_silence_ms: 800,
+            vad_silence_ms: 500,
             vad_energy_threshold: 0.01,
+            vad_speech_threshold: 0.5,
             max_utterance_secs: 30,
+            tts_min_chunk_chars: 30,
+            tts_voice_clone_ref: None,
         }
     }
 }

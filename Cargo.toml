@@ -28,9 +28,11 @@ rust-version = "1.75"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
 
-# Audio codec (pure Rust, no C dependency)
+# Audio codec and resampling (pure Rust, no C dependency)
 opus-rs = "0.1"
+rubato = "0.15"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
