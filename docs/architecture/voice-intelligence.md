@@ -13,7 +13,7 @@ Three complementary layers handle voice:
 
 1. **Voice inference services** — standalone Python services on **drtr RTX 2080** exposing OpenAI-compatible HTTP APIs. STT (Parakeet TDT 0.6B, fp16) on port 7733. TTS (Chatterbox-Turbo 350M) on port 7744. Total VRAM: 4.6GB / 8GB. OpenFang calls these over HTTP via Tailscale (~7ms RTT).
 
-2. **Voice transport layer** — implemented in `crates/openfang-api/src/voice.rs`, `vad.rs`, and `ws.rs`. Handles the binary WebSocket protocol, neural VAD (Silero v5 via candle), codec, STT/TTS client calls, sentence buffering, barge-in via CancellationToken, and the full conversation turn loop.
+2. **Voice transport layer** — implemented in `crates/openfang-api/src/voice.rs` and `ws.rs`, with the shared client in `static/js/voice-client.js`. Handles the binary WebSocket protocol, codec, STT/TTS client calls, clause buffering, barge-in via CancellationToken (server) and energy VAD (client), and the full conversation turn loop.
 
 3. **Neural VAD** — Silero VAD v5 loaded via candle (safetensors, CPU inference on prtr i9-9900X). Processes 512-sample chunks at 16kHz, returns speech probability. Falls back to energy-based RMS if model unavailable.
 
@@ -198,25 +198,29 @@ Client sends 0x01 AudioDataIn frames
 
 ### Neural VAD (Silero v5)
 
-Implemented in `crates/openfang-api/src/vad.rs`. Loads `idle-intelligence/silero-vad-v5-safetensors` from HuggingFace hub via candle-nn (safetensors format, no ONNX runtime needed).
+Implemented in `crates/openfang-runtime/src/candle_vad.rs`. Follows the established candle driver pattern (`candle_reranker.rs`, `candle_ner.rs`): loaded once at boot as `Option<Arc<SileroVad>>` on the kernel, gated behind the `memory-candle` feature flag, passed into `VoiceSession` as a parameter. Thread-safe via `Arc<Mutex<Inner>>`.
+
+Loads `idle-intelligence/silero-vad-v5-safetensors` from HuggingFace hub (cached after first download). Safetensors weight keys: `stft.conv.weight`, `encoder.{0-3}.conv.{weight,bias}`, `decoder.lstm.{weight_ih_l0,weight_hh_l0,bias_ih_l0,bias_hh_l0}`, `decoder.output.{weight,bias}`.
 
 **Architecture:** Input [1, 576] → reflection pad → Conv1d STFT (1→258, k=256, s=128) → magnitude [1, 129, 4] → 4× Conv1d encoder → LSTM (128→128, stateful) → Conv1d decoder → sigmoid → probability ∈ [0, 1].
 
-**Integration:** `VoiceSession` holds an optional `SileroVad`. `detect_speech()` accumulates PCM in a 512-sample buffer and feeds complete chunks to Silero. Falls back to RMS energy when Silero is unavailable. Config: `vad_speech_threshold = 0.5` (Silero), `vad_energy_threshold = 0.01` (fallback).
+**Integration:** `VoiceSession` receives `Option<Arc<SileroVad>>` at creation. `detect_speech()` accumulates PCM in a 512-sample buffer and feeds complete chunks to Silero. Falls back to RMS energy when Silero is unavailable (feature not compiled or model failed to load). Config: `vad_speech_threshold = 0.5` (Silero), `vad_energy_threshold = 0.01` (fallback).
+
+**Note:** Server-side VAD is **disabled during Speaking state** — `handle_audio()` returns `VoiceAction::Continue` while TTS is playing. This prevents false barge-ins from ambient mic noise. Barge-in during playback is handled client-side.
 
 ### Barge-in (Interrupt)
 
-Real barge-in implemented via `tokio_util::sync::CancellationToken` with both client-side and server-side paths:
+Barge-in uses a **client-side primary path** with server-side CancellationToken support:
 
-1. **Client-side barge-in (primary path):** When the client receives VadSpeechStart (0x30) while in `speaking` state (bot is talking), it immediately sends an Interrupt frame (0x40) to the server and flushes its local audio playback queue. This is the most reliable path because it doesn't depend on the server detecting speech through the WS audio stream. Implemented in both `voice.html` (standalone) and `chat.js` (dashboard).
+1. **Client-side energy VAD (primary path):** `voice-client.js` computes RMS energy on each mic audio frame during TTS playback. When energy exceeds the threshold (0.008), the client immediately calls `stopPlayback()` (which calls `.stop()` on the active `AudioBufferSourceNode` and flushes the queue) and sends a 0x40 Interrupt frame to the server. A 2-second cooldown prevents rapid-fire triggers. This runs entirely in the browser — no server round-trip needed for detection.
 
-2. **Server-side client interrupt (0x40):** WS handler cancels the `CancellationToken`, aborts the `voice_task` JoinHandle, sends SpeechEnd (0x11), resets session.
+2. **Server-side 0x40 handler:** WS handler cancels the `CancellationToken`, aborts the `voice_task` JoinHandle, sends SpeechEnd (0x11), resets session to Idle with a fresh CancellationToken.
 
-3. **Server-side VAD-initiated (automatic):** When `handle_audio()` detects speech during `Speaking` state, returns `VoiceAction::BargeIn`. WS handler cancels TTS, sends SpeechEnd, resets, and begins listening for the new utterance.
+3. **Non-blocking select! loop:** The voice_task is spawned but NOT awaited inline. The main WS `select!` loop polls both the receiver and the voice_task, allowing Interrupt messages to be processed while TTS is streaming.
 
-4. **Non-blocking select! loop:** The voice_task is spawned but NOT awaited inline. The main WS `select!` loop polls both the receiver and the voice_task, allowing Interrupt messages to be processed while TTS is streaming. Previous implementation blocked the message loop during TTS.
+**Server-side VAD during Speaking is disabled.** Both Silero and energy VAD produced false positives from ambient mic noise during TTS playback, killing TTS mid-response. `handle_audio()` returns `VoiceAction::Continue` during Speaking state.
 
-**Client-side audio queue flush:** On receiving SpeechEnd (0x11) or Interrupt confirmation (0x40) from the server, the client clears its `playQueue` and stops playback immediately. This prevents buffered audio from continuing to play after the interrupt.
+**SpeechEnd (0x11) behavior:** On natural completion, SpeechEnd lets the client's audio queue drain — the currently-playing `AudioBufferSourceNode` finishes, then `drainPlayQueue()` finds the queue empty and transitions state. On interrupt (0x40), `stopPlayback()` kills the active source immediately.
 
 ### Clause-Level TTS Chunking
 
@@ -246,13 +250,23 @@ Idle --[SessionInit]--> Listening
 
 ## Voice Web UI
 
-Two voice interfaces exist:
+### Shared voice client (`voice-client.js`)
 
-1. **Dashboard chat** (`/`) — the main dashboard's chat page has a mic button that activates voice mode inline. Implemented in `static/js/pages/chat.js` with a 4-state submit button (idle->mic, text->send, sending->stop, voice->end-call).
+All voice functionality — mic capture, Web Audio playback, barge-in energy VAD, WS binary protocol, session state machine — lives in a single shared module: `static/js/voice-client.js`, served at `GET /voice-client.js` (auth-exempt).
 
-2. **Dedicated voice page** (`/voice`) — a standalone voice-only interface at `GET /voice`, embedded in the binary via `include_str!("../static/voice.html")`. Agent selector, API token input, call/hangup, mute, transcript view.
+Both UIs instantiate a `VoiceClient` with callbacks for state changes, transcripts, and errors. This eliminates the previous split where `voice.html` and `chat.js` had diverged implementations with different bugs.
+
+### Voice interfaces
+
+1. **Dedicated voice page** (`/voice`) — standalone voice-only interface. Agent selector, API token input, call/hangup, mute, transcript view. Loads `voice-client.js` via `<script src="/voice-client.js">`. This is the primary testing interface.
+
+2. **Dashboard chat** (`/`) — the dashboard's chat page has a mic button that activates voice mode inline. `chat.js` needs migration to use `VoiceClient` (currently still has its own implementation — pending consolidation).
 
 Both use `ScriptProcessorNode` for mic capture (deprecated but universally supported on iOS Safari) and PCM16 codec by default.
+
+### Dev mode (OPENFANG_STATIC_DIR)
+
+Set `OPENFANG_STATIC_DIR` env var to the `static/` directory path (e.g. `crates/openfang-api/static`). Voice HTML and JS are then served from disk on every request — no rebuild needed for client-side changes. Unset or empty falls back to compiled-in `include_str!()` versions.
 
 ---
 
@@ -287,10 +301,11 @@ All fields have defaults; only `enabled = true` is required to activate voice.
 | Parakeet TDT app | `drtr:/opt/services/parakeet-stt/app.py` | **Active** |
 | Parakeet systemd | `drtr:/etc/systemd/system/parakeet-stt.service` | **Active** |
 | Voice transport | `crates/openfang-api/src/voice.rs` | Active |
-| Neural VAD | `crates/openfang-api/src/vad.rs` | Active |
+| Neural VAD (Silero v5) | `crates/openfang-runtime/src/candle_vad.rs` | Active (memory-candle feature) |
 | WS handler | `crates/openfang-api/src/ws.rs` | Active |
-| Dashboard voice UI | `crates/openfang-api/static/js/pages/chat.js` | Active |
-| Standalone voice UI | `crates/openfang-api/static/voice.html` | Active |
+| Voice client (shared JS) | `crates/openfang-api/static/js/voice-client.js` | Active |
+| Standalone voice UI | `crates/openfang-api/static/voice.html` | Active (uses voice-client.js) |
+| Dashboard voice UI | `crates/openfang-api/static/js/pages/chat.js` | Active (pending VoiceClient migration) |
 | Kokoro TTS (prtr) | `/opt/services/kokoro-tts/` | Retired, disabled |
 | Whisper STT (prtr) | `/opt/services/whisper-stt/` | Retired, disabled |
 | Qwen3-TTS (drtr) | `drtr:/opt/services/qwen3-tts/` | Retired, disabled |
@@ -387,3 +402,10 @@ vox.ism.la {
 - **2026-04-07:** Phase 3 — Rubato sinc resampler replaces linear interpolation (24→16kHz)
 - **2026-04-07:** Phase 4 — Voice cloning: tts_voice_clone_ref config, SessionInit extension, TtsClient base64 encoding
 - **2026-04-07:** Client-side barge-in: voice.html + chat.js send 0x40 Interrupt when VadSpeechStart arrives during speaking state, flush audio queue
+- **2026-04-07:** Fixed Silero VAD weight names: encoder.0→encoder.0.conv, decoder.rnn→decoder.lstm, decoder.decoder→decoder.output
+- **2026-04-07:** Moved SileroVad to openfang-runtime/candle_vad.rs (follows candle driver pattern, memory-candle feature)
+- **2026-04-07:** Disabled server-side VAD during Speaking state (false positives from ambient noise)
+- **2026-04-07:** Client-side energy VAD in voice-client.js (RMS > 0.008 threshold, 2s cooldown)
+- **2026-04-07:** Consolidated voice.html + chat.js into shared voice-client.js module
+- **2026-04-07:** Added OPENFANG_STATIC_DIR filesystem fallback for live JS iteration without rebuilds
+- **2026-04-07:** SpeechEnd (0x11) lets audio drain naturally; only 0x40 Interrupt stops immediately
