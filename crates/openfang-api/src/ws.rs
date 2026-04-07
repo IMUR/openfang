@@ -711,7 +711,16 @@ async fn handle_agent_ws(
                                                         )
                                                         .await;
                                                     }
-                                                    StreamEvent::ContentComplete { .. } => {
+                                                    StreamEvent::ContentComplete { stop_reason, .. } => {
+                                                        // Only break on a final stop — EndTurn or
+                                                        // StopSequence.  A ToolUse stop means the
+                                                        // agent loop will continue with more TextDelta
+                                                        // events after tool execution; breaking here
+                                                        // would silently discard the final spoken reply.
+                                                        use openfang_types::message::StopReason;
+                                                        if matches!(stop_reason, StopReason::ToolUse | StopReason::MaxTokens) {
+                                                            continue;
+                                                        }
                                                         // Flush remaining sentence buffer
                                                         if !cancel.is_cancelled() {
                                                             if let Some(tail) = sentence_buf.flush() {

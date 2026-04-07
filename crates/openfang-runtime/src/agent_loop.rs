@@ -2174,6 +2174,8 @@ pub async fn run_agent_loop_streaming(
                     session
                         .messages
                         .push(Message::assistant("[no reply needed]".to_string()));
+                    // Release stream channel before persistence so consumers aren't blocked.
+                    drop(stream_tx);
                     memory
                         .save_session_async(session)
                         .await
@@ -2245,6 +2247,12 @@ pub async fn run_agent_loop_streaming(
 
                 // Prune NO_REPLY heartbeat turns to save context budget
                 crate::session_repair::prune_heartbeat_turns(&mut session.messages, 10);
+
+                // Drop stream_tx here — the response text is captured and all streaming
+                // events have been sent.  Consumers (WebSocket, SSE, TUI) see channel
+                // close immediately and can deliver the response to the client without
+                // waiting for the persistence work below.
+                drop(stream_tx);
 
                 memory
                     .save_session_async(session)
@@ -2710,6 +2718,8 @@ pub async fn run_agent_loop_streaming(
                         text
                     };
                     session.messages.push(Message::assistant(&text));
+                    // Release stream channel before persistence.
+                    drop(stream_tx);
                     if let Err(e) = memory.save_session_async(session).await {
                         warn!("Failed to save session on max continuations: {e}");
                     }
@@ -2750,6 +2760,9 @@ pub async fn run_agent_loop_streaming(
             }
         }
     }
+
+    // Release stream channel before persistence — max iterations exit path.
+    drop(stream_tx);
 
     if let Err(e) = memory.save_session_async(session).await {
         warn!("Failed to save session on max iterations: {e}");
