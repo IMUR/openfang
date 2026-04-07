@@ -479,6 +479,7 @@ impl SttClient {
         let form = reqwest::multipart::Form::new()
             .part("file", part)
             .text("model", self.model.clone())
+            .text("language", "en")
             .text("response_format", "json");
 
         let url = format!("{}/v1/audio/transcriptions", self.endpoint);
@@ -510,10 +511,11 @@ impl SttClient {
 // TTS Client
 // ---------------------------------------------------------------------------
 
-/// HTTP client for the Kokoro TTS service.
+/// HTTP client for the TTS service (Qwen3-TTS / Kokoro / any OpenAI-compatible).
 pub struct TtsClient {
     endpoint: String,
     voice: String,
+    language: String,
     speed: f32,
     client: reqwest::Client,
 }
@@ -523,6 +525,7 @@ impl TtsClient {
         Self {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             voice: voice.to_string(),
+            language: "English".to_string(),
             speed,
             client: reqwest::Client::new(),
         }
@@ -530,13 +533,14 @@ impl TtsClient {
 
     /// Synthesize text to PCM16 samples at 16kHz mono.
     ///
-    /// Kokoro returns 24kHz WAV; we parse the WAV header, extract PCM16, and resample to 16kHz.
+    /// TTS service returns 24kHz WAV; we parse the WAV header, extract PCM16, and resample to 16kHz.
     pub async fn synthesize(&self, text: &str) -> Result<Vec<i16>, String> {
         let url = format!("{}/v1/audio/speech", self.endpoint);
         let body = serde_json::json!({
             "input": text,
             "voice": self.voice,
             "speed": self.speed,
+            "language": self.language,
         });
 
         let resp = self
@@ -816,7 +820,9 @@ pub fn markdown_to_speakable(text: &str) -> String {
         }
     }
 
-    collapsed.trim().to_string()
+    // Only trim trailing whitespace — leading spaces in streaming deltas
+    // are significant word separators that the SentenceBuffer needs.
+    collapsed.trim_end().to_string()
 }
 
 fn count_char(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, target: char) -> usize {

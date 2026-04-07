@@ -61,7 +61,7 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 # candle-kernels is patched at git.ism.la/rtr/candle-kernels to skip WMMA MoE
 # kernels on pre-Volta GPUs (CC < 7.0). GTX 970 is CC 5.2, GTX 1080 is CC 6.1.
 # candle-onnx: requires protoc; re-enable for Phase 2 (Liquid LFM2 ONNX models).
-candle-core = { version = "0.10", features = ["cuda"] }
+candle-core = { version = "0.10" }
 candle-nn = { version = "0.10" }
 candle-transformers = { version = "0.10" }
 # candle-onnx = { version = "0.10" }
@@ -175,10 +175,8 @@ openssl = { version = "0.10", features = ["vendored"] }
 tokio-test = "0.4"
 tempfile = "3"
 
-# Patch candle-kernels to skip WMMA MoE kernels on pre-Volta GPUs (CC < 7.0).
-# GTX 970 (CC 5.2) and GTX 1080 (CC 6.1) both lack Tensor Cores.
-[patch.crates-io]
-candle-kernels = { git = "ssh://git@git.ism.la:6666/rtr/candle-kernels.git", branch = "main" }
+# candle-kernels patch removed — CUDA feature disabled on candle-core,
+# memory intelligence runs on CPU only. Patch was for pre-Volta WMMA skip.
 
 [profile.release]
 lto = true

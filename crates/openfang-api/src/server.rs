@@ -819,10 +819,19 @@ pub async fn run_daemon(
             version: env!("CARGO_PKG_VERSION").to_string(),
             platform: std::env::consts::OS.to_string(),
         };
-        if let Ok(json) = serde_json::to_string_pretty(&daemon_info) {
-            let _ = std::fs::write(info_path, json);
-            // SECURITY: Restrict daemon info file permissions (contains PID and port).
-            restrict_permissions(info_path);
+        match serde_json::to_string_pretty(&daemon_info) {
+            Ok(json) => match std::fs::write(info_path, &json) {
+                Ok(()) => {
+                    info!("Wrote daemon info to {}", info_path.display());
+                    restrict_permissions(info_path);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to write daemon info to {}: {e}", info_path.display());
+                }
+            },
+            Err(e) => {
+                tracing::error!("Failed to serialize daemon info: {e}");
+            }
         }
     }
 

@@ -546,14 +546,22 @@ async fn handle_agent_ws(
                                 )
                                 .await;
 
-                                // Feed transcription to agent (same path as text chat)
+                                // Feed transcription to agent with voice-mode context
+                                let voice_message = format!(
+                                    "[VOICE MODE] The user is speaking to you via voice chat. \
+                                     Your response will be spoken aloud via TTS. Keep replies \
+                                     short and conversational (1-3 sentences). Avoid markdown, \
+                                     code blocks, bullet points, and long lists — speak naturally. \
+                                     Do not mention that you are in voice mode.\n\n{}",
+                                    transcription
+                                );
                                 let kernel_handle: Arc<dyn KernelHandle> =
                                     state.kernel.clone() as Arc<dyn KernelHandle>;
                                 match state
                                     .kernel
                                     .send_message_streaming(
                                         agent_id,
-                                        &transcription,
+                                        &voice_message,
                                         Some(kernel_handle),
                                         None,
                                         None,
