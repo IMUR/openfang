@@ -394,6 +394,9 @@ fn host_kv_get(state: &GuestState, params: &serde_json::Value) -> serde_json::Va
         Some(k) => k,
         None => return json!({"error": "Missing 'key' parameter"}),
     };
+    // Defense-in-depth: local capability check before kernel call.
+    // The kernel also enforces capabilities, but checking here catches
+    // misuse before hitting the blocking runtime bridge.
     if let Err(e) = check_capability(
         &state.capabilities,
         &Capability::MemoryRead(key.to_string()),
@@ -404,7 +407,7 @@ fn host_kv_get(state: &GuestState, params: &serde_json::Value) -> serde_json::Va
         Some(k) => k,
         None => return json!({"error": "No kernel handle available"}),
     };
-    match kernel.memory_recall(key) {
+    match kernel.memory_recall(&state.agent_id, key) {
         Ok(Some(val)) => json!({"ok": val}),
         Ok(None) => json!({"ok": null}),
         Err(e) => json!({"error": e}),
@@ -430,7 +433,7 @@ fn host_kv_set(state: &GuestState, params: &serde_json::Value) -> serde_json::Va
         Some(k) => k,
         None => return json!({"error": "No kernel handle available"}),
     };
-    match kernel.memory_store(key, value) {
+    match kernel.memory_store(&state.agent_id, key, value) {
         Ok(()) => json!({"ok": true}),
         Err(e) => json!({"error": e}),
     }

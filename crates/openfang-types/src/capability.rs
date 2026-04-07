@@ -313,4 +313,69 @@ mod tests {
         ];
         assert!(validate_capability_inheritance(&parent, &child).is_err());
     }
+
+    // --- Memory capability tests (validates middleware enforcement) ---
+
+    #[test]
+    fn test_memory_write_self_scope() {
+        assert!(capability_matches(
+            &Capability::MemoryWrite("self.*".to_string()),
+            &Capability::MemoryWrite("self.notes".to_string()),
+        ));
+        assert!(capability_matches(
+            &Capability::MemoryWrite("self.*".to_string()),
+            &Capability::MemoryWrite("self.user_prefs".to_string()),
+        ));
+    }
+
+    #[test]
+    fn test_memory_write_self_denies_shared() {
+        assert!(!capability_matches(
+            &Capability::MemoryWrite("self.*".to_string()),
+            &Capability::MemoryWrite("user_name".to_string()),
+        ));
+        assert!(!capability_matches(
+            &Capability::MemoryWrite("self.*".to_string()),
+            &Capability::MemoryWrite("shared.config".to_string()),
+        ));
+    }
+
+    #[test]
+    fn test_memory_read_wildcard_grants_all() {
+        assert!(capability_matches(
+            &Capability::MemoryRead("*".to_string()),
+            &Capability::MemoryRead("self.notes".to_string()),
+        ));
+        assert!(capability_matches(
+            &Capability::MemoryRead("*".to_string()),
+            &Capability::MemoryRead("anything".to_string()),
+        ));
+    }
+
+    #[test]
+    fn test_memory_write_mixed_scopes() {
+        let grants = vec![
+            Capability::MemoryWrite("self.*".to_string()),
+            Capability::MemoryWrite("shared.*".to_string()),
+        ];
+        let self_key = Capability::MemoryWrite("self.data".to_string());
+        let shared_key = Capability::MemoryWrite("shared.tasks".to_string());
+        let bare_key = Capability::MemoryWrite("user_name".to_string());
+
+        assert!(grants.iter().any(|g| capability_matches(g, &self_key)));
+        assert!(grants.iter().any(|g| capability_matches(g, &shared_key)));
+        assert!(!grants.iter().any(|g| capability_matches(g, &bare_key)));
+    }
+
+    #[test]
+    fn test_memory_read_write_isolation() {
+        assert!(!capability_matches(
+            &Capability::MemoryRead("self.*".to_string()),
+            &Capability::MemoryWrite("self.notes".to_string()),
+        ));
+        assert!(!capability_matches(
+            &Capability::MemoryWrite("self.*".to_string()),
+            &Capability::MemoryRead("self.notes".to_string()),
+        ));
+    }
 }

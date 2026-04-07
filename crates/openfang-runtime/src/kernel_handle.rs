@@ -7,6 +7,11 @@
 
 use async_trait::async_trait;
 
+/// The system principal agent ID string.  Used by internal infrastructure
+/// (schedules, cron) to access shared memory without per-key capability
+/// checks.  Corresponds to `shared_memory_agent_id()` in the kernel.
+pub const SYSTEM_AGENT_ID: &str = "00000000-0000-0000-0000-000000000001";
+
 /// Agent info returned by list and discovery operations.
 #[derive(Debug, Clone)]
 pub struct AgentInfo {
@@ -43,11 +48,48 @@ pub trait KernelHandle: Send + Sync {
     /// Kill an agent by ID.
     fn kill_agent(&self, agent_id: &str) -> Result<(), String>;
 
-    /// Store a value in shared memory (cross-agent accessible).
-    fn memory_store(&self, key: &str, value: serde_json::Value) -> Result<(), String>;
+    /// Store a value in memory.
+    ///
+    /// `agent_id` identifies the calling agent (used for capability checks and
+    /// namespace routing).  Keys prefixed with `self.` are stored in the
+    /// agent's private namespace; all other keys go to shared memory.
+    fn memory_store(
+        &self,
+        agent_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<(), String>;
 
-    /// Recall a value from shared memory.
-    fn memory_recall(&self, key: &str) -> Result<Option<serde_json::Value>, String>;
+    /// Recall a value from memory.
+    ///
+    /// Namespace routing follows the same `self.` convention as `memory_store`.
+    fn memory_recall(
+        &self,
+        agent_id: &str,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, String>;
+
+    /// List all keys in an agent's memory namespace.
+    ///
+    /// `namespace` selects which store to enumerate:
+    /// - `"self"` — the calling agent's private keys
+    /// - `"shared"` or `""` — the shared cross-agent store
+    fn memory_list(
+        &self,
+        agent_id: &str,
+        namespace: &str,
+    ) -> Result<Vec<(String, serde_json::Value)>, String> {
+        let _ = (agent_id, namespace);
+        Err("memory_list not implemented".to_string())
+    }
+
+    /// Delete a key from memory.
+    ///
+    /// Namespace routing follows the same `self.` convention as `memory_store`.
+    fn memory_delete(&self, agent_id: &str, key: &str) -> Result<(), String> {
+        let _ = (agent_id, key);
+        Err("memory_delete not implemented".to_string())
+    }
 
     /// Find agents by query (matches on name substring, tag, or tool name; case-insensitive).
     fn find_agents(&self, query: &str) -> Vec<AgentInfo>;

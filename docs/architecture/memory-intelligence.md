@@ -1,6 +1,6 @@
 # OpenFang Memory Intelligence Architecture
 
-**Date:** 2026-04-06
+**Date:** 2026-04-07
 **Branch:** `main` (Forgejo `rtr/openfang`)
 **Version:** 0.5.5
 
@@ -152,13 +152,58 @@ Agents are granted up to four memory tools depending on their manifest capabilit
 | `memory_store(key, value)` | **KV store** (`kv` table) | Write a structured key/value fact |
 | `memory_recall(key)` | **KV store** (`kv` table) | Read a specific key by name |
 | `memory_delete(key)` | **KV store** (`kv` table) | Remove a key |
-| `memory_list` | **KV store** (`kv` table) | Enumerate stored keys |
+| `memory_list(namespace)` | **KV store** (`kv` table) | Enumerate stored keys (`"self"` or `"shared"`) |
 
 **Critical distinction:** tool-driven memory targets the **KV store** (`structured_get` / `structured_set`), not the semantic store. The automatic pre-turn injection (Layer 1) targets the **semantic store** (HNSW/BM25). These are two completely separate SurrealDB tables with different access patterns. An agent can `memory_store` a fact via tool call and then see it surfaced automatically next turn via vector recall only if it was also written to the semantic store during the agent loop's write path — the KV store is not vectorised.
 
-Tool calls are capability-checked against `MemoryRead(key)` / `MemoryWrite(key)` before execution. Implementation lives in `crates/openfang-runtime/src/tool_runner.rs` -> `KernelHandle`.
+#### Namespace Routing
 
-Typical use: agents use `memory_store` to persist structured user preferences (`user_name`, `preferred_language`, etc.) that they want to look up by exact key in future sessions.
+Keys are routed to one of two SurrealDB partitions based on their prefix:
+
+| Key prefix | Storage partition | SurrealDB `agent_id` |
+|------------|-------------------|----------------------|
+| `self.*` | Agent's **private** namespace | Calling agent's `AgentId` |
+| `shared.*`, bare keys | **Shared** cross-agent namespace | Fixed `00000000-0000-0000-0000-000000000001` |
+
+This is handled by `resolve_memory_namespace(key, caller_id)` in `kernel.rs`. The shared namespace uses the same `AgentId` as `shared_memory_agent_id()` — the fixed UUID `[0..0, 0x01]` that also backs the shared KV namespace visible in `kernel.rs`.
+
+An agent with `memory_write = ["self.*"]` can store `self.user_name` (routed to its own partition) but **cannot** write `shared.config` or bare keys like `global_setting` — the capability check rejects the key before the write reaches SurrealDB.
+
+#### Capability Enforcement
+
+Every tool call passes through `KernelHandle` where the kernel enforces capabilities:
+
+```
+tool_runner.rs                          kernel.rs
+─────────────                           ──────────
+tool_memory_store(input, kernel, id)
+  → kernel.memory_store(agent_id, key, value)
+                                        1. Parse agent_id → AgentId
+                                        2. is_system_principal(caller)?
+                                           → yes: skip checks (internal infra)
+                                           → no: check MemoryWrite(key) capability
+                                              → denied: return Err
+                                        3. resolve_memory_namespace(key, caller)
+                                           → self.* → caller's AgentId
+                                           → other  → shared AgentId
+                                        4. memory.structured_set(storage_id, key, value)
+```
+
+Capabilities in `agent.toml` use glob-style matching:
+
+| Manifest pattern | Grants |
+|------------------|--------|
+| `memory_write = ["self.*"]` | Write to own namespace only |
+| `memory_write = ["*"]` | Write to any namespace |
+| `memory_read = ["self.*", "shared.config"]` | Read own keys + one specific shared key |
+
+The **system principal** (`SYSTEM_AGENT_ID = "00000000-0000-0000-0000-000000000001"`, defined in `kernel_handle.rs`) bypasses per-key capability checks entirely. Internal infrastructure — schedule tools, cron delivery — uses this identity to access shared state without requiring explicit capability grants.
+
+WASM agents go through the same enforcement path: `host_functions.rs` (`host_kv_get` / `host_kv_set`) passes the WASM agent's ID to the `KernelHandle` memory methods.
+
+Implementation: `crates/openfang-runtime/src/tool_runner.rs` (dispatch + tool definitions), `crates/openfang-kernel/src/kernel.rs` (`KernelHandle` impl, `resolve_memory_namespace`, `is_system_principal`).
+
+Typical use: agents use `memory_store` to persist structured user preferences (`self.user_name`, `self.preferred_language`, etc.) that they want to look up by exact key in future sessions.
 
 ### Layer 3 — Static Workspace Context Files (loaded at session build time)
 
@@ -344,8 +389,29 @@ OpenFangKernel
 |       zero-shot NLI: DistilBERT-MNLI classifies scope + category at write time
 |       falls back to rule-based when classifier = None or inference fails
 |
++- capabilities: CapabilityManager
+|       enforces MemoryRead / MemoryWrite per agent per key
+|       consulted by memory_store, memory_recall, memory_list, memory_delete
+|
 +- populate_knowledge_graph(agent_id, text, memory_id)
         called after agent loop returns (streaming: background spawn; non-streaming: inline)
+
+KernelHandle (trait, defined in openfang-runtime/src/kernel_handle.rs)
++- SYSTEM_AGENT_ID: &str = "00000000-0000-0000-0000-000000000001"
+|       system principal — bypasses per-key capability checks
+|
++- memory_store(agent_id, key, value)    capability-checked, namespace-routed
++- memory_recall(agent_id, key)          capability-checked, namespace-routed
++- memory_list(agent_id, namespace)       capability-checked, namespace = "self" | "shared"
++- memory_delete(agent_id, key)          capability-checked, namespace-routed
+
+Helper functions (kernel.rs, module-level):
++- resolve_memory_namespace(key, caller_id) -> AgentId
+|       "self.*" -> caller_id (private partition)
+|       anything else -> shared_memory_agent_id() (cross-agent partition)
+|
++- is_system_principal(id) -> bool
+        id == shared_memory_agent_id()
 ```
 
 All four Candle handles are `Option` — the system degrades gracefully if a model fails to load.
@@ -453,6 +519,7 @@ All four subsystems active on CPU. Verify via `/api/health/detail`.
 | 5 | Candle classification driver -- zero-shot NLI override at write time | Complete |
 | Backfill | CLI + API to re-enrich existing memories | Complete |
 | SurrealDB v3 | Upgrade from 2.6.5 to 3.0.5 -- DDL, SDK, type system | Complete |
+| Memory middleware | Capability enforcement, `self.*` namespace routing, `memory_list`/`memory_delete` tools, system principal, WASM alignment | Complete |
 
 ---
 
@@ -500,7 +567,7 @@ systemctl --user start openfang
 | Forgejo `rtr/openfang` (origin) | Source of truth -- `main` branch, deployed from |
 | GitHub `IMUR/openfang` (github) | Curated fork of upstream, comparison view |
 | GitHub `RightNow-AI/openfang` (upstream) | Upstream project |
-| Forgejo `rtr/candle-kernels` | Forked `candle-kernels` with pre-Volta CC guard |
+| Forgejo `rtr/candle-kernels` | Forked `candle-kernels` with pre-Volta CC guard (inactive — no longer referenced in `Cargo.toml`) |
 | Forgejo `rtr/viper` | Voice pipeline service code (STT + TTS apps, systemd units) |
 | `~/.openfang/config.toml` | Live daemon config |
 | `~/.openfang/data/openfang.db/` | SurrealKV 0.21.0 data (live) |

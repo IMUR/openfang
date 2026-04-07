@@ -6392,6 +6392,27 @@ pub fn shared_memory_agent_id() -> AgentId {
     ]))
 }
 
+/// Returns true if the caller is the system principal (shared memory agent),
+/// which bypasses per-key capability checks.  Internal infrastructure
+/// (schedules, cron delivery) uses this to access shared state directly.
+fn is_system_principal(id: AgentId) -> bool {
+    id == shared_memory_agent_id()
+}
+
+/// Route a memory key to the correct storage namespace.
+///
+/// Keys prefixed with `self.` are stored under the calling agent's own ID,
+/// giving each agent a private KV partition.  All other keys (including bare
+/// keys and `shared.*`) go to the fixed shared namespace for cross-agent
+/// coordination.
+fn resolve_memory_namespace(key: &str, caller_id: AgentId) -> AgentId {
+    if key.starts_with("self.") {
+        caller_id
+    } else {
+        shared_memory_agent_id()
+    }
+}
+
 /// Deliver a cron job's agent response to the configured delivery target.
 async fn cron_deliver_response(
     kernel: &OpenFangKernel,
@@ -6546,21 +6567,114 @@ impl KernelHandle for OpenFangKernel {
         OpenFangKernel::kill_agent(self, id).map_err(|e| format!("Kill failed: {e}"))
     }
 
-    fn memory_store(&self, key: &str, value: serde_json::Value) -> Result<(), String> {
-        let agent_id = shared_memory_agent_id();
+    fn memory_store(
+        &self,
+        agent_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<(), String> {
+        let caller_id: AgentId = agent_id
+            .parse()
+            .map_err(|_| format!("Invalid agent ID: {agent_id}"))?;
+
+        if !is_system_principal(caller_id) {
+            let check = self
+                .capabilities
+                .check(caller_id, &Capability::MemoryWrite(key.to_string()));
+            if !check.is_granted() {
+                return Err(format!("Memory write denied for key '{key}'"));
+            }
+        }
+
+        let storage_id = resolve_memory_namespace(key, caller_id);
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(self.memory.structured_set(agent_id, key, value))
+                .block_on(self.memory.structured_set(storage_id, key, value))
         })
         .map_err(|e| format!("Memory store failed: {e}"))
     }
 
-    fn memory_recall(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
-        let agent_id = shared_memory_agent_id();
+    fn memory_recall(
+        &self,
+        agent_id: &str,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let caller_id: AgentId = agent_id
+            .parse()
+            .map_err(|_| format!("Invalid agent ID: {agent_id}"))?;
+
+        if !is_system_principal(caller_id) {
+            let check = self
+                .capabilities
+                .check(caller_id, &Capability::MemoryRead(key.to_string()));
+            if !check.is_granted() {
+                return Err(format!("Memory read denied for key '{key}'"));
+            }
+        }
+
+        let storage_id = resolve_memory_namespace(key, caller_id);
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.memory.structured_get(agent_id, key))
+            tokio::runtime::Handle::current()
+                .block_on(self.memory.structured_get(storage_id, key))
         })
         .map_err(|e| format!("Memory recall failed: {e}"))
+    }
+
+    fn memory_list(
+        &self,
+        agent_id: &str,
+        namespace: &str,
+    ) -> Result<Vec<(String, serde_json::Value)>, String> {
+        let caller_id: AgentId = agent_id
+            .parse()
+            .map_err(|_| format!("Invalid agent ID: {agent_id}"))?;
+
+        let storage_id = match namespace {
+            "self" => caller_id,
+            _ => shared_memory_agent_id(),
+        };
+
+        if !is_system_principal(caller_id) {
+            let scope = if storage_id == caller_id {
+                "self.*"
+            } else {
+                "*"
+            };
+            let check = self
+                .capabilities
+                .check(caller_id, &Capability::MemoryRead(scope.to_string()));
+            if !check.is_granted() {
+                return Err(format!("Memory list denied for namespace '{namespace}'"));
+            }
+        }
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(self.memory.list_kv(storage_id))
+        })
+        .map_err(|e| format!("Memory list failed: {e}"))
+    }
+
+    fn memory_delete(&self, agent_id: &str, key: &str) -> Result<(), String> {
+        let caller_id: AgentId = agent_id
+            .parse()
+            .map_err(|_| format!("Invalid agent ID: {agent_id}"))?;
+
+        if !is_system_principal(caller_id) {
+            let check = self
+                .capabilities
+                .check(caller_id, &Capability::MemoryWrite(key.to_string()));
+            if !check.is_granted() {
+                return Err(format!("Memory delete denied for key '{key}'"));
+            }
+        }
+
+        let storage_id = resolve_memory_namespace(key, caller_id);
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(self.memory.structured_delete(storage_id, key))
+        })
+        .map_err(|e| format!("Memory delete failed: {e}"))
     }
 
     fn find_agents(&self, query: &str) -> Vec<kernel_handle::AgentInfo> {
@@ -7443,8 +7557,8 @@ mod tests {
             .any(|c| matches!(c, Capability::ToolInvoke(name) if name == "shell_exec")));
     }
 
-    #[test]
-    fn test_hand_activation_does_not_seed_runtime_tool_filters() {
+    #[tokio::test]
+    async fn test_hand_activation_does_not_seed_runtime_tool_filters() {
         let tmp = tempfile::tempdir().unwrap();
         let home_dir = tmp.path().join("openfang-kernel-hand-test");
         std::fs::create_dir_all(&home_dir).unwrap();
@@ -7455,7 +7569,9 @@ mod tests {
             ..KernelConfig::default()
         };
 
-        let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+        let kernel = OpenFangKernel::boot_with_config(config)
+            .await
+            .expect("Kernel should boot");
         let instance = kernel
             .activate_hand("browser", HashMap::new())
             .expect("browser hand should activate");
