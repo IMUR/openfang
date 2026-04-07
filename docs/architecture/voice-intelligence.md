@@ -306,20 +306,14 @@ All fields have defaults; only `enabled = true` is required to activate voice.
 vox.ism.la {
     encode zstd gzip
 
-    handle_path /stt/* {
-        reverse_proxy http://100.64.0.7:7733
-    }
-
-    handle_path /tts/* {
-        reverse_proxy http://100.64.0.7:7744
-    }
-
     reverse_proxy http://100.64.0.7:4477 {
         header_up Host {host}
         header_up X-Real-IP {remote_host}
     }
 }
 ```
+
+> **Note:** The `/stt/*` and `/tts/*` proxy rules previously pointed to prtr localhost services (7733/7744). Those services are retired — STT/TTS now run on drtr, accessed by OpenFang internally over Tailscale. The Caddy proxy only needs to forward to the OpenFang daemon on prtr:4477.
 
 ---
 
@@ -356,7 +350,7 @@ vox.ism.la {
 | ClauseBuffer (split on `,;:.!?\n—`, 30-char min) | Complete |
 | Markdown stripper (for TTS-safe text) | Complete |
 | VoiceSession state machine | Complete |
-| Barge-in via CancellationToken | Complete (client-initiated + VAD-initiated) |
+| Barge-in via CancellationToken | Working — client-side energy VAD + server CancellationToken + voice-client.js consolidation. Known remaining bugs under investigation. |
 | Non-blocking voice_task select! loop | Complete |
 | WS integration in `ws.rs` | Complete |
 | Voice mode context (`[VOICE MODE]` prefix) | Complete |

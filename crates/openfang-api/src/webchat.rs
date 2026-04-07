@@ -4,6 +4,11 @@
 //! HTML/CSS/JS files under `static/` using `include_str!()`. This keeps
 //! single-binary deployment while allowing organized source files.
 //!
+//! **Dev mode:** Set `OPENFANG_STATIC_DIR` env var to the path of the
+//! `static/` directory (e.g. `crates/openfang-api/static`) and files
+//! are served from disk on every request — no rebuild needed for JS/HTML
+//! changes. Unset or empty falls back to the compiled-in version.
+//!
 //! Features:
 //! - Alpine.js SPA with hash-based routing (10 panels)
 //! - Dark/light theme toggle with system preference detection
@@ -14,6 +19,20 @@
 
 use axum::http::header;
 use axum::response::IntoResponse;
+
+/// Check if dev-mode static serving is enabled.
+fn static_dir() -> Option<std::path::PathBuf> {
+    std::env::var("OPENFANG_STATIC_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// Read a file from the static dir if dev mode is active.
+fn read_static(relative: &str) -> Option<String> {
+    let dir = static_dir()?;
+    std::fs::read_to_string(dir.join(relative)).ok()
+}
 
 /// Nonce placeholder in compile-time HTML, replaced at request time.
 const NONCE_PLACEHOLDER: &str = "__NONCE__";
@@ -80,17 +99,34 @@ pub async fn sw_js() -> impl IntoResponse {
     )
 }
 
-/// Embedded voice chat HTML.
+/// Embedded voice chat HTML (compile-time fallback).
 const VOICE_HTML: &str = include_str!("../static/voice.html");
 
 /// GET /voice — Serve the OpenFang Voice chat page.
+/// In dev mode (OPENFANG_STATIC_DIR set), reads from disk for hot-reload.
 pub async fn voice_page() -> impl IntoResponse {
+    let html = read_static("voice.html")
+        .unwrap_or_else(|| VOICE_HTML.to_string());
     (
         [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
         ],
-        VOICE_HTML,
+        html,
+    )
+}
+
+/// GET /voice-client.js — Serve the shared voice client module.
+/// This file is loaded by both voice.html and the dashboard.
+pub async fn voice_client_js() -> impl IntoResponse {
+    let js = read_static("js/voice-client.js")
+        .unwrap_or_else(|| "/* voice-client.js not found */".to_string());
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript".to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        js,
     )
 }
 

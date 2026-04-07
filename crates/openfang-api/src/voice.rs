@@ -394,12 +394,12 @@ impl VoiceSession {
     /// Process incoming decoded PCM audio. Returns a `VoiceAction` indicating
     /// whether to keep listening or trigger transcription.
     pub fn handle_audio(&mut self, pcm: &[i16]) -> VoiceAction {
-        // Barge-in: if we're in Speaking state and detect speech, interrupt
+        // During Speaking state, don't run VAD on incoming audio.
+        // Server-side VAD during TTS playback causes false barge-ins from
+        // mic bleed or ambient noise, killing TTS mid-response.
+        // Barge-in is handled client-side: the client detects user speech
+        // and sends 0x40 Interrupt explicitly.
         if self.state == VoiceSessionState::Speaking {
-            let is_speech = self.detect_speech(pcm);
-            if is_speech {
-                return VoiceAction::BargeIn;
-            }
             return VoiceAction::Continue;
         }
 

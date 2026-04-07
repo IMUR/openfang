@@ -1253,9 +1253,33 @@ function chatPage() {
 
         var source = self._audioCtx.createMediaStreamSource(self._mediaStream);
         self._processorNode = self._audioCtx.createScriptProcessor(512, 1, 1);
+        self._bargeInCooldown = false;
         self._processorNode.onaudioprocess = function(e) {
-          if (!self.voiceActive || self._ttsPlaying) return;
+          if (!self.voiceActive) return;
           var float32 = e.inputBuffer.getChannelData(0);
+
+          // Client-side barge-in: detect speech energy during TTS playback
+          if (self._ttsPlaying && !self._bargeInCooldown) {
+            var energy = 0;
+            for (var j = 0; j < float32.length; j++) energy += float32[j] * float32[j];
+            energy = Math.sqrt(energy / float32.length);
+            // Log energy periodically for debugging (every ~1s = every 31 frames at 512 samples/16kHz)
+            if (!self._energyLogCounter) self._energyLogCounter = 0;
+            if (++self._energyLogCounter % 31 === 0) {
+              console.log('[barge-in] energy:', energy.toFixed(4), 'ttsPlaying:', self._ttsPlaying, 'cooldown:', self._bargeInCooldown);
+            }
+            if (energy > 0.008) { // lowered from 0.02 — earbuds produce lower RMS
+              self._bargeInCooldown = true;
+              setTimeout(function() { self._bargeInCooldown = false; }, 2000);
+              self.voiceTranscript = 'Interrupting...';
+              self._stopPlayback();
+              var interruptFrame = new Uint8Array([0x40]);
+              OpenFangAPI.wsSendBinary(interruptFrame.buffer);
+              return;
+            }
+            return; // don't send mic audio to server during TTS (prevents ghost messages)
+          }
+
           var pcm = new Int16Array(float32.length);
           for (var i = 0; i < float32.length; i++) {
             var s = Math.max(-1, Math.min(1, float32[i]));
@@ -1320,8 +1344,10 @@ function chatPage() {
         case 0x10: // SpeechStart — agent TTS begins
           this._ttsPlaying = true;
           break;
-        case 0x11: // SpeechEnd — stop all audio immediately
-          this._stopPlayback();
+        case 0x11: // SpeechEnd — no more audio coming, let current chunk finish
+          // Don't call _stopPlayback() — that kills the active buffer mid-play.
+          // Let drainPlayQueue() finish naturally. Only _stopPlayback() on 0x40 interrupt.
+          this._ttsPlaying = false;
           break;
         case 0x21: // SessionAck
           try {
@@ -1337,9 +1363,7 @@ function chatPage() {
             this.voiceTranscript = 'Interrupting...';
             this._stopPlayback();
             var interruptFrame = new Uint8Array([0x40]);
-            if (this._voiceWs && this._voiceWs.readyState === WebSocket.OPEN) {
-              this._voiceWs.send(interruptFrame.buffer);
-            }
+            OpenFangAPI.wsSendBinary(interruptFrame.buffer);
           }
           break;
         case 0x31: // VadSpeechEnd

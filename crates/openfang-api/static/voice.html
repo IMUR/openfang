@@ -67,40 +67,29 @@
 
 <div class="status-bar" id="statusBar">Select an agent and enter your API token</div>
 
+<script src="/voice-client.js"></script>
 <script>
 (function() {
-  // --- Config ---
-  const SAMPLE_RATE = 16000;
-  const FRAME_MS = 20;
-  const FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS / 1000; // 320
-
   // --- DOM ---
-  const agentSel   = document.getElementById('agentSelect');
-  const tokenInput = document.getElementById('tokenInput');
-  const callBtn    = document.getElementById('callBtn');
-  const muteBtn    = document.getElementById('muteBtn');
-  const transcript = document.getElementById('transcript');
-  const statusDot  = document.getElementById('statusDot');
-  const stateLabel = document.getElementById('stateLabel');
-  const statusBar  = document.getElementById('statusBar');
-  const configBar  = document.getElementById('configBar');
+  var agentSel   = document.getElementById('agentSelect');
+  var tokenInput = document.getElementById('tokenInput');
+  var callBtn    = document.getElementById('callBtn');
+  var muteBtn    = document.getElementById('muteBtn');
+  var transcriptEl = document.getElementById('transcript');
+  var statusDot  = document.getElementById('statusDot');
+  var stateLabel = document.getElementById('stateLabel');
+  var statusBar  = document.getElementById('statusBar');
+  var configBar  = document.getElementById('configBar');
 
   // --- State ---
-  let ws = null;
-  let audioCtx = null;
-  let mediaStream = null;
-  let processorNode = null;
-  let connected = false;
-  let muted = false;
-  let currentText = '';
+  var ws = null;
+  var vc = null; // VoiceClient instance
+  var connected = false;
+  var currentText = '';
 
   // --- Helpers ---
-  function baseUrl() {
-    return window.location.origin;
-  }
-
   function wsUrl(agentId, token) {
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     return proto + '//' + location.host + '/api/agents/' + agentId + '/ws?token=' + encodeURIComponent(token);
   }
 
@@ -110,12 +99,11 @@
   }
 
   function addMsg(role, text) {
-    const div = document.createElement('div');
+    var div = document.createElement('div');
     div.className = 'msg ' + role;
     div.textContent = text;
-    transcript.appendChild(div);
-    transcript.scrollTop = transcript.scrollHeight;
-    return div;
+    transcriptEl.appendChild(div);
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
   }
 
   function status(msg) { statusBar.textContent = msg; }
@@ -123,15 +111,15 @@
   // --- Load agents ---
   async function loadAgents() {
     try {
-      const resp = await fetch(baseUrl() + '/api/agents');
-      const agents = await resp.json();
+      var resp = await fetch(window.location.origin + '/api/agents');
+      var agents = await resp.json();
       agentSel.innerHTML = '';
       if (!agents.length) {
         agentSel.innerHTML = '<option value="">No agents found</option>';
         return;
       }
       agents.forEach(function(a) {
-        const opt = document.createElement('option');
+        var opt = document.createElement('option');
         opt.value = a.id;
         opt.textContent = a.name || a.id;
         agentSel.appendChild(opt);
@@ -141,89 +129,7 @@
     }
   }
 
-  // --- Audio capture ---
-  async function startCapture() {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
-
-    // On iOS Safari, AudioContext may start suspended
-    if (audioCtx.state === 'suspended') {
-      await audioCtx.resume();
-    }
-
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: { sampleRate: SAMPLE_RATE, channelCount: 1, echoCancellation: true, noiseSuppression: true }
-    });
-
-    const source = audioCtx.createMediaStreamSource(mediaStream);
-
-    // ScriptProcessorNode (deprecated but universally supported including iOS Safari)
-    processorNode = audioCtx.createScriptProcessor(FRAME_SAMPLES, 1, 1);
-    processorNode.onaudioprocess = function(e) {
-      if (!connected || muted) return;
-      const float32 = e.inputBuffer.getChannelData(0);
-      // Convert float32 [-1,1] to int16 PCM
-      const pcm = new Int16Array(float32.length);
-      for (var i = 0; i < float32.length; i++) {
-        var s = Math.max(-1, Math.min(1, float32[i]));
-        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-      }
-      // Send as binary: [0x01] + PCM16 LE bytes
-      var frame = new Uint8Array(1 + pcm.byteLength);
-      frame[0] = 0x01;
-      frame.set(new Uint8Array(pcm.buffer), 1);
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(frame.buffer);
-      }
-    };
-
-    source.connect(processorNode);
-    processorNode.connect(audioCtx.destination); // required for onaudioprocess to fire
-  }
-
-  function stopCapture() {
-    if (processorNode) { processorNode.disconnect(); processorNode = null; }
-    if (mediaStream) { mediaStream.getTracks().forEach(function(t) { t.stop(); }); mediaStream = null; }
-    if (audioCtx) { audioCtx.close(); audioCtx = null; }
-  }
-
-  // --- Audio playback ---
-  let playQueue = [];
-  let playing = false;
-  let activeSource = null; // currently playing AudioBufferSourceNode
-
-  function queuePlayback(pcmInt16) {
-    playQueue.push(pcmInt16);
-    if (!playing) drainPlayQueue();
-  }
-
-  function stopPlayback() {
-    playQueue = [];
-    playing = false;
-    if (activeSource) {
-      try { activeSource.onended = null; activeSource.stop(); } catch(e) {}
-      activeSource = null;
-    }
-  }
-
-  function drainPlayQueue() {
-    if (!playQueue.length || !audioCtx) { playing = false; activeSource = null; return; }
-    playing = true;
-    var pcm = playQueue.shift();
-    var float32 = new Float32Array(pcm.length);
-    for (var i = 0; i < pcm.length; i++) {
-      float32[i] = pcm[i] / 32768.0;
-    }
-    var buf = audioCtx.createBuffer(1, float32.length, SAMPLE_RATE);
-    buf.getChannelData(0).set(float32);
-    var src = audioCtx.createBufferSource();
-    src.buffer = buf;
-    src.connect(audioCtx.destination);
-    src.onended = drainPlayQueue;
-    activeSource = src;
-    src.start();
-  }
-
-  // --- WebSocket ---
+  // --- Connect ---
   function connect() {
     var agentId = agentSel.value;
     var token = tokenInput.value.trim();
@@ -234,138 +140,93 @@
     ws = new WebSocket(wsUrl(agentId, token));
     ws.binaryType = 'arraybuffer';
 
-    ws.onopen = async function() {
+    ws.onopen = function() {
       connected = true;
-      setState('connected');
       configBar.style.display = 'none';
       muteBtn.style.display = '';
       callBtn.classList.add('active');
       status('Connected — speak to begin');
       addMsg('system', 'Connected to ' + agentSel.options[agentSel.selectedIndex].text);
 
-      try {
-        await startCapture();
-      } catch(e) {
+      // Create VoiceClient with this WS
+      vc = new VoiceClient({
+        ws: ws,
+        bargeInThreshold: 0.008,
+        bargeInCooldownMs: 2000,
+        onStateChange: function(state) {
+          setState(state);
+        },
+        onSystemMessage: function(msg) {
+          addMsg('system', msg);
+        },
+        onSessionAck: function(ack) {
+          addMsg('system', 'Voice session: ' + ack.session_id.slice(0, 8) + '...');
+        },
+        onError: function(msg) {
+          addMsg('system', 'Error: ' + msg);
+          status('Error: ' + msg);
+        },
+      });
+
+      vc.start().catch(function(e) {
         status('Microphone error: ' + e.message);
         disconnect();
-        return;
-      }
-
-      // Send SessionInit (PCM16 mode)
-      var init = JSON.stringify({ sample_rate: SAMPLE_RATE, codec: 'pcm16', channels: 1 });
-      var initBytes = new TextEncoder().encode(init);
-      var frame = new Uint8Array(1 + initBytes.length);
-      frame[0] = 0x20;
-      frame.set(initBytes, 1);
-      ws.send(frame.buffer);
+      });
     };
 
     ws.onmessage = function(event) {
       if (typeof event.data === 'string') {
-        // JSON text message
         try {
           var msg = JSON.parse(event.data);
-          handleJsonMessage(msg);
+          switch (msg.type) {
+            case 'voice_transcript':
+              addMsg('user', msg.content);
+              break;
+            case 'text_delta':
+              currentText += msg.content;
+              break;
+            case 'voice_status':
+              addMsg('system', msg.text);
+              break;
+            case 'response':
+              if (currentText.trim()) {
+                addMsg('assistant', currentText.trim());
+                currentText = '';
+              }
+              break;
+            case 'error':
+              addMsg('system', 'Error: ' + msg.content);
+              break;
+          }
         } catch(e) {}
         return;
       }
 
-      // Binary frame
-      var data = new Uint8Array(event.data);
-      if (data.length < 1) return;
-      var type = data[0];
-      var payload = data.slice(1);
-
-      switch (type) {
-        case 0x02: // AudioDataOut — PCM16 LE
-          var pcm = new Int16Array(payload.buffer, payload.byteOffset, payload.byteLength / 2);
-          queuePlayback(pcm);
-          break;
-        case 0x10: // SpeechStart
-          setState('speaking');
-          currentText = '';
-          break;
-        case 0x11: // SpeechEnd — stop all audio immediately
-          stopPlayback();
-          setState('connected');
-          if (currentText.trim()) {
-            addMsg('assistant', currentText.trim());
-            currentText = '';
-          }
-          break;
-        case 0x21: // SessionAck
-          try {
-            var ack = JSON.parse(new TextDecoder().decode(payload));
-            addMsg('system', 'Voice session: ' + ack.session_id.slice(0, 8) + '...');
-          } catch(e) {}
-          break;
-        case 0x30: // VadSpeechStart
-          addMsg('system', 'Listening...');
-          // Barge-in: if bot is speaking when user starts talking, interrupt
-          if (stateLabel.textContent === 'speaking') {
-            addMsg('system', 'Interrupting...');
-            stopPlayback();
-            // Send 0x40 Interrupt to server
-            var interruptFrame = new Uint8Array([0x40]);
-            if (ws && ws.readyState === WebSocket.OPEN) {
-              ws.send(interruptFrame.buffer);
-            }
-            setState('connected');
-          }
-          break;
-        case 0x31: // VadSpeechEnd
-          addMsg('system', 'Transcribing...');
-          break;
-        case 0xF0: // Error
-          var errMsg = new TextDecoder().decode(payload);
-          addMsg('system', 'Error: ' + errMsg);
-          status('Error: ' + errMsg);
-          break;
-      }
+      // Binary frame — delegate to VoiceClient
+      if (vc) vc.handleBinaryFrame(event.data);
     };
 
     ws.onclose = function() {
       connected = false;
-      stopCapture();
+      if (vc) { vc.stop(); vc = null; }
       setState('disconnected');
       callBtn.classList.remove('active');
       muteBtn.style.display = 'none';
       configBar.style.display = '';
       status('Disconnected');
-      stopPlayback();
     };
 
-    ws.onerror = function() {
-      status('Connection error');
-    };
+    ws.onerror = function() { status('Connection error'); };
   }
 
   function disconnect() {
+    if (vc) { vc.stop(); vc = null; }
     if (ws) { ws.close(); ws = null; }
-    stopCapture();
     connected = false;
     setState('disconnected');
     callBtn.classList.remove('active');
     muteBtn.style.display = 'none';
     configBar.style.display = '';
-    stopPlayback();
-  }
-
-  function handleJsonMessage(msg) {
-    switch (msg.type) {
-      case 'voice_transcript':
-        addMsg('user', msg.content);
-        break;
-      case 'text_delta':
-        currentText += msg.content;
-        break;
-      case 'voice_status':
-        addMsg('system', msg.text);
-        break;
-      case 'error':
-        addMsg('system', 'Error: ' + msg.content);
-        break;
-    }
   }
 
   // --- Button handlers ---
@@ -374,18 +235,19 @@
   });
 
   muteBtn.addEventListener('click', function() {
-    muted = !muted;
-    muteBtn.classList.toggle('muted', muted);
-    addMsg('system', muted ? 'Muted' : 'Unmuted');
+    if (vc) {
+      if (vc.isMuted()) { vc.unmute(); } else { vc.mute(); }
+      muteBtn.classList.toggle('muted', vc.isMuted());
+      addMsg('system', vc.isMuted() ? 'Muted' : 'Unmuted');
+    }
   });
 
-  // Persist token in sessionStorage
+  // Persist token
   tokenInput.value = sessionStorage.getItem('vox_token') || '';
   tokenInput.addEventListener('change', function() {
     sessionStorage.setItem('vox_token', tokenInput.value);
   });
 
-  // Init
   loadAgents();
 })();
 </script>
