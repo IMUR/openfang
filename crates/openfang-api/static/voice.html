@@ -281,6 +281,11 @@
             currentText = '';
           }
           break;
+        case 0x40: // Interrupt confirmation from server (barge-in acknowledged)
+          setState('connected');
+          playQueue = [];
+          playing = false;
+          break;
         case 0x21: // SessionAck
           try {
             var ack = JSON.parse(new TextDecoder().decode(payload));
@@ -289,6 +294,19 @@
           break;
         case 0x30: // VadSpeechStart
           addMsg('system', 'Listening...');
+          // Barge-in: if bot is speaking when user starts talking, interrupt
+          if (stateLabel.textContent === 'speaking') {
+            addMsg('system', 'Interrupting...');
+            // Send 0x40 Interrupt to server
+            var interruptFrame = new Uint8Array([0x40]);
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(interruptFrame.buffer);
+            }
+            // Flush client-side audio queue immediately
+            playQueue = [];
+            playing = false;
+            setState('connected');
+          }
           break;
         case 0x31: // VadSpeechEnd
           addMsg('system', 'Transcribing...');

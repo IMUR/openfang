@@ -206,13 +206,17 @@ Implemented in `crates/openfang-api/src/vad.rs`. Loads `idle-intelligence/silero
 
 ### Barge-in (Interrupt)
 
-Real barge-in implemented via `tokio_util::sync::CancellationToken`:
+Real barge-in implemented via `tokio_util::sync::CancellationToken` with both client-side and server-side paths:
 
-1. **Client-initiated (0x40 Interrupt):** WS handler cancels the `CancellationToken`, aborts the `voice_task` JoinHandle, sends SpeechEnd (0x11), resets session.
+1. **Client-side barge-in (primary path):** When the client receives VadSpeechStart (0x30) while in `speaking` state (bot is talking), it immediately sends an Interrupt frame (0x40) to the server and flushes its local audio playback queue. This is the most reliable path because it doesn't depend on the server detecting speech through the WS audio stream. Implemented in both `voice.html` (standalone) and `chat.js` (dashboard).
 
-2. **VAD-initiated (automatic):** When `handle_audio()` detects speech during `Speaking` state, returns `VoiceAction::BargeIn`. WS handler cancels TTS, resets, and begins listening for the new utterance.
+2. **Server-side client interrupt (0x40):** WS handler cancels the `CancellationToken`, aborts the `voice_task` JoinHandle, sends SpeechEnd (0x11), resets session.
 
-3. **Non-blocking select! loop:** The voice_task is spawned but NOT awaited inline. The main WS `select!` loop polls both the receiver and the voice_task, allowing Interrupt messages to be processed while TTS is streaming. Previous implementation blocked the message loop during TTS.
+3. **Server-side VAD-initiated (automatic):** When `handle_audio()` detects speech during `Speaking` state, returns `VoiceAction::BargeIn`. WS handler cancels TTS, sends SpeechEnd, resets, and begins listening for the new utterance.
+
+4. **Non-blocking select! loop:** The voice_task is spawned but NOT awaited inline. The main WS `select!` loop polls both the receiver and the voice_task, allowing Interrupt messages to be processed while TTS is streaming. Previous implementation blocked the message loop during TTS.
+
+**Client-side audio queue flush:** On receiving SpeechEnd (0x11) or Interrupt confirmation (0x40) from the server, the client clears its `playQueue` and stops playback immediately. This prevents buffered audio from continuing to play after the interrupt.
 
 ### Clause-Level TTS Chunking
 
@@ -388,3 +392,4 @@ vox.ism.la {
 - **2026-04-07:** Phase 3 — ClauseBuffer replaces SentenceBuffer (splits on `,;:.!?\n—`, 30-char min)
 - **2026-04-07:** Phase 3 — Rubato sinc resampler replaces linear interpolation (24→16kHz)
 - **2026-04-07:** Phase 4 — Voice cloning: tts_voice_clone_ref config, SessionInit extension, TtsClient base64 encoding
+- **2026-04-07:** Client-side barge-in: voice.html + chat.js send 0x40 Interrupt when VadSpeechStart arrives during speaking state, flush audio queue

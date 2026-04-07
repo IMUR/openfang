@@ -1323,6 +1323,11 @@ function chatPage() {
         case 0x11: // SpeechEnd — agent TTS finished
           this._ttsPlaying = false;
           break;
+        case 0x40: // Interrupt confirmation (barge-in acknowledged)
+          this._ttsPlaying = false;
+          this._playQueue = [];
+          this._playing = false;
+          break;
         case 0x21: // SessionAck
           try {
             var ack = JSON.parse(new TextDecoder().decode(payload));
@@ -1332,6 +1337,17 @@ function chatPage() {
           break;
         case 0x30: // VadSpeechStart
           this.voiceTranscript = 'Listening...';
+          // Barge-in: if bot is speaking when user starts talking, interrupt
+          if (this._ttsPlaying) {
+            this.voiceTranscript = 'Interrupting...';
+            var interruptFrame = new Uint8Array([0x40]);
+            if (this._voiceWs && this._voiceWs.readyState === WebSocket.OPEN) {
+              this._voiceWs.send(interruptFrame.buffer);
+            }
+            this._playQueue = [];
+            this._playing = false;
+            this._ttsPlaying = false;
+          }
           break;
         case 0x31: // VadSpeechEnd
           this.voiceTranscript = 'Transcribing...';
