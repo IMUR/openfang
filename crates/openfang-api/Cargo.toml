@@ -7,7 +7,7 @@ description = "HTTP/WebSocket API server for the OpenFang Agent OS daemon"
 
 [features]
 default = []
-memory-candle = ["openfang-kernel/memory-candle"]
+memory-candle = ["openfang-kernel/memory-candle", "openfang-runtime/memory-candle"]
 
 [dependencies]
 openfang-types = { path = "../openfang-types" }
@@ -45,9 +45,6 @@ socket2 = { workspace = true }
 reqwest = { workspace = true }
 opus-rs = { workspace = true }
 rubato = { workspace = true }
-candle-core = { workspace = true }
-candle-nn = { workspace = true }
-hf-hub = { workspace = true }
 argon2 = { workspace = true }
 rand = { workspace = true }
 

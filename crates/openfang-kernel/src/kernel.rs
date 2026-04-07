@@ -125,6 +125,9 @@ pub struct OpenFangKernel {
     /// Zero-shot NLI memory classifier (None = use rule-based fallback).
     #[cfg(feature = "memory-candle")]
     pub classifier: Option<Arc<openfang_runtime::candle_classifier::CandleClassifier>>,
+    /// Silero VAD v5 driver for neural voice activity detection (None = energy-based fallback).
+    #[cfg(feature = "memory-candle")]
+    pub vad_driver: Option<Arc<openfang_runtime::candle_vad::SileroVad>>,
     /// Hand registry — curated autonomous capability packages.
     pub hand_registry: openfang_hands::registry::HandRegistry,
     /// Credential resolver — vault → dotenv → env var priority chain.
@@ -1004,12 +1007,12 @@ impl OpenFangKernel {
 
         // Candle NER / reranker / classifier: independent of embedding provider when backend = "candle".
         #[cfg(feature = "memory-candle")]
-        let (candle_ner, candle_reranker, candle_classifier) = {
+        let (candle_ner, candle_reranker, candle_classifier, candle_vad) = {
             let want_ner = config.memory.wants_candle_ner();
             let want_rerank = config.memory.wants_candle_reranker();
             let want_classify = config.memory.wants_candle_classification();
-            if !want_ner && !want_rerank && !want_classify {
-                (None, None, None)
+            if !want_ner && !want_rerank && !want_classify && !config.voice.enabled {
+                (None, None, None, None)
             } else {
                 let cuda = config.memory.cuda_device;
                 let home = config.home_dir.clone();
@@ -1102,7 +1105,23 @@ impl OpenFangKernel {
                     None
                 };
 
-                (ner, reranker, classifier)
+                // Silero VAD v5: load for voice activity detection (CPU, ~1.2MB)
+                let vad = if config.voice.enabled {
+                    match openfang_runtime::candle_vad::SileroVad::load().await {
+                        Ok(v) => {
+                            info!("Silero VAD v5 loaded — neural voice activity detection active");
+                            Some(Arc::new(v))
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Silero VAD failed to load — using energy-based VAD fallback");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                (ner, reranker, classifier, vad)
             }
         };
 
@@ -1175,6 +1194,8 @@ impl OpenFangKernel {
             reranker: candle_reranker,
             #[cfg(feature = "memory-candle")]
             classifier: candle_classifier,
+            #[cfg(feature = "memory-candle")]
+            vad_driver: candle_vad,
             hand_registry,
             credential_resolver: std::sync::Mutex::new(credential_resolver),
             extension_registry: std::sync::RwLock::new(extension_registry),

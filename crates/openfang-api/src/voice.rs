@@ -20,7 +20,6 @@
 //! | 0x40   | Interrupt      | client→server   | empty                              |
 //! | 0xF0   | Error          | server→client   | UTF-8 error string                 |
 
-use crate::vad::SileroVad;
 use openfang_types::config::VoiceConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -306,7 +305,9 @@ pub struct VoiceSession {
     /// Sentence buffer for TTS output.
     pub sentence_buffer: SentenceBuffer,
     /// Neural VAD (Silero v5 via Candle). None = fallback to energy-based.
-    silero_vad: Option<SileroVad>,
+    /// Injected at creation from the kernel's boot-time loaded driver.
+    #[cfg(feature = "memory-candle")]
+    silero_vad: Option<std::sync::Arc<openfang_runtime::candle_vad::SileroVad>>,
     /// Accumulates PCM for Silero VAD (needs 512-sample chunks).
     vad_accumulator: Vec<i16>,
     /// Last Silero VAD probability (for smooth state transitions).
@@ -315,7 +316,15 @@ pub struct VoiceSession {
 
 impl VoiceSession {
     /// Create a new voice session from a SessionInit payload and config.
-    pub fn new(init: SessionInitPayload, config: VoiceConfig) -> Result<Self, String> {
+    ///
+    /// `vad_driver`: pre-loaded Silero VAD from the kernel (None = energy-based fallback).
+    /// When built without `memory-candle`, this parameter is not present.
+    pub fn new(
+        init: SessionInitPayload,
+        config: VoiceConfig,
+        #[cfg(feature = "memory-candle")]
+        vad_driver: Option<std::sync::Arc<openfang_runtime::candle_vad::SileroVad>>,
+    ) -> Result<Self, String> {
         let opus = if init.codec == "pcm16" {
             None
         } else {
@@ -324,17 +333,12 @@ impl VoiceSession {
 
         let min_chunk_chars = config.tts_min_chunk_chars;
 
-        // Try to load Silero VAD; fall back to energy-based on failure
-        let silero_vad = match SileroVad::from_hub() {
-            Ok(vad) => {
-                info!("Silero VAD v5 loaded (candle, CPU)");
-                Some(vad)
-            }
-            Err(e) => {
-                warn!("Silero VAD load failed, using energy-based VAD: {e}");
-                None
-            }
-        };
+        #[cfg(feature = "memory-candle")]
+        if vad_driver.is_some() {
+            info!("Voice session using Silero VAD v5 (candle, CPU)");
+        } else {
+            warn!("Voice session using energy-based VAD (Silero unavailable)");
+        }
 
         Ok(Self {
             session_id: Uuid::new_v4().to_string(),
@@ -346,7 +350,8 @@ impl VoiceSession {
             silence_frames: 0,
             speech_detected: false,
             sentence_buffer: SentenceBuffer::with_min_chars(min_chunk_chars),
-            silero_vad,
+            #[cfg(feature = "memory-candle")]
+            silero_vad: vad_driver,
             vad_accumulator: Vec::with_capacity(512),
             last_vad_prob: 0.0,
         })
@@ -448,7 +453,8 @@ impl VoiceSession {
 
     /// Detect speech using Silero VAD (neural) or energy-based (fallback).
     fn detect_speech(&mut self, pcm: &[i16]) -> bool {
-        if let Some(ref mut vad) = self.silero_vad {
+        #[cfg(feature = "memory-candle")]
+        if let Some(ref vad) = self.silero_vad {
             // Accumulate samples for Silero (needs 512-sample chunks)
             self.vad_accumulator.extend_from_slice(pcm);
             while self.vad_accumulator.len() >= 512 {
@@ -457,16 +463,15 @@ impl VoiceSession {
                     Ok(prob) => self.last_vad_prob = prob,
                     Err(e) => {
                         warn!("Silero VAD error: {e}");
-                        // Fall through to energy-based
                         return self.detect_speech_energy(pcm);
                     }
                 }
             }
             let threshold = self.config.vad_speech_threshold;
-            self.last_vad_prob > threshold
-        } else {
-            self.detect_speech_energy(pcm)
+            return self.last_vad_prob > threshold;
         }
+
+        self.detect_speech_energy(pcm)
     }
 
     /// Energy-based speech detection (fallback when Silero unavailable).
@@ -488,7 +493,8 @@ impl VoiceSession {
         self.sentence_buffer = SentenceBuffer::new();
         self.vad_accumulator.clear();
         self.last_vad_prob = 0.0;
-        if let Some(ref mut vad) = self.silero_vad {
+        #[cfg(feature = "memory-candle")]
+        if let Some(ref vad) = self.silero_vad {
             vad.reset();
         }
     }
@@ -1220,7 +1226,12 @@ mod tests {
     #[test]
     fn test_voice_session_new() {
         let session =
-            VoiceSession::new(SessionInitPayload::default(), VoiceConfig::default()).unwrap();
+            VoiceSession::new(
+                SessionInitPayload::default(),
+                VoiceConfig::default(),
+                #[cfg(feature = "memory-candle")]
+                None,
+            ).unwrap();
         assert_eq!(session.state, VoiceSessionState::Idle);
         assert!(!session.session_id.is_empty());
         assert_eq!(session.init.sample_rate, 16000);
@@ -1362,7 +1373,12 @@ mod tests {
     #[test]
     fn test_vad_silence_ignored() {
         let mut session =
-            VoiceSession::new(SessionInitPayload::default(), VoiceConfig::default()).unwrap();
+            VoiceSession::new(
+                SessionInitPayload::default(),
+                VoiceConfig::default(),
+                #[cfg(feature = "memory-candle")]
+                None,
+            ).unwrap();
         let silence = vec![0i16; OPUS_FRAME_SAMPLES];
         match session.handle_audio(&silence) {
             VoiceAction::Continue => {} // expected
@@ -1377,7 +1393,12 @@ mod tests {
         config.vad_silence_ms = 40; // 2 frames of silence at 20ms each
         config.vad_energy_threshold = 0.001;
         let mut session =
-            VoiceSession::new(SessionInitPayload::default(), config).unwrap();
+            VoiceSession::new(
+                SessionInitPayload::default(),
+                config,
+                #[cfg(feature = "memory-candle")]
+                None,
+            ).unwrap();
 
         // Send loud audio (speech) — first frame returns SpeechStarted
         let speech: Vec<i16> = (0..OPUS_FRAME_SAMPLES).map(|i| ((i % 50) as i16 * 500)).collect();
@@ -1403,7 +1424,12 @@ mod tests {
     #[test]
     fn test_vad_reset_to_idle() {
         let mut session =
-            VoiceSession::new(SessionInitPayload::default(), VoiceConfig::default()).unwrap();
+            VoiceSession::new(
+                SessionInitPayload::default(),
+                VoiceConfig::default(),
+                #[cfg(feature = "memory-candle")]
+                None,
+            ).unwrap();
         session.state = VoiceSessionState::Speaking;
         session.pcm_buffer.extend_from_slice(&[1, 2, 3]);
         session.reset_to_idle();

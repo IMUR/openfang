@@ -1320,13 +1320,8 @@ function chatPage() {
         case 0x10: // SpeechStart — agent TTS begins
           this._ttsPlaying = true;
           break;
-        case 0x11: // SpeechEnd — agent TTS finished
-          this._ttsPlaying = false;
-          break;
-        case 0x40: // Interrupt confirmation (barge-in acknowledged)
-          this._ttsPlaying = false;
-          this._playQueue = [];
-          this._playing = false;
+        case 0x11: // SpeechEnd — stop all audio immediately
+          this._stopPlayback();
           break;
         case 0x21: // SessionAck
           try {
@@ -1340,13 +1335,11 @@ function chatPage() {
           // Barge-in: if bot is speaking when user starts talking, interrupt
           if (this._ttsPlaying) {
             this.voiceTranscript = 'Interrupting...';
+            this._stopPlayback();
             var interruptFrame = new Uint8Array([0x40]);
             if (this._voiceWs && this._voiceWs.readyState === WebSocket.OPEN) {
               this._voiceWs.send(interruptFrame.buffer);
             }
-            this._playQueue = [];
-            this._playing = false;
-            this._ttsPlaying = false;
           }
           break;
         case 0x31: // VadSpeechEnd
@@ -1360,8 +1353,18 @@ function chatPage() {
       }
     },
 
+    _stopPlayback: function() {
+      this._playQueue = [];
+      this._playing = false;
+      this._ttsPlaying = false;
+      if (this._activeSource) {
+        try { this._activeSource.onended = null; this._activeSource.stop(); } catch(e) {}
+        this._activeSource = null;
+      }
+    },
+
     _drainPlayQueue: function() {
-      if (!this._playQueue.length || !this._audioCtx) { this._playing = false; return; }
+      if (!this._playQueue.length || !this._audioCtx) { this._playing = false; this._activeSource = null; return; }
       this._playing = true;
       var pcm = this._playQueue.shift();
       var float32 = new Float32Array(pcm.length);
@@ -1375,6 +1378,7 @@ function chatPage() {
       src.connect(this._audioCtx.destination);
       var self = this;
       src.onended = function() { self._drainPlayQueue(); };
+      this._activeSource = src;
       src.start();
     },
 

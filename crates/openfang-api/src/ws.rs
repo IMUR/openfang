@@ -471,7 +471,12 @@ async fn handle_agent_ws(
                 match voice::parse_binary_frame(&data) {
                     Ok(VoiceProtocol::SessionInit(payload)) => {
                         let voice_config = state.kernel.config.voice.clone();
-                        match VoiceSession::new(payload, voice_config) {
+                        match VoiceSession::new(
+                            payload,
+                            voice_config,
+                            #[cfg(feature = "memory-candle")]
+                            state.kernel.vad_driver.clone(),
+                        ) {
                             Ok(session) => {
                                 let ack = voice::encode_binary_frame(&VoiceProtocol::SessionAck {
                                     session_id: session.session_id.clone(),
@@ -548,11 +553,11 @@ async fn handle_agent_ws(
                                     let _ = s.send(Message::Binary(frame.into())).await;
                                 }
 
-                                // Reset session and start listening for the new utterance
+                                // Reset session fully — don't pre-seed the buffer.
+                                // Let the normal VAD flow re-detect speech cleanly
+                                // from the next frames. Pre-seeding with the barge-in
+                                // frame caused ghost transcriptions from partial audio.
                                 session.reset_to_idle();
-                                session.state = voice::VoiceSessionState::Listening;
-                                session.speech_detected = true;
-                                session.pcm_buffer.extend_from_slice(&pcm);
                             }
                             VoiceAction::Transcribe(pcm_buffer) => {
                                 // Send VadSpeechEnd to client

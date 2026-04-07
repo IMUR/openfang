@@ -28,6 +28,8 @@ pub mod candle_classifier;
 pub mod candle_ner;
 #[cfg(feature = "memory-candle")]
 pub mod candle_reranker;
+#[cfg(feature = "memory-candle")]
+pub mod candle_vad;
 pub mod embedding;
 #[cfg(feature = "memory-candle")]
 pub mod model_cache;

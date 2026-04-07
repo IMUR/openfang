@@ -189,14 +189,24 @@
   // --- Audio playback ---
   let playQueue = [];
   let playing = false;
+  let activeSource = null; // currently playing AudioBufferSourceNode
 
   function queuePlayback(pcmInt16) {
     playQueue.push(pcmInt16);
     if (!playing) drainPlayQueue();
   }
 
+  function stopPlayback() {
+    playQueue = [];
+    playing = false;
+    if (activeSource) {
+      try { activeSource.onended = null; activeSource.stop(); } catch(e) {}
+      activeSource = null;
+    }
+  }
+
   function drainPlayQueue() {
-    if (!playQueue.length || !audioCtx) { playing = false; return; }
+    if (!playQueue.length || !audioCtx) { playing = false; activeSource = null; return; }
     playing = true;
     var pcm = playQueue.shift();
     var float32 = new Float32Array(pcm.length);
@@ -209,6 +219,7 @@
     src.buffer = buf;
     src.connect(audioCtx.destination);
     src.onended = drainPlayQueue;
+    activeSource = src;
     src.start();
   }
 
@@ -274,17 +285,13 @@
           setState('speaking');
           currentText = '';
           break;
-        case 0x11: // SpeechEnd
+        case 0x11: // SpeechEnd — stop all audio immediately
+          stopPlayback();
           setState('connected');
           if (currentText.trim()) {
             addMsg('assistant', currentText.trim());
             currentText = '';
           }
-          break;
-        case 0x40: // Interrupt confirmation from server (barge-in acknowledged)
-          setState('connected');
-          playQueue = [];
-          playing = false;
           break;
         case 0x21: // SessionAck
           try {
@@ -297,14 +304,12 @@
           // Barge-in: if bot is speaking when user starts talking, interrupt
           if (stateLabel.textContent === 'speaking') {
             addMsg('system', 'Interrupting...');
+            stopPlayback();
             // Send 0x40 Interrupt to server
             var interruptFrame = new Uint8Array([0x40]);
             if (ws && ws.readyState === WebSocket.OPEN) {
               ws.send(interruptFrame.buffer);
             }
-            // Flush client-side audio queue immediately
-            playQueue = [];
-            playing = false;
             setState('connected');
           }
           break;
@@ -327,8 +332,7 @@
       muteBtn.style.display = 'none';
       configBar.style.display = '';
       status('Disconnected');
-      playQueue = [];
-      playing = false;
+      stopPlayback();
     };
 
     ws.onerror = function() {
@@ -344,8 +348,7 @@
     callBtn.classList.remove('active');
     muteBtn.style.display = 'none';
     configBar.style.display = '';
-    playQueue = [];
-    playing = false;
+    stopPlayback();
   }
 
   function handleJsonMessage(msg) {
