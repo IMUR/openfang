@@ -87,8 +87,6 @@ pub async fn auth(
     // unauthenticated writes (cron job creation, skill install, etc.).
     let is_get = method == axum::http::Method::GET;
     let is_public = path == "/"
-        || path == "/voice"
-        || path == "/voice-client.js"
         || path == "/logo.png"
         || path == "/favicon.ico"
         || (path == "/.well-known/agent.json" && is_get)

@@ -102,7 +102,9 @@ async fn test_full_daemon_lifecycle() {
         ..KernelConfig::default()
     };
 
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = OpenFangKernel::boot_with_config(config)
+        .await
+        .expect("Kernel should boot");
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
 
@@ -229,7 +231,7 @@ async fn test_server_immediate_responsiveness() {
         ..KernelConfig::default()
     };
 
-    let kernel = OpenFangKernel::boot_with_config(config).unwrap();
+    let kernel = OpenFangKernel::boot_with_config(config).await.unwrap();
     let kernel = Arc::new(kernel);
 
     let state = Arc::new(AppState {

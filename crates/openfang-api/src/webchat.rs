@@ -20,20 +20,6 @@
 use axum::http::header;
 use axum::response::IntoResponse;
 
-/// Check if dev-mode static serving is enabled.
-fn static_dir() -> Option<std::path::PathBuf> {
-    std::env::var("OPENFANG_STATIC_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
-}
-
-/// Read a file from the static dir if dev mode is active.
-fn read_static(relative: &str) -> Option<String> {
-    let dir = static_dir()?;
-    std::fs::read_to_string(dir.join(relative)).ok()
-}
-
 /// Nonce placeholder in compile-time HTML, replaced at request time.
 const NONCE_PLACEHOLDER: &str = "__NONCE__";
 
@@ -96,37 +82,6 @@ pub async fn sw_js() -> impl IntoResponse {
             (header::CACHE_CONTROL, "no-cache"),
         ],
         SW_JS,
-    )
-}
-
-/// Embedded voice chat HTML (compile-time fallback).
-const VOICE_HTML: &str = include_str!("../static/voice.html");
-
-/// GET /voice — Serve the OpenFang Voice chat page.
-/// In dev mode (OPENFANG_STATIC_DIR set), reads from disk for hot-reload.
-pub async fn voice_page() -> impl IntoResponse {
-    let html = read_static("voice.html")
-        .unwrap_or_else(|| VOICE_HTML.to_string());
-    (
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
-            (header::CACHE_CONTROL, "no-store".to_string()),
-        ],
-        html,
-    )
-}
-
-/// GET /voice-client.js — Serve the shared voice client module.
-/// This file is loaded by both voice.html and the dashboard.
-pub async fn voice_client_js() -> impl IntoResponse {
-    let js = read_static("js/voice-client.js")
-        .unwrap_or_else(|| "/* voice-client.js not found */".to_string());
-    (
-        [
-            (header::CONTENT_TYPE, "application/javascript".to_string()),
-            (header::CACHE_CONTROL, "no-store".to_string()),
-        ],
-        js,
     )
 }
 
@@ -201,6 +156,8 @@ const WEBCHAT_HTML: &str = concat!(
     include_str!("../static/js/pages/overview.js"),
     "\n",
     include_str!("../static/js/katex.js"),
+    "\n",
+    include_str!(concat!("../static/js/", "voice-client.js")),
     "\n",
     include_str!("../static/js/pages/chat.js"),
     "\n",

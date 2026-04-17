@@ -252,21 +252,15 @@ Idle --[SessionInit]--> Listening
 
 ### Shared voice client (`voice-client.js`)
 
-All voice functionality — mic capture, Web Audio playback, barge-in energy VAD, WS binary protocol, session state machine — lives in a single shared module: `static/js/voice-client.js`, served at `GET /voice-client.js` (auth-exempt).
+All voice functionality — mic capture, Web Audio playback, barge-in energy VAD, WS binary protocol, session state machine — lives in a single shared module: `static/js/voice-client.js` and is bundled into the dashboard page.
 
-Both UIs instantiate a `VoiceClient` with callbacks for state changes, transcripts, and errors. This eliminates the previous split where `voice.html` and `chat.js` had diverged implementations with different bugs.
-
-### Voice interfaces
-
-1. **Dedicated voice page** (`/voice`) — standalone voice-only interface. Agent selector, API token input, call/hangup, mute, transcript view. Loads `voice-client.js` via `<script src="/voice-client.js">`. This is the primary testing interface.
-
-2. **Dashboard chat** (`/`) — the dashboard's chat page has a mic button that activates voice mode inline. `chat.js` needs migration to use `VoiceClient` (currently still has its own implementation — pending consolidation).
+The dashboard chat instantiates a `VoiceClient` with callbacks for state changes and status. This eliminates the previous drift where multiple client implementations diverged and developed different bugs.
 
 Both use `ScriptProcessorNode` for mic capture (deprecated but universally supported on iOS Safari) and PCM16 codec by default.
 
 ### Dev mode (OPENFANG_STATIC_DIR)
 
-Set `OPENFANG_STATIC_DIR` env var to the `static/` directory path (e.g. `crates/openfang-api/static`). Voice HTML and JS are then served from disk on every request — no rebuild needed for client-side changes. Unset or empty falls back to compiled-in `include_str!()` versions.
+`OPENFANG_STATIC_DIR` was originally used for standalone static handlers. The dashboard is currently bundled via `include_str!()` and requires a rebuild for JS changes.
 
 ---
 
@@ -303,9 +297,8 @@ All fields have defaults; only `enabled = true` is required to activate voice.
 | Voice transport | `crates/openfang-api/src/voice.rs` | Active |
 | Neural VAD (Silero v5) | `crates/openfang-runtime/src/candle_vad.rs` | Active (memory-candle feature) |
 | WS handler | `crates/openfang-api/src/ws.rs` | Active |
-| Voice client (shared JS) | `crates/openfang-api/static/js/voice-client.js` | Active |
-| Standalone voice UI | `crates/openfang-api/static/voice.html` | Active (uses voice-client.js) |
-| Dashboard voice UI | `crates/openfang-api/static/js/pages/chat.js` | Active (pending VoiceClient migration) |
+| Voice client (shared JS) | `crates/openfang-api/static/js/voice-client.js` | Active (bundled into dashboard) |
+| Dashboard voice UI | `crates/openfang-api/static/js/pages/chat.js` | Active (delegates to VoiceClient) |
 | Kokoro TTS (prtr) | `/opt/services/kokoro-tts/` | Retired, disabled |
 | Whisper STT (prtr) | `/opt/services/whisper-stt/` | Retired, disabled |
 | Qwen3-TTS (drtr) | `drtr:/opt/services/qwen3-tts/` | Retired, disabled |
@@ -315,20 +308,13 @@ All fields have defaults; only `enabled = true` is required to activate voice.
 
 ## Caddy Configuration (`crtr:/etc/caddy/Caddyfile`)
 
-`vox.ism.la` proxies to OpenFang on prtr via Tailscale:
+`vox.ism.la` is intentionally **inactive** (placeholder 503). Voice is a capability inside the OpenFang dashboard (`guy.ism.la`), not a separate web surface.
 
 ```caddy
 vox.ism.la {
-    encode zstd gzip
-
-    reverse_proxy http://100.64.0.7:4477 {
-        header_up Host {host}
-        header_up X-Real-IP {remote_host}
-    }
+    respond "Service Not Available" 503
 }
 ```
-
-> **Note:** The `/stt/*` and `/tts/*` proxy rules previously pointed to prtr localhost services (7733/7744). Those services are retired — STT/TTS now run on drtr, accessed by OpenFang internally over Tailscale. The Caddy proxy only needs to forward to the OpenFang daemon on prtr:4477.
 
 ---
 
@@ -370,8 +356,6 @@ vox.ism.la {
 | WS integration in `ws.rs` | Complete |
 | Voice mode context (`[VOICE MODE]` prefix) | Complete |
 | Dashboard voice UI (4-state mic button) | Complete |
-| Standalone voice UI (`/voice`) | Complete |
-| Caddy routing (`vox.ism.la -> :4477`) | Complete |
 | Chatterbox-Turbo TTS on drtr | Complete (3.2GB VRAM) |
 | Parakeet TDT STT on drtr (fp16) | Complete (1.35GB VRAM) |
 | Sinc resampler (rubato, 24→16kHz) | Complete |
@@ -401,11 +385,11 @@ vox.ism.la {
 - **2026-04-07:** Phase 3 — ClauseBuffer replaces SentenceBuffer (splits on `,;:.!?\n—`, 30-char min)
 - **2026-04-07:** Phase 3 — Rubato sinc resampler replaces linear interpolation (24→16kHz)
 - **2026-04-07:** Phase 4 — Voice cloning: tts_voice_clone_ref config, SessionInit extension, TtsClient base64 encoding
-- **2026-04-07:** Client-side barge-in: voice.html + chat.js send 0x40 Interrupt when VadSpeechStart arrives during speaking state, flush audio queue
+- **2026-04-07:** Client-side barge-in: voice client sends 0x40 Interrupt on detected speech during Speaking, flushes the audio queue
 - **2026-04-07:** Fixed Silero VAD weight names: encoder.0→encoder.0.conv, decoder.rnn→decoder.lstm, decoder.decoder→decoder.output
 - **2026-04-07:** Moved SileroVad to openfang-runtime/candle_vad.rs (follows candle driver pattern, memory-candle feature)
 - **2026-04-07:** Disabled server-side VAD during Speaking state (false positives from ambient noise)
 - **2026-04-07:** Client-side energy VAD in voice-client.js (RMS > 0.008 threshold, 2s cooldown)
-- **2026-04-07:** Consolidated voice.html + chat.js into shared voice-client.js module
+- **2026-04-07:** Consolidated dashboard voice implementation into shared voice-client.js module
 - **2026-04-07:** Added OPENFANG_STATIC_DIR filesystem fallback for live JS iteration without rebuilds
 - **2026-04-07:** SpeechEnd (0x11) lets audio drain naturally; only 0x40 Interrupt stops immediately

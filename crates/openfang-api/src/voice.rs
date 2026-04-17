@@ -23,7 +23,7 @@
 use openfang_types::config::VoiceConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use tracing::{info, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -364,7 +364,7 @@ impl VoiceSession {
             Some(codec) => codec.decode(data),
             None => {
                 // Raw PCM16 little-endian
-                if data.len() % 2 != 0 {
+                if !data.len().is_multiple_of(2) {
                     return Err("PCM16 data must be even length".into());
                 }
                 Ok(data
@@ -1099,6 +1099,12 @@ impl SentenceBuffer {
     }
 }
 
+impl Default for SentenceBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1389,9 +1395,11 @@ mod tests {
 
     #[test]
     fn test_vad_speech_then_silence_triggers_transcribe() {
-        let mut config = VoiceConfig::default();
-        config.vad_silence_ms = 40; // 2 frames of silence at 20ms each
-        config.vad_energy_threshold = 0.001;
+        let config = VoiceConfig {
+            vad_silence_ms: 40, // 2 frames of silence at 20ms each
+            vad_energy_threshold: 0.001,
+            ..VoiceConfig::default()
+        };
         let mut session =
             VoiceSession::new(
                 SessionInitPayload::default(),
@@ -1401,7 +1409,9 @@ mod tests {
             ).unwrap();
 
         // Send loud audio (speech) — first frame returns SpeechStarted
-        let speech: Vec<i16> = (0..OPUS_FRAME_SAMPLES).map(|i| ((i % 50) as i16 * 500)).collect();
+        let speech: Vec<i16> = (0..OPUS_FRAME_SAMPLES)
+            .map(|i| (i % 50) as i16 * 500)
+            .collect();
         assert!(matches!(session.handle_audio(&speech), VoiceAction::SpeechStarted));
         assert_eq!(session.state, VoiceSessionState::Listening);
 

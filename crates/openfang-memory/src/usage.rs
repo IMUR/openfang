@@ -50,6 +50,7 @@ impl UsageStore {
     }
 
     /// Record a usage event.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record(
         &self,
         agent_id: AgentId,

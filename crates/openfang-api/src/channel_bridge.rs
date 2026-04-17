@@ -888,10 +888,11 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             if let Some(tid) = thread_id {
                 kv_val["thread_id"] = serde_json::json!(tid);
             }
-            let _ = self
-                .kernel
-                .memory
-                .structured_set(agent_id, "delivery.last_channel", kv_val);
+            std::mem::drop(
+                self.kernel
+                    .memory
+                    .structured_set(agent_id, "delivery.last_channel", kv_val),
+            );
         }
     }
 

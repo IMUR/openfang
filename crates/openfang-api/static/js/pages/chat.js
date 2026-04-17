@@ -32,12 +32,7 @@ function chatPage() {
     // Voice chat mode state (real-time streaming)
     voiceActive: false,
     voiceTranscript: '',
-    _audioCtx: null,
-    _mediaStream: null,
-    _processorNode: null,
-    _playQueue: [],
-    _playing: false,
-    _ttsPlaying: false,
+    _voiceClient: null,
     // Model autocomplete state
     showModelPicker: false,
     modelPickerList: [],
@@ -608,7 +603,11 @@ function chatPage() {
           Alpine.store('app').wsConnected = true;
         },
         onMessage: function(data) { self.handleWsMessage(data); },
-        onBinary: function(buf) { self.handleVoiceBinary(buf); },
+        onBinary: function(buf) {
+          if (self._voiceClient) {
+            self._voiceClient.handleBinaryFrame(buf);
+          }
+        },
         onClose: function() {
           Alpine.store('app').wsConnected = false;
           self._wsAgent = null;
@@ -1243,167 +1242,67 @@ function chatPage() {
       if (this.voiceActive || !this.currentAgent || this.sending) return;
       var self = this;
       try {
-        var AudioCtx = window.AudioContext || window.webkitAudioContext;
-        self._audioCtx = new AudioCtx({ sampleRate: 16000 });
-        if (self._audioCtx.state === 'suspended') await self._audioCtx.resume();
+        if (typeof VoiceClient === 'undefined') {
+          throw new Error('VoiceClient not loaded');
+        }
 
-        self._mediaStream = await navigator.mediaDevices.getUserMedia({
-          audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+        self._voiceClient = new VoiceClient({
+          sendBinary: function(buf) { OpenFangAPI.wsSendBinary(buf); },
+          onStateChange: function(state) {
+            // Keep a simple UI flag; detailed state is owned by VoiceClient.
+            if (state === 'idle') {
+              self.voiceActive = false;
+              self.voiceTranscript = '';
+            } else {
+              self.voiceActive = true;
+            }
+          },
+          onSystemMessage: function(msg) {
+            if (msg) self.voiceTranscript = msg;
+          },
+          onError: function(msg) {
+            OpenFangToast.error('Voice error: ' + msg);
+            self.stopVoiceMode();
+          },
+          onSessionAck: function(ack) {
+            if (ack && ack.session_id) {
+              self.messages.push({
+                id: ++msgId,
+                role: 'system',
+                text: 'Voice session: ' + ack.session_id.slice(0, 8) + '...',
+                meta: '',
+                tools: []
+              });
+              self.scrollToBottom();
+            }
+          }
         });
 
-        var source = self._audioCtx.createMediaStreamSource(self._mediaStream);
-        self._processorNode = self._audioCtx.createScriptProcessor(512, 1, 1);
-        self._bargeInCooldown = false;
-        self._processorNode.onaudioprocess = function(e) {
-          if (!self.voiceActive) return;
-          var float32 = e.inputBuffer.getChannelData(0);
-
-          // Client-side barge-in: detect speech energy during TTS playback
-          if (self._ttsPlaying && !self._bargeInCooldown) {
-            var energy = 0;
-            for (var j = 0; j < float32.length; j++) energy += float32[j] * float32[j];
-            energy = Math.sqrt(energy / float32.length);
-            // Log energy periodically for debugging (every ~1s = every 31 frames at 512 samples/16kHz)
-            if (!self._energyLogCounter) self._energyLogCounter = 0;
-            if (++self._energyLogCounter % 31 === 0) {
-              console.log('[barge-in] energy:', energy.toFixed(4), 'ttsPlaying:', self._ttsPlaying, 'cooldown:', self._bargeInCooldown);
-            }
-            if (energy > 0.008) { // lowered from 0.02 — earbuds produce lower RMS
-              self._bargeInCooldown = true;
-              setTimeout(function() { self._bargeInCooldown = false; }, 2000);
-              self.voiceTranscript = 'Interrupting...';
-              self._stopPlayback();
-              var interruptFrame = new Uint8Array([0x40]);
-              OpenFangAPI.wsSendBinary(interruptFrame.buffer);
-              return;
-            }
-            return; // don't send mic audio to server during TTS (prevents ghost messages)
-          }
-
-          var pcm = new Int16Array(float32.length);
-          for (var i = 0; i < float32.length; i++) {
-            var s = Math.max(-1, Math.min(1, float32[i]));
-            pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-          }
-          var frame = new Uint8Array(1 + pcm.byteLength);
-          frame[0] = 0x01; // AudioDataIn
-          frame.set(new Uint8Array(pcm.buffer), 1);
-          OpenFangAPI.wsSendBinary(frame.buffer);
-        };
-        source.connect(self._processorNode);
-        self._processorNode.connect(self._audioCtx.destination);
-
-        // Send SessionInit
-        var init = JSON.stringify({ sample_rate: 16000, codec: 'pcm16', channels: 1 });
-        var initBytes = new TextEncoder().encode(init);
-        var initFrame = new Uint8Array(1 + initBytes.length);
-        initFrame[0] = 0x20; // SessionInit
-        initFrame.set(initBytes, 1);
-        OpenFangAPI.wsSendBinary(initFrame.buffer);
+        await self._voiceClient.start();
 
         self.voiceActive = true;
         self.voiceTranscript = 'Listening...';
         self.messages.push({ id: ++msgId, role: 'system', text: 'Voice mode active — speak to begin', meta: '', tools: [] });
         self.scrollToBottom();
       } catch(e) {
-        self._stopVoiceCapture();
+        if (self._voiceClient) {
+          try { self._voiceClient.stop(); } catch(_) {}
+          self._voiceClient = null;
+        }
         OpenFangToast.error('Microphone error: ' + (e.message || 'access denied'));
       }
     },
 
     stopVoiceMode: function() {
-      if (!this.voiceActive) return;
-      this._stopVoiceCapture();
+      if (!this.voiceActive && !this._voiceClient) return;
+      if (this._voiceClient) {
+        try { this._voiceClient.stop(); } catch(_) {}
+        this._voiceClient = null;
+      }
       this.voiceActive = false;
       this.voiceTranscript = '';
-      this._ttsPlaying = false;
-      this._playQueue = [];
-      this._playing = false;
       this.messages.push({ id: ++msgId, role: 'system', text: 'Voice mode ended', meta: '', tools: [] });
       this.scrollToBottom();
-    },
-
-    _stopVoiceCapture: function() {
-      if (this._processorNode) { this._processorNode.disconnect(); this._processorNode = null; }
-      if (this._mediaStream) { this._mediaStream.getTracks().forEach(function(t) { t.stop(); }); this._mediaStream = null; }
-      if (this._audioCtx) { this._audioCtx.close(); this._audioCtx = null; }
-    },
-
-    handleVoiceBinary: function(buf) {
-      var data = new Uint8Array(buf);
-      if (data.length < 1) return;
-      var type = data[0];
-      var payload = data.slice(1);
-
-      switch (type) {
-        case 0x02: // AudioDataOut — PCM16 LE
-          var pcm = new Int16Array(payload.buffer, payload.byteOffset, payload.byteLength / 2);
-          this._playQueue.push(pcm);
-          if (!this._playing) this._drainPlayQueue();
-          break;
-        case 0x10: // SpeechStart — agent TTS begins
-          this._ttsPlaying = true;
-          break;
-        case 0x11: // SpeechEnd — no more audio coming, let current chunk finish
-          // Don't call _stopPlayback() — that kills the active buffer mid-play.
-          // Let drainPlayQueue() finish naturally. Only _stopPlayback() on 0x40 interrupt.
-          this._ttsPlaying = false;
-          break;
-        case 0x21: // SessionAck
-          try {
-            var ack = JSON.parse(new TextDecoder().decode(payload));
-            this.messages.push({ id: ++msgId, role: 'system', text: 'Voice session: ' + ack.session_id.slice(0, 8) + '...', meta: '', tools: [] });
-            this.scrollToBottom();
-          } catch(e) {}
-          break;
-        case 0x30: // VadSpeechStart
-          this.voiceTranscript = 'Listening...';
-          // Barge-in: if bot is speaking when user starts talking, interrupt
-          if (this._ttsPlaying) {
-            this.voiceTranscript = 'Interrupting...';
-            this._stopPlayback();
-            var interruptFrame = new Uint8Array([0x40]);
-            OpenFangAPI.wsSendBinary(interruptFrame.buffer);
-          }
-          break;
-        case 0x31: // VadSpeechEnd
-          this.voiceTranscript = 'Transcribing...';
-          break;
-        case 0xF0: // Error
-          var errMsg = new TextDecoder().decode(payload);
-          OpenFangToast.error('Voice error: ' + errMsg);
-          this.stopVoiceMode();
-          break;
-      }
-    },
-
-    _stopPlayback: function() {
-      this._playQueue = [];
-      this._playing = false;
-      this._ttsPlaying = false;
-      if (this._activeSource) {
-        try { this._activeSource.onended = null; this._activeSource.stop(); } catch(e) {}
-        this._activeSource = null;
-      }
-    },
-
-    _drainPlayQueue: function() {
-      if (!this._playQueue.length || !this._audioCtx) { this._playing = false; this._activeSource = null; return; }
-      this._playing = true;
-      var pcm = this._playQueue.shift();
-      var float32 = new Float32Array(pcm.length);
-      for (var i = 0; i < pcm.length; i++) {
-        float32[i] = pcm[i] / 32768.0;
-      }
-      var buf = this._audioCtx.createBuffer(1, float32.length, 16000);
-      buf.getChannelData(0).set(float32);
-      var src = this._audioCtx.createBufferSource();
-      src.buffer = buf;
-      src.connect(this._audioCtx.destination);
-      var self = this;
-      src.onended = function() { self._drainPlayQueue(); };
-      this._activeSource = src;
-      src.start();
     },
 
     // ── Voice Recording (push-to-talk) ──

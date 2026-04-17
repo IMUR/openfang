@@ -44,6 +44,7 @@ struct AgentWrapper {
 }
 
 /// Lightweight agent listing row.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, SurrealValue)]
 struct AgentListRow {
     id: serde_json::Value,

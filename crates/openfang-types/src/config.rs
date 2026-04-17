@@ -1785,24 +1785,29 @@ impl MemoryConfig {
     /// Validation messages for unknown backend tokens.
     pub fn memory_subsystem_backend_warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if self.ner_backend.is_some() && self.resolved_ner_backend().is_err() {
-            out.push(format!(
-                "Unknown [memory] ner_backend {:?} — use none|off|auto|candle",
-                self.ner_backend.as_ref().unwrap()
-            ));
+        if let Some(ner_backend) = self.ner_backend.as_ref() {
+            if self.resolved_ner_backend().is_err() {
+                out.push(format!(
+                    "Unknown [memory] ner_backend {:?} — use none|off|auto|candle",
+                    ner_backend
+                ));
+            }
         }
-        if self.reranker_backend.is_some() && self.resolved_reranker_backend().is_err() {
-            out.push(format!(
-                "Unknown [memory] reranker_backend {:?} — use none|off|auto|candle",
-                self.reranker_backend.as_ref().unwrap()
-            ));
+        if let Some(reranker_backend) = self.reranker_backend.as_ref() {
+            if self.resolved_reranker_backend().is_err() {
+                out.push(format!(
+                    "Unknown [memory] reranker_backend {:?} — use none|off|auto|candle",
+                    reranker_backend
+                ));
+            }
         }
-        if self.classification_backend.is_some() && self.resolved_classification_backend().is_err()
-        {
-            out.push(format!(
-                "Unknown [memory] classification_backend {:?} — use none|off|auto|candle",
-                self.classification_backend.as_ref().unwrap()
-            ));
+        if let Some(classification_backend) = self.classification_backend.as_ref() {
+            if self.resolved_classification_backend().is_err() {
+                out.push(format!(
+                    "Unknown [memory] classification_backend {:?} — use none|off|auto|candle",
+                    classification_backend
+                ));
+            }
         }
         out
     }

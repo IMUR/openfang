@@ -18,6 +18,7 @@ impl MeteringEngine {
     }
 
     /// Record a usage event (persists to SurrealDB).
+    #[allow(clippy::too_many_arguments)]
     pub async fn record(
         &self,
         agent_id: AgentId,

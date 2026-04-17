@@ -1138,7 +1138,7 @@ impl OpenFangKernel {
         let media_engine =
             openfang_runtime::media_understanding::MediaEngine::new(config.media.clone());
         let tts_engine = openfang_runtime::tts::TtsEngine::new(config.tts.clone());
-        let mut pairing = crate::pairing::PairingManager::new(config.pairing.clone());
+        let pairing = crate::pairing::PairingManager::new(config.pairing.clone());
 
         // TODO: Port pairing device persistence to SurrealDB
         // Pairing persistence was backed by rusqlite; skipped until audit.rs is ported.
@@ -1697,7 +1697,6 @@ impl OpenFangKernel {
         #[cfg(not(feature = "memory-candle"))]
         {
             let _ = (agent_id, text, memory_id);
-            return;
         }
 
         #[cfg(feature = "memory-candle")]
@@ -3295,7 +3294,7 @@ impl OpenFangKernel {
         }
 
         // Delete the old session
-        let _ = self.memory.delete_session(entry.session_id);
+        std::mem::drop(self.memory.delete_session(entry.session_id));
 
         // Create a fresh session
         let new_session = self
@@ -3325,10 +3324,10 @@ impl OpenFangKernel {
         })?;
 
         // Delete all regular sessions
-        let _ = self.memory.delete_agent_sessions(agent_id);
+        std::mem::drop(self.memory.delete_agent_sessions(agent_id));
 
         // Delete canonical (cross-channel) session
-        let _ = self.memory.delete_canonical_session(agent_id);
+        std::mem::drop(self.memory.delete_canonical_session(agent_id));
 
         // Create a fresh session
         let new_session = self
@@ -3497,9 +3496,10 @@ impl OpenFangKernel {
 
         // Save to structured memory store (key = "session_{date}_{slug}")
         let key = format!("session_{date}_{slug}");
-        let _ =
+        std::mem::drop(
             self.memory
-                .structured_set(agent_id, &key, serde_json::Value::String(summary.clone()));
+                .structured_set(agent_id, &key, serde_json::Value::String(summary.clone())),
+        );
 
         // Also write to workspace memory/ dir if workspace exists
         if let Some(ref workspace) = entry.manifest.workspace {
@@ -3598,11 +3598,11 @@ impl OpenFangKernel {
 
         // Persist the updated entry
         if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
+            std::mem::drop(self.memory.save_agent(&entry));
         }
 
         // Clear canonical session to prevent memory poisoning from old model's responses
-        let _ = self.memory.delete_canonical_session(agent_id);
+        std::mem::drop(self.memory.delete_canonical_session(agent_id));
         debug!(agent_id = %agent_id, "Cleared canonical session after model switch");
 
         Ok(())
@@ -3631,7 +3631,7 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
 
         if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
+            std::mem::drop(self.memory.save_agent(&entry));
         }
 
         info!(agent_id = %agent_id, skills = ?skills, "Agent skills updated");
@@ -3670,7 +3670,7 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
 
         if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
+            std::mem::drop(self.memory.save_agent(&entry));
         }
 
         info!(agent_id = %agent_id, servers = ?servers, "Agent MCP servers updated");
@@ -3689,7 +3689,7 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
 
         if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
+            std::mem::drop(self.memory.save_agent(&entry));
         }
 
         info!(
@@ -3901,7 +3901,7 @@ impl OpenFangKernel {
         }
 
         // Remove from persistent storage
-        let _ = self.memory.remove_agent(agent_id);
+        std::mem::drop(self.memory.remove_agent(agent_id));
 
         // SECURITY: Record agent kill in audit trail
         self.audit_log.record(
@@ -5133,7 +5133,7 @@ impl OpenFangKernel {
             let _ = self.registry.set_state(entry.id, AgentState::Suspended);
             // Re-save with Suspended state for clean resume on next boot
             if let Some(updated) = self.registry.get(entry.id) {
-                let _ = self.memory.save_agent(&updated);
+                std::mem::drop(self.memory.save_agent(&updated));
             }
         }
 
@@ -6460,9 +6460,11 @@ async fn cron_deliver_response(
             tracing::debug!(channel = %channel, to = %to, "Cron: delivering to channel");
             // Persist as last channel for this agent (survives restarts)
             let kv_val = serde_json::json!({"channel": channel, "recipient": to});
-            let _ = kernel
-                .memory
-                .structured_set(agent_id, "delivery.last_channel", kv_val);
+            std::mem::drop(
+                kernel
+                    .memory
+                    .structured_set(agent_id, "delivery.last_channel", kv_val),
+            );
             // Deliver via the registered channel adapter
             kernel
                 .send_channel_message(channel, to, response, None)

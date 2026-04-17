@@ -128,10 +128,7 @@ pub async fn build_router(
     };
     let gcra_limiter = rate_limiter::create_rate_limiter();
 
-    let app = Router::new()
-        .route("/voice", axum::routing::get(webchat::voice_page))
-        .route("/voice-client.js", axum::routing::get(webchat::voice_client_js))
-        .route("/", axum::routing::get(webchat::webchat_page))
+    let app = Router::new().route("/", axum::routing::get(webchat::webchat_page))
         .route("/logo.png", axum::routing::get(webchat::logo_png))
         .route("/favicon.ico", axum::routing::get(webchat::favicon_ico))
         .route("/manifest.json", axum::routing::get(webchat::manifest_json))

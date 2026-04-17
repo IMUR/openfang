@@ -4,7 +4,7 @@
  * Single implementation of: mic capture, audio playback, barge-in VAD,
  * WS binary protocol, and session state machine.
  *
- * Used by both /voice (standalone) and the dashboard chat page.
+ * Consumed by the dashboard chat page via `static/js/pages/chat.js`.
  *
  * Usage:
  *   var vc = new VoiceClient({

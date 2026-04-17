@@ -17,8 +17,8 @@ use async_trait::async_trait;
 use openfang_types::agent::{AgentEntry, AgentId, SessionId};
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{
-    scope, ConsolidationReport, Entity, ExportFormat, GraphMatch, GraphPattern, ImportReport,
-    Memory, MemoryFilter, MemoryFragment, MemoryId, MemorySource, Relation,
+    ConsolidationReport, Entity, ExportFormat, GraphMatch, GraphPattern, ImportReport, Memory,
+    MemoryFilter, MemoryFragment, MemoryId, MemorySource, Relation,
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::types::SurrealValue;

@@ -490,7 +490,7 @@ impl SessionStore {
     ) -> Result<(), std::io::Error> {
         tokio::task::spawn_blocking(move || write_jsonl_mirror_sync(&session, &sessions_dir))
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .map_err(std::io::Error::other)?
     }
 }
 

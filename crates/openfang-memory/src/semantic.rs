@@ -166,7 +166,7 @@ fn parse_memory_id(record_key: Option<&str>) -> MemoryId {
     record_key
         .and_then(|k| uuid::Uuid::parse_str(k).ok())
         .map(MemoryId)
-        .unwrap_or_else(MemoryId::new)
+        .unwrap_or_default()
 }
 
 /// Parse a datetime string into a `chrono::DateTime<Utc>`.
@@ -391,7 +391,7 @@ impl SemanticStore {
 
         Ok(rows
             .into_iter()
-            .map(|r| bm25_row_to_fragment(r))
+            .map(bm25_row_to_fragment)
             .collect())
     }
 
