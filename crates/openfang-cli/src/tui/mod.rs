@@ -11,6 +11,7 @@ use event::{AppEvent, BackendRef};
 use openfang_kernel::OpenFangKernel;
 use openfang_runtime::llm_driver::StreamEvent;
 use openfang_types::agent::AgentId;
+use openfang_types::commands::{self, Surfaces};
 use screens::{
     agents, audit, channels, chat, comms, dashboard, extensions, hands, logs, memory, peers,
     security, sessions, settings, skills, templates, triggers, usage, welcome, wizard, workflows,
@@ -433,6 +434,10 @@ impl App {
                     self.skills.mcp_list.select(Some(0));
                 }
                 self.skills.loading = false;
+            }
+            AppEvent::SkillConfigLoaded { skill, rows } => {
+                self.skills.selected_config_details = Some((skill.clone(), rows));
+                self.skills.status_msg = format!("Loaded config for '{skill}'");
             }
             AppEvent::TemplateProvidersLoaded(providers) => {
                 self.templates.providers = providers;
@@ -1572,6 +1577,11 @@ impl App {
                     event::spawn_fetch_mcp_servers(backend, self.event_tx.clone());
                 }
             }
+            skills::SkillsAction::LoadSkillConfig(name) => {
+                if let Some(backend) = self.backend.to_ref() {
+                    event::spawn_fetch_skill_config(backend, name, self.event_tx.clone());
+                }
+            }
         }
     }
 
@@ -1608,9 +1618,14 @@ impl App {
                     event::spawn_fetch_active_hands(backend, self.event_tx.clone());
                 }
             }
-            hands::HandsAction::ActivateHand(hand_id) => {
+            hands::HandsAction::ActivateHand(hand_id, instance_name) => {
                 if let Some(backend) = self.backend.to_ref() {
-                    event::spawn_activate_hand(backend, hand_id, self.event_tx.clone());
+                    event::spawn_activate_hand(
+                        backend,
+                        hand_id,
+                        instance_name,
+                        self.event_tx.clone(),
+                    );
                 }
             }
             hands::HandsAction::DeactivateHand(instance_id) => {
@@ -2008,26 +2023,18 @@ impl App {
 
     fn handle_slash_command(&mut self, cmd: &str) {
         let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
-        match parts[0] {
-            "/exit" | "/quit" => self.handle_chat_action(chat::ChatAction::Back),
+        // Canonicalise through the unified command registry: `/quit` -> `exit`,
+        // `/NEW` -> `new`, etc. Unregistered commands fall through unchanged so
+        // this refactor does not break any existing surface-specific behaviour.
+        let canonical_head: String = commands::resolve(parts[0])
+            .filter(|def| def.surfaces.contains(Surfaces::CLI))
+            .map(|def| format!("/{}", def.name))
+            .unwrap_or_else(|| parts[0].to_string());
+        match canonical_head.as_str() {
+            "/exit" => self.handle_chat_action(chat::ChatAction::Back),
             "/help" => {
-                self.chat.push_message(
-                    chat::Role::System,
-                    [
-                        "/help              \u{2014} show this help",
-                        "/model             \u{2014} open model picker (Ctrl+M)",
-                        "/model <name>      \u{2014} switch to model directly",
-                        "/status            \u{2014} connection & agent info",
-                        "/agents            \u{2014} list running agents",
-                        "/approvals         \u{2014} list pending tool approvals",
-                        "/approve <id>      \u{2014} approve a pending request",
-                        "/reject <id>       \u{2014} reject a pending request",
-                        "/clear             \u{2014} clear chat history",
-                        "/kill              \u{2014} kill the current agent",
-                        "/exit              \u{2014} end chat session",
-                    ]
-                    .join("\n"),
-                );
+                self.chat
+                    .push_message(chat::Role::System, commands::render_help(Surfaces::CLI));
             }
             "/status" => {
                 let mut s = Vec::new();
@@ -2168,9 +2175,8 @@ impl App {
                                         if a["status"].as_str() == Some("pending") {
                                             lines.push(format!(
                                                 "[{}] {} \u{2014} {} ({})",
-                                                &a["id"].as_str().unwrap_or("?")[..8.min(
-                                                    a["id"].as_str().unwrap_or("?").len()
-                                                )],
+                                                &a["id"].as_str().unwrap_or("?")[..8
+                                                    .min(a["id"].as_str().unwrap_or("?").len())],
                                                 a["agent_name"].as_str().unwrap_or("?"),
                                                 a["tool_name"].as_str().unwrap_or("?"),
                                                 a["description"].as_str().unwrap_or(""),
@@ -2252,10 +2258,8 @@ impl App {
             "/reject" => {
                 let id = parts.get(1).map(|s| s.trim()).unwrap_or("");
                 if id.is_empty() {
-                    self.chat.push_message(
-                        chat::Role::System,
-                        "Usage: /reject <id-prefix>".to_string(),
-                    );
+                    self.chat
+                        .push_message(chat::Role::System, "Usage: /reject <id-prefix>".to_string());
                 } else {
                     let result = match &self.backend {
                         Backend::Daemon { base_url } => {
@@ -2335,9 +2339,10 @@ impl App {
                 }
             },
             _ => {
+                let help = commands::render_help(Surfaces::CLI);
                 self.chat.push_message(
                     chat::Role::System,
-                    format!("Unknown command: {}. Type /help", parts[0]),
+                    format!("Unknown command: {}\n\n{}", parts[0], help),
                 );
             }
         }
@@ -2540,10 +2545,7 @@ fn resolve_approval_id_daemon(base_url: &str, prefix: &str) -> Option<String> {
 }
 
 /// Resolve a short approval-ID prefix to a full UUID from the in-process kernel.
-fn resolve_approval_id_kernel(
-    kernel: &OpenFangKernel,
-    prefix: &str,
-) -> Option<uuid::Uuid> {
+fn resolve_approval_id_kernel(kernel: &OpenFangKernel, prefix: &str) -> Option<uuid::Uuid> {
     kernel
         .approval_manager
         .list_pending()

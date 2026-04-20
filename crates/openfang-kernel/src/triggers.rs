@@ -453,7 +453,11 @@ fn describe_event(event: &Event) -> String {
         EventPayload::Approval(ae) => {
             use openfang_types::event::ApprovalEvent;
             match ae {
-                ApprovalEvent::Pending { tool_name, agent_id, .. } => {
+                ApprovalEvent::Pending {
+                    tool_name,
+                    agent_id,
+                    ..
+                } => {
                     format!("Approval pending: tool '{tool_name}' for agent {agent_id}")
                 }
                 ApprovalEvent::Resolved { id, decision, .. } => {

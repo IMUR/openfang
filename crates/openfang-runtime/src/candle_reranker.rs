@@ -73,7 +73,10 @@ impl CandleReranker {
 
         info!(
             model_id,
-            device = cuda_device.map(|d| format!("cuda:{d}")).as_deref().unwrap_or("cpu"),
+            device = cuda_device
+                .map(|d| format!("cuda:{d}"))
+                .as_deref()
+                .unwrap_or("cpu"),
             "Loading cross-encoder reranker"
         );
 
@@ -118,10 +121,12 @@ impl CandleReranker {
             let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| RerankerError::Load(format!("tokenizer: {e}")))?;
 
-            tokenizer.with_truncation(Some(TruncationParams {
-                max_length: 512,
-                ..Default::default()
-            })).map_err(|e| RerankerError::Load(format!("truncation: {e}")))?;
+            tokenizer
+                .with_truncation(Some(TruncationParams {
+                    max_length: 512,
+                    ..Default::default()
+                }))
+                .map_err(|e| RerankerError::Load(format!("truncation: {e}")))?;
 
             tokenizer.with_padding(Some(PaddingParams {
                 strategy: tokenizers::PaddingStrategy::BatchLongest,
@@ -173,16 +178,11 @@ impl CandleReranker {
         .map_err(|e| RerankerError::Inference(format!("Task join: {e}")))?
         .map_err(|e| e)?;
 
-        debug!(
-            n = candidates.len(),
-            "Cross-encoder reranking complete"
-        );
+        debug!(n = candidates.len(), "Cross-encoder reranking complete");
 
         // Attach scores and sort descending
-        let mut scored: Vec<(MemoryFragment, f32)> = candidates
-            .drain(..)
-            .zip(scores.iter().copied())
-            .collect();
+        let mut scored: Vec<(MemoryFragment, f32)> =
+            candidates.drain(..).zip(scores.iter().copied()).collect();
 
         scored.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
 

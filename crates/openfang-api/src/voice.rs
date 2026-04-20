@@ -125,10 +125,7 @@ pub fn parse_binary_frame(data: &[u8]) -> Result<VoiceProtocol, String> {
         0x21 => {
             let json: serde_json::Value = serde_json::from_slice(payload)
                 .map_err(|e| format!("SessionAck: invalid JSON: {e}"))?;
-            let session_id = json["session_id"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            let session_id = json["session_id"].as_str().unwrap_or("").to_string();
             Ok(VoiceProtocol::SessionAck { session_id })
         }
         0x30 => Ok(VoiceProtocol::VadSpeechStart),
@@ -322,8 +319,9 @@ impl VoiceSession {
     pub fn new(
         init: SessionInitPayload,
         config: VoiceConfig,
-        #[cfg(feature = "memory-candle")]
-        vad_driver: Option<std::sync::Arc<openfang_runtime::candle_vad::SileroVad>>,
+        #[cfg(feature = "memory-candle")] vad_driver: Option<
+            std::sync::Arc<openfang_runtime::candle_vad::SileroVad>,
+        >,
     ) -> Result<Self, String> {
         let opus = if init.codec == "pcm16" {
             None
@@ -404,8 +402,7 @@ impl VoiceSession {
         }
 
         let is_speech = self.detect_speech(pcm);
-        let silence_threshold_frames =
-            (self.config.vad_silence_ms as f32 / 20.0).ceil() as u32;
+        let silence_threshold_frames = (self.config.vad_silence_ms as f32 / 20.0).ceil() as u32;
         let max_samples = self.config.max_utterance_secs as usize * 16000;
 
         if is_speech {
@@ -430,10 +427,8 @@ impl VoiceSession {
                 self.state = VoiceSessionState::Transcribing;
                 self.speech_detected = false;
                 self.silence_frames = 0;
-                let buffer = std::mem::replace(
-                    &mut self.pcm_buffer,
-                    Vec::with_capacity(16000 * 30),
-                );
+                let buffer =
+                    std::mem::replace(&mut self.pcm_buffer, Vec::with_capacity(16000 * 30));
                 return VoiceAction::Transcribe(buffer);
             }
         }
@@ -443,8 +438,7 @@ impl VoiceSession {
             self.state = VoiceSessionState::Transcribing;
             self.speech_detected = false;
             self.silence_frames = 0;
-            let buffer =
-                std::mem::replace(&mut self.pcm_buffer, Vec::with_capacity(16000 * 30));
+            let buffer = std::mem::replace(&mut self.pcm_buffer, Vec::with_capacity(16000 * 30));
             return VoiceAction::Transcribe(buffer);
         }
 
@@ -720,12 +714,9 @@ pub fn parse_wav(data: &[u8]) -> Result<(Vec<i16>, u32), String> {
         return Err("Not a WAV file".into());
     }
 
-    let sample_rate = u32::from_le_bytes(
-        data[24..28].try_into().map_err(|_| "Bad sample rate")?,
-    );
-    let bits_per_sample = u16::from_le_bytes(
-        data[34..36].try_into().map_err(|_| "Bad bits/sample")?,
-    );
+    let sample_rate = u32::from_le_bytes(data[24..28].try_into().map_err(|_| "Bad sample rate")?);
+    let bits_per_sample =
+        u16::from_le_bytes(data[34..36].try_into().map_err(|_| "Bad bits/sample")?);
 
     if bits_per_sample != 16 {
         return Err(format!("Expected 16-bit PCM, got {bits_per_sample}-bit"));
@@ -765,7 +756,9 @@ pub fn resample(pcm: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
         return pcm.to_vec();
     }
 
-    use rubato::{SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction, Resampler};
+    use rubato::{
+        Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    };
 
     let params = SincInterpolationParameters {
         sinc_len: 256,
@@ -778,10 +771,10 @@ pub fn resample(pcm: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
     let ratio = to_rate as f64 / from_rate as f64;
     let mut resampler = match SincFixedIn::<f64>::new(
         ratio,
-        2.0,        // max relative ratio
+        2.0, // max relative ratio
         params,
-        pcm.len(),  // chunk size = full input
-        1,          // mono
+        pcm.len(), // chunk size = full input
+        1,         // mono
     ) {
         Ok(r) => r,
         Err(_) => {
@@ -795,12 +788,10 @@ pub fn resample(pcm: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
     let waves_in = vec![input];
 
     match resampler.process(&waves_in, None) {
-        Ok(waves_out) => {
-            waves_out[0]
-                .iter()
-                .map(|&s| (s * 32768.0).clamp(-32768.0, 32767.0) as i16)
-                .collect()
-        }
+        Ok(waves_out) => waves_out[0]
+            .iter()
+            .map(|&s| (s * 32768.0).clamp(-32768.0, 32767.0) as i16)
+            .collect(),
         Err(_) => resample_linear(pcm, from_rate, to_rate),
     }
 }
@@ -1231,13 +1222,13 @@ mod tests {
 
     #[test]
     fn test_voice_session_new() {
-        let session =
-            VoiceSession::new(
-                SessionInitPayload::default(),
-                VoiceConfig::default(),
-                #[cfg(feature = "memory-candle")]
-                None,
-            ).unwrap();
+        let session = VoiceSession::new(
+            SessionInitPayload::default(),
+            VoiceConfig::default(),
+            #[cfg(feature = "memory-candle")]
+            None,
+        )
+        .unwrap();
         assert_eq!(session.state, VoiceSessionState::Idle);
         assert!(!session.session_id.is_empty());
         assert_eq!(session.init.sample_rate, 16000);
@@ -1298,7 +1289,10 @@ mod tests {
 
     #[test]
     fn test_markdown_bold_italic() {
-        assert_eq!(markdown_to_speakable("This is **bold** and *italic*"), "This is bold and italic");
+        assert_eq!(
+            markdown_to_speakable("This is **bold** and *italic*"),
+            "This is bold and italic"
+        );
     }
 
     #[test]
@@ -1378,17 +1372,20 @@ mod tests {
 
     #[test]
     fn test_vad_silence_ignored() {
-        let mut session =
-            VoiceSession::new(
-                SessionInitPayload::default(),
-                VoiceConfig::default(),
-                #[cfg(feature = "memory-candle")]
-                None,
-            ).unwrap();
+        let mut session = VoiceSession::new(
+            SessionInitPayload::default(),
+            VoiceConfig::default(),
+            #[cfg(feature = "memory-candle")]
+            None,
+        )
+        .unwrap();
         let silence = vec![0i16; OPUS_FRAME_SAMPLES];
         match session.handle_audio(&silence) {
             VoiceAction::Continue => {} // expected
-            other => panic!("Expected Continue for silence, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "Expected Continue for silence, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
         assert_eq!(session.state, VoiceSessionState::Idle);
     }
@@ -1400,46 +1397,58 @@ mod tests {
             vad_energy_threshold: 0.001,
             ..VoiceConfig::default()
         };
-        let mut session =
-            VoiceSession::new(
-                SessionInitPayload::default(),
-                config,
-                #[cfg(feature = "memory-candle")]
-                None,
-            ).unwrap();
+        let mut session = VoiceSession::new(
+            SessionInitPayload::default(),
+            config,
+            #[cfg(feature = "memory-candle")]
+            None,
+        )
+        .unwrap();
 
         // Send loud audio (speech) — first frame returns SpeechStarted
         let speech: Vec<i16> = (0..OPUS_FRAME_SAMPLES)
             .map(|i| (i % 50) as i16 * 500)
             .collect();
-        assert!(matches!(session.handle_audio(&speech), VoiceAction::SpeechStarted));
+        assert!(matches!(
+            session.handle_audio(&speech),
+            VoiceAction::SpeechStarted
+        ));
         assert_eq!(session.state, VoiceSessionState::Listening);
 
         // Second speech frame returns Continue (already listening)
-        assert!(matches!(session.handle_audio(&speech), VoiceAction::Continue));
+        assert!(matches!(
+            session.handle_audio(&speech),
+            VoiceAction::Continue
+        ));
 
         // Send silence
         let silence = vec![0i16; OPUS_FRAME_SAMPLES];
-        assert!(matches!(session.handle_audio(&silence), VoiceAction::Continue));
+        assert!(matches!(
+            session.handle_audio(&silence),
+            VoiceAction::Continue
+        ));
         // Second silence frame should trigger transcription
         match session.handle_audio(&silence) {
             VoiceAction::Transcribe(pcm) => {
                 assert!(!pcm.is_empty());
                 assert_eq!(session.state, VoiceSessionState::Transcribing);
             }
-            other => panic!("Expected Transcribe after silence threshold, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "Expected Transcribe after silence threshold, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
     #[test]
     fn test_vad_reset_to_idle() {
-        let mut session =
-            VoiceSession::new(
-                SessionInitPayload::default(),
-                VoiceConfig::default(),
-                #[cfg(feature = "memory-candle")]
-                None,
-            ).unwrap();
+        let mut session = VoiceSession::new(
+            SessionInitPayload::default(),
+            VoiceConfig::default(),
+            #[cfg(feature = "memory-candle")]
+            None,
+        )
+        .unwrap();
         session.state = VoiceSessionState::Speaking;
         session.pcm_buffer.extend_from_slice(&[1, 2, 3]);
         session.reset_to_idle();
@@ -1466,7 +1475,10 @@ mod tests {
         assert_eq!(decoded.len(), OPUS_FRAME_SAMPLES);
         // Silence in should produce near-silence out
         let max_sample = decoded.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-        assert!(max_sample < 100, "Expected near-silence, got max sample {max_sample}");
+        assert!(
+            max_sample < 100,
+            "Expected near-silence, got max sample {max_sample}"
+        );
     }
 
     #[test]
@@ -1487,7 +1499,10 @@ mod tests {
         assert_eq!(decoded.len(), OPUS_FRAME_SAMPLES);
         // Should have non-trivial audio content
         let max_sample = decoded.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-        assert!(max_sample > 1000, "Expected audible signal, got max sample {max_sample}");
+        assert!(
+            max_sample > 1000,
+            "Expected audible signal, got max sample {max_sample}"
+        );
     }
 
     #[test]

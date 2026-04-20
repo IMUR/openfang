@@ -61,10 +61,12 @@ memory_write = ["self.*"]
 // ---------------------------------------------------------------------------
 
 /// Test that workflow registration and agent resolution work at the kernel level.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_workflow_register_and_resolve() {
     let config = test_config("ollama", "test-model", "OLLAMA_API_KEY");
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = OpenFangKernel::boot_with_config(config)
+        .await
+        .expect("Kernel should boot");
     let kernel = Arc::new(kernel);
 
     // Spawn agents
@@ -172,10 +174,12 @@ memory_write = ["self.*"]
 }
 
 /// Test workflow with agent referenced by ID.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_workflow_agent_by_id() {
     let config = test_config("ollama", "test-model", "OLLAMA_API_KEY");
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = OpenFangKernel::boot_with_config(config)
+        .await
+        .expect("Kernel should boot");
 
     let manifest: AgentManifest = toml::from_str(
         r#"
@@ -229,12 +233,14 @@ memory_write = ["self.*"]
 }
 
 /// Test trigger registration and listing at kernel level.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_trigger_registration_with_kernel() {
     use openfang_kernel::triggers::TriggerPattern;
 
     let config = test_config("ollama", "test-model", "OLLAMA_API_KEY");
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = OpenFangKernel::boot_with_config(config)
+        .await
+        .expect("Kernel should boot");
 
     let manifest: AgentManifest = toml::from_str(
         r#"
@@ -301,7 +307,7 @@ memory_write = ["self.*"]
 
 /// End-to-end: boot kernel → spawn 2 agents → create 2-step workflow →
 /// run it through the real Groq LLM → verify output flows from step 1 to step 2.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_workflow_e2e_with_groq() {
     if std::env::var("GROQ_API_KEY").is_err() {
         eprintln!("GROQ_API_KEY not set, skipping E2E workflow test");
@@ -309,7 +315,9 @@ async fn test_workflow_e2e_with_groq() {
     }
 
     let config = test_config("groq", "llama-3.3-70b-versatile", "GROQ_API_KEY");
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = OpenFangKernel::boot_with_config(config)
+        .await
+        .expect("Kernel should boot");
     let kernel = Arc::new(kernel);
     kernel.set_self_handle();
 

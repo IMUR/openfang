@@ -109,10 +109,7 @@ pub enum ApprovalEvent {
         decision: ApprovalDecision,
     },
     /// An approval request timed out before a decision was made.
-    Expired {
-        id: Uuid,
-        agent_id: String,
-    },
+    Expired { id: Uuid, agent_id: String },
 }
 
 /// A message between agents or from user to agent.

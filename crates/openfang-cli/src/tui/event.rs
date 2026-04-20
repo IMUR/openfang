@@ -121,6 +121,11 @@ pub enum AppEvent {
     SkillUninstalled(String),
     /// MCP servers loaded.
     McpServersLoaded(Vec<McpServerInfo>),
+    /// Skill config details loaded (installed skill `c` key).
+    SkillConfigLoaded {
+        skill: String,
+        rows: Vec<crate::tui::screens::skills::SkillConfigVarDetail>,
+    },
     /// Templates providers loaded (auth status).
     TemplateProvidersLoaded(Vec<ProviderAuth>),
     /// Security features loaded.
@@ -608,10 +613,8 @@ pub fn spawn_fetch_channels(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                             arr.iter()
                                 .map(|ch| {
                                     use super::screens::channels::ChannelStatus;
-                                    let configured =
-                                        ch["configured"].as_bool().unwrap_or(false);
-                                    let has_token =
-                                        ch["has_token"].as_bool().unwrap_or(false);
+                                    let configured = ch["configured"].as_bool().unwrap_or(false);
+                                    let has_token = ch["has_token"].as_bool().unwrap_or(false);
                                     let status = if configured && has_token {
                                         ChannelStatus::Ready
                                     } else if configured {
@@ -755,9 +758,13 @@ pub fn spawn_fetch_workflow_runs(
                             arr.iter()
                                 .map(|r| WorkflowRun {
                                     id: r["id"].as_str().unwrap_or("?").to_string(),
-                                    state: r["state"].as_str()
-                                        .or_else(|| r["state"].as_object().and_then(|_| Some("running")))
-                                        .unwrap_or("?").to_string(),
+                                    state: r["state"]
+                                        .as_str()
+                                        .or_else(|| {
+                                            r["state"].as_object().and_then(|_| Some("running"))
+                                        })
+                                        .unwrap_or("?")
+                                        .to_string(),
                                     duration: r["completed_at"].as_str().unwrap_or("").to_string(),
                                     output_preview: format!(
                                         "{} step(s)",
@@ -843,7 +850,10 @@ pub fn spawn_create_workflow(
             {
                 Ok(resp) => {
                     let body: serde_json::Value = resp.json().unwrap_or_default();
-                    let id = body["workflow_id"].as_str().unwrap_or("created").to_string();
+                    let id = body["workflow_id"]
+                        .as_str()
+                        .unwrap_or("created")
+                        .to_string();
                     let _ = tx.send(AppEvent::WorkflowCreated(id));
                 }
                 Err(e) => {
@@ -877,7 +887,8 @@ pub fn spawn_fetch_triggers(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                                 .map(|tr| TriggerInfo {
                                     id: tr["id"].as_str().unwrap_or("?").to_string(),
                                     agent_id: tr["agent_id"].as_str().unwrap_or("?").to_string(),
-                                    pattern: tr["pattern"].as_str()
+                                    pattern: tr["pattern"]
+                                        .as_str()
                                         .map(String::from)
                                         .unwrap_or_else(|| tr["pattern"].to_string()),
                                     fires: tr["fire_count"].as_u64().unwrap_or(0),
@@ -1461,6 +1472,14 @@ pub fn spawn_fetch_skills(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                                         .as_str()
                                         .unwrap_or("")
                                         .to_string(),
+                                    config_declared: s["config_declared_count"]
+                                        .as_u64()
+                                        .unwrap_or(0)
+                                        as usize,
+                                    config_resolved: s["config_resolved_count"]
+                                        .as_u64()
+                                        .unwrap_or(0)
+                                        as usize,
                                 })
                                 .collect()
                         })
@@ -1632,6 +1651,89 @@ pub fn spawn_fetch_mcp_servers(backend: BackendRef, tx: mpsc::Sender<AppEvent>) 
         }
         BackendRef::InProcess(_) => {
             let _ = tx.send(AppEvent::McpServersLoaded(Vec::new()));
+        }
+    });
+}
+
+/// Fetch declared + resolved config for a specific installed skill.
+///
+/// Pulls `GET /api/skills/{id}/config` and flattens the response into the
+/// `SkillConfigVarDetail` rows that the TUI details pane renders. Secret
+/// values are already redacted by the daemon so nothing sensitive crosses
+/// the wire here.
+pub fn spawn_fetch_skill_config(
+    backend: BackendRef,
+    skill_name: String,
+    tx: mpsc::Sender<AppEvent>,
+) {
+    use crate::tui::screens::skills::SkillConfigVarDetail;
+    std::thread::spawn(move || match backend {
+        BackendRef::Daemon(base_url) => {
+            let client = daemon_client();
+            let encoded: String = skill_name
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
+                        c.to_string()
+                    } else {
+                        format!("%{:02X}", c as u32)
+                    }
+                })
+                .collect();
+            let url = format!("{base_url}/api/skills/{encoded}/config");
+            if let Ok(resp) = client.get(&url).send() {
+                if let Ok(body) = resp.json::<serde_json::Value>() {
+                    let declared = body.get("declared").cloned().unwrap_or_default();
+                    let resolved = body.get("resolved").cloned().unwrap_or_default();
+                    let mut rows: Vec<SkillConfigVarDetail> = Vec::new();
+                    if let Some(obj) = declared.as_object() {
+                        // Sort keys for deterministic output.
+                        let mut keys: Vec<&String> = obj.keys().collect();
+                        keys.sort();
+                        for k in keys {
+                            let d = &obj[k];
+                            let r = resolved.get(k).cloned().unwrap_or_default();
+                            let value_hint = r
+                                .get("value")
+                                .and_then(|v| v.as_str())
+                                .map(String::from)
+                                .unwrap_or_default();
+                            rows.push(SkillConfigVarDetail {
+                                name: k.clone(),
+                                description: d
+                                    .get("description")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                required: d
+                                    .get("required")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false),
+                                source: r
+                                    .get("source")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unresolved")
+                                    .to_string(),
+                                value_hint,
+                                is_secret: r
+                                    .get("is_secret")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false),
+                            });
+                        }
+                    }
+                    let _ = tx.send(AppEvent::SkillConfigLoaded {
+                        skill: skill_name,
+                        rows,
+                    });
+                }
+            }
+        }
+        BackendRef::InProcess(_) => {
+            let _ = tx.send(AppEvent::SkillConfigLoaded {
+                skill: skill_name,
+                rows: Vec::new(),
+            });
         }
     });
 }
@@ -1866,8 +1968,7 @@ pub fn spawn_fetch_providers(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                             .map(|arr| {
                                 arr.iter()
                                     .map(|p| {
-                                        let auth =
-                                            p["auth_status"].as_str().unwrap_or("missing");
+                                        let auth = p["auth_status"].as_str().unwrap_or("missing");
                                         let key_required =
                                             p["key_required"].as_bool().unwrap_or(true);
                                         let configured =
@@ -1932,20 +2033,11 @@ pub fn spawn_fetch_models(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                                 arr.iter()
                                     .map(|m| ModelInfo {
                                         id: m["id"].as_str().unwrap_or("").to_string(),
-                                        provider: m["provider"]
-                                            .as_str()
-                                            .unwrap_or("")
-                                            .to_string(),
+                                        provider: m["provider"].as_str().unwrap_or("").to_string(),
                                         tier: m["tier"].as_str().unwrap_or("").to_string(),
-                                        context_window: m["context_window"]
-                                            .as_u64()
-                                            .unwrap_or(0),
-                                        cost_input: m["input_cost_per_m"]
-                                            .as_f64()
-                                            .unwrap_or(0.0),
-                                        cost_output: m["output_cost_per_m"]
-                                            .as_f64()
-                                            .unwrap_or(0.0),
+                                        context_window: m["context_window"].as_u64().unwrap_or(0),
+                                        cost_input: m["input_cost_per_m"].as_f64().unwrap_or(0.0),
+                                        cost_output: m["output_cost_per_m"].as_f64().unwrap_or(0.0),
                                     })
                                     .collect()
                             })
@@ -2155,13 +2247,14 @@ pub fn spawn_fetch_peers(backend: BackendRef, tx: mpsc::Sender<AppEvent>) {
                         .map(|arr| {
                             arr.iter()
                                 .map(|p| {
-                                    let agent_count = p["agents"]
-                                        .as_array()
-                                        .map(|a| a.len() as u64)
-                                        .unwrap_or(0);
+                                    let agent_count =
+                                        p["agents"].as_array().map(|a| a.len() as u64).unwrap_or(0);
                                     PeerInfo {
                                         node_id: p["node_id"].as_str().unwrap_or("").to_string(),
-                                        node_name: p["node_name"].as_str().unwrap_or("").to_string(),
+                                        node_name: p["node_name"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string(),
                                         address: p["address"].as_str().unwrap_or("").to_string(),
                                         state: p["state"].as_str().unwrap_or("").to_string(),
                                         agent_count,
@@ -2337,13 +2430,22 @@ pub fn spawn_fetch_active_hands(backend: BackendRef, tx: mpsc::Sender<AppEvent>)
 }
 
 /// Activate a hand.
-pub fn spawn_activate_hand(backend: BackendRef, hand_id: String, tx: mpsc::Sender<AppEvent>) {
+pub fn spawn_activate_hand(
+    backend: BackendRef,
+    hand_id: String,
+    instance_name: Option<String>,
+    tx: mpsc::Sender<AppEvent>,
+) {
     std::thread::spawn(move || match backend {
         BackendRef::Daemon(base_url) => {
             let client = daemon_client();
+            let payload = match &instance_name {
+                Some(n) => serde_json::json!({ "instance_name": n }),
+                None => serde_json::json!({}),
+            };
             match client
                 .post(format!("{base_url}/api/hands/{hand_id}/activate"))
-                .json(&serde_json::json!({}))
+                .json(&payload)
                 .send()
             {
                 Ok(resp) if resp.status().is_success() => {
@@ -2363,7 +2465,7 @@ pub fn spawn_activate_hand(backend: BackendRef, hand_id: String, tx: mpsc::Sende
             }
         }
         BackendRef::InProcess(kernel) => {
-            match kernel.activate_hand(&hand_id, std::collections::HashMap::new()) {
+            match kernel.activate_hand(&hand_id, std::collections::HashMap::new(), instance_name) {
                 Ok(_) => {
                     let _ = tx.send(AppEvent::HandActivated(hand_id));
                 }

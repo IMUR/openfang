@@ -23,8 +23,7 @@ macro_rules! surreal_via_json {
                 surrealdb::types::Kind::Any
             }
             fn into_value(self) -> surrealdb::types::Value {
-                let json = serde_json::to_value(self)
-                    .unwrap_or(serde_json::Value::Null);
+                let json = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
                 surrealdb::types::SurrealValue::into_value(json)
             }
             fn from_value(value: surrealdb::types::Value) -> Result<Self, surrealdb::types::Error> {
@@ -494,10 +493,7 @@ impl SessionStore {
     }
 }
 
-fn write_jsonl_mirror_sync(
-    session: &Session,
-    sessions_dir: &Path,
-) -> Result<(), std::io::Error> {
+fn write_jsonl_mirror_sync(session: &Session, sessions_dir: &Path) -> Result<(), std::io::Error> {
     std::fs::create_dir_all(sessions_dir)?;
     let path = sessions_dir.join(format!("{}.jsonl", session.id.0));
     let mut file = std::fs::File::create(&path)?;
@@ -577,7 +573,7 @@ fn write_jsonl_mirror_sync(
     }
 
     Ok(())
-    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -724,7 +720,10 @@ mod tests {
 
         let dir = tempfile::TempDir::new().unwrap();
         let sessions_dir = dir.path().join("sessions");
-        store.write_jsonl_mirror(session.clone(), sessions_dir.clone()).await.unwrap();
+        store
+            .write_jsonl_mirror(session.clone(), sessions_dir.clone())
+            .await
+            .unwrap();
 
         let jsonl_path = sessions_dir.join(format!("{}.jsonl", session.id.0));
         assert!(jsonl_path.exists());

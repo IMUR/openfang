@@ -28,14 +28,16 @@ fn load_manifest(toml_str: &str) -> AgentManifest {
     toml::from_str(toml_str).expect("Should parse manifest")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_six_agent_fleet() {
     if std::env::var("GROQ_API_KEY").is_err() {
         eprintln!("GROQ_API_KEY not set, skipping multi-agent test");
         return;
     }
 
-    let kernel = OpenFangKernel::boot_with_config(test_config()).expect("Kernel should boot");
+    let kernel = OpenFangKernel::boot_with_config(test_config())
+        .await
+        .expect("Kernel should boot");
 
     // Define all 6 agents with different roles and models
     let agents = vec![

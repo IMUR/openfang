@@ -149,7 +149,7 @@ memory_write = ["self.*"]
 // ---------------------------------------------------------------------------
 
 /// Test: Concurrent agent spawns — verify kernel handles parallel agent creation.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn load_concurrent_agent_spawns() {
     let server = start_test_server().await;
     let client = reqwest::Client::new();
@@ -204,7 +204,7 @@ async fn load_concurrent_agent_spawns() {
 }
 
 /// Test: API endpoint latency — measure p50/p95/p99 for health, status, list agents.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn load_endpoint_latency() {
     let server = start_test_server().await;
     let client = reqwest::Client::new();
@@ -268,7 +268,7 @@ async fn load_endpoint_latency() {
 }
 
 /// Test: Concurrent reads — many clients hitting the same endpoints simultaneously.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn load_concurrent_reads() {
     let server = start_test_server().await;
     let client = reqwest::Client::new();
@@ -326,7 +326,7 @@ async fn load_concurrent_reads() {
 }
 
 /// Test: Session management under load — create, list, and switch sessions.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn load_session_management() {
     let server = start_test_server().await;
     let client = reqwest::Client::new();
@@ -427,7 +427,7 @@ async fn load_session_management() {
 }
 
 /// Test: Workflow creation and listing under load.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn load_workflow_operations() {
     let server = start_test_server().await;
     let client = reqwest::Client::new();
@@ -493,7 +493,7 @@ async fn load_workflow_operations() {
 }
 
 /// Test: Agent spawn + kill cycle — stress the registry.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn load_spawn_kill_cycle() {
     let server = start_test_server().await;
     let client = reqwest::Client::new();
@@ -549,7 +549,7 @@ async fn load_spawn_kill_cycle() {
 }
 
 /// Test: Prometheus metrics endpoint under sustained load.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn load_metrics_sustained() {
     let server = start_test_server().await;
     let client = reqwest::Client::new();

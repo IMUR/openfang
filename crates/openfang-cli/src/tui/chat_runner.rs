@@ -418,9 +418,8 @@ impl StandaloneChat {
                                         if a["status"].as_str() == Some("pending") {
                                             lines.push(format!(
                                                 "[{}] {} \u{2014} {} ({})",
-                                                &a["id"].as_str().unwrap_or("?")[..8.min(
-                                                    a["id"].as_str().unwrap_or("?").len()
-                                                )],
+                                                &a["id"].as_str().unwrap_or("?")[..8
+                                                    .min(a["id"].as_str().unwrap_or("?").len())],
                                                 a["agent_name"].as_str().unwrap_or("?"),
                                                 a["tool_name"].as_str().unwrap_or("?"),
                                                 a["description"].as_str().unwrap_or(""),

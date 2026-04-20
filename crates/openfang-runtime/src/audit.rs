@@ -135,8 +135,6 @@ impl AuditLog {
             hash: hash.clone(),
         };
 
-
-
         entries.push(entry);
         *tip = hash.clone();
         hash
@@ -279,6 +277,4 @@ mod tests {
         assert_eq!(log.tip_hash(), h2);
         assert_ne!(h2, h1);
     }
-
-
 }

@@ -19,7 +19,9 @@ use openfang_memory::MemorySubstrate;
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::agent::{AgentManifest, FallbackModel};
 use openfang_types::error::{OpenFangError, OpenFangResult};
-use openfang_types::memory::{Memory, MemoryFilter, MemorySource, scope as mem_scope, category as mem_category};
+use openfang_types::memory::{
+    category as mem_category, scope as mem_scope, Memory, MemoryFilter, MemorySource,
+};
 use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
 };
@@ -119,7 +121,10 @@ fn append_tool_error_guidance(tool_result_blocks: &mut Vec<ContentBlock>) {
 /// This runs on every write path before optional ML classification (Phase 5).
 ///
 /// Returns `(scope, category, priority)`.
-fn classify_memory(content: &str, source: &MemorySource) -> (&'static str, &'static str, &'static str) {
+fn classify_memory(
+    content: &str,
+    source: &MemorySource,
+) -> (&'static str, &'static str, &'static str) {
     let lower = content.to_lowercase();
 
     let scope = match source {
@@ -159,7 +164,11 @@ fn classify_memory(content: &str, source: &MemorySource) -> (&'static str, &'sta
         mem_category::FACT
     };
 
-    let priority = if is_user_directive(&lower) { "high" } else { "normal" };
+    let priority = if is_user_directive(&lower) {
+        "high"
+    } else {
+        "normal"
+    };
 
     (scope, category, priority)
 }
@@ -249,6 +258,30 @@ pub struct AgentLoopResult {
     pub memory_id: Option<String>,
 }
 
+/// Build the user-turn message, combining text with any image content blocks.
+///
+/// When the turn has both text and image blocks the text is emitted as the
+/// first block followed by the images so the LLM sees the full multimodal
+/// turn. When only one is present the single-mode representation is used.
+fn build_user_turn_message(user_message: &str, blocks: Option<Vec<ContentBlock>>) -> Message {
+    match blocks {
+        Some(blocks) if !blocks.is_empty() => {
+            if user_message.trim().is_empty() {
+                Message::user_with_blocks(blocks)
+            } else {
+                let mut combined = Vec::with_capacity(blocks.len() + 1);
+                combined.push(ContentBlock::Text {
+                    text: user_message.to_string(),
+                    provider_metadata: None,
+                });
+                combined.extend(blocks);
+                Message::user_with_blocks(combined)
+            }
+        }
+        _ => Message::user(user_message),
+    }
+}
+
 /// Run the agent execution loop for a single user message.
 ///
 /// This is the core of OpenFang: it loads session context, recalls memories,
@@ -267,12 +300,11 @@ pub async fn run_agent_loop(
     web_ctx: Option<&WebToolsContext>,
     browser_ctx: Option<&crate::browser::BrowserManager>,
     embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
-    #[cfg(feature = "memory-candle")]
-    reranker: Option<&crate::candle_reranker::CandleReranker>,
-    #[cfg(feature = "memory-candle")]
-    ner_driver: Option<&crate::candle_ner::CandleNerDriver>,
-    #[cfg(feature = "memory-candle")]
-    classifier: Option<&crate::candle_classifier::CandleClassifier>,
+    #[cfg(feature = "memory-candle")] reranker: Option<&crate::candle_reranker::CandleReranker>,
+    #[cfg(feature = "memory-candle")] ner_driver: Option<&crate::candle_ner::CandleNerDriver>,
+    #[cfg(feature = "memory-candle")] classifier: Option<
+        &crate::candle_classifier::CandleClassifier,
+    >,
     workspace_root: Option<&Path>,
     on_phase: Option<&PhaseCallback>,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
@@ -361,8 +393,10 @@ pub async fn run_agent_loop(
             match ner.extract_entities(user_message, 0.60).await {
                 Ok(query_entities) if !query_entities.is_empty() => {
                     use std::collections::HashSet;
-                    let query_names: HashSet<String> =
-                        query_entities.iter().map(|e| e.text.to_lowercase()).collect();
+                    let query_names: HashSet<String> = query_entities
+                        .iter()
+                        .map(|e| e.text.to_lowercase())
+                        .collect();
                     let mut scored: Vec<(usize, openfang_types::memory::MemoryFragment)> = memories
                         .into_iter()
                         .map(|frag| {
@@ -379,10 +413,10 @@ pub async fn run_agent_loop(
                                                         .find('-')
                                                         .map(|i| &s[i + 1..])
                                                         .unwrap_or(s);
-                                                    query_names.contains(
-                                                        &name_part.replace('_', " "),
-                                                    ) || query_names
-                                                        .contains(&name_part.to_lowercase())
+                                                    query_names
+                                                        .contains(&name_part.replace('_', " "))
+                                                        || query_names
+                                                            .contains(&name_part.to_lowercase())
                                                 })
                                                 .unwrap_or(false)
                                         })
@@ -420,8 +454,14 @@ pub async fn run_agent_loop(
             }
         };
         memories.sort_by_key(|f| scope_rank(f));
-        let semantic_n = memories.iter().filter(|f| f.scope == mem_scope::SEMANTIC).count();
-        let declarative_n = memories.iter().filter(|f| f.scope == mem_scope::DECLARATIVE).count();
+        let semantic_n = memories
+            .iter()
+            .filter(|f| f.scope == mem_scope::SEMANTIC)
+            .count();
+        let declarative_n = memories
+            .iter()
+            .filter(|f| f.scope == mem_scope::DECLARATIVE)
+            .count();
         if semantic_n > 0 || declarative_n > 0 {
             debug!(
                 semantic = semantic_n,
@@ -518,12 +558,10 @@ pub async fn run_agent_loop(
 
     // Add the user message to session history.
     // When content blocks are provided (e.g. text + image from a channel),
-    // use multimodal message format so the LLM receives the image for vision.
-    if let Some(blocks) = user_content_blocks {
-        session.messages.push(Message::user_with_blocks(blocks));
-    } else {
-        session.messages.push(Message::user(user_message));
-    }
+    // combine them with the user text so the LLM sees the full multimodal turn.
+    session
+        .messages
+        .push(build_user_turn_message(user_message, user_content_blocks));
 
     // Build the messages for the LLM, filtering system messages
     // System prompt goes into the separate `system` field.
@@ -572,6 +610,10 @@ pub async fn run_agent_loop(
 
     let mut total_usage = TokenUsage::default();
     let final_response;
+    // Accumulate text from intermediate iterations (tool_use turns may include text
+    // alongside tool calls — this text would otherwise be lost when the final
+    // EndTurn iteration has empty text).
+    let mut accumulated_text = String::new();
 
     // Safety valve: trim excessively long message histories to prevent context overflow.
     // The full compaction system handles sophisticated summarization, but this prevents
@@ -589,6 +631,10 @@ pub async fn run_agent_loop(
         // pair across the cut boundary, leaving orphaned blocks that cause the LLM
         // to return empty responses (input_tokens=0).
         messages = crate::session_repair::validate_and_repair(&messages);
+        // Ensure history starts with a user turn: trimming may have left an
+        // assistant turn at position 0, which strict providers (e.g. Gemini)
+        // reject with INVALID_ARGUMENT on function-call turns.
+        messages = crate::session_repair::ensure_starts_with_user(messages);
     }
 
     // Use autonomous config max_iterations if set, else default
@@ -628,6 +674,8 @@ pub async fn run_agent_loop(
         // which may have broken assistant→tool ordering invariants.
         if recovery != RecoveryStage::None {
             messages = crate::session_repair::validate_and_repair(&messages);
+            // Ensure history starts with a user turn after overflow recovery.
+            messages = crate::session_repair::ensure_starts_with_user(messages);
         }
 
         // Context guard: compact oversized tool results before LLM call
@@ -765,20 +813,30 @@ pub async fn run_agent_loop(
                     }
                 }
 
-                // Guard against empty response — covers both iteration 0 and post-tool cycles
+                // Guard against empty response — covers both iteration 0 and post-tool cycles.
+                // Use accumulated_text from intermediate tool_use iterations as fallback.
                 let text = if text.trim().is_empty() {
-                    warn!(
-                        agent = %manifest.name,
-                        iteration,
-                        input_tokens = total_usage.input_tokens,
-                        output_tokens = total_usage.output_tokens,
-                        messages_count = messages.len(),
-                        "Empty response from LLM — guard activated"
-                    );
-                    if any_tools_executed {
-                        "[Task completed — the agent executed tools but did not produce a text summary.]".to_string()
+                    if !accumulated_text.is_empty() {
+                        debug!(
+                            agent = %manifest.name,
+                            accumulated_len = accumulated_text.len(),
+                            "Using accumulated text from intermediate tool_use iterations"
+                        );
+                        accumulated_text.clone()
                     } else {
-                        "[The model returned an empty response. This usually means the model is overloaded, the context is too large, or the API key lacks credits. Try again or check /status.]".to_string()
+                        warn!(
+                            agent = %manifest.name,
+                            iteration,
+                            input_tokens = total_usage.input_tokens,
+                            output_tokens = total_usage.output_tokens,
+                            messages_count = messages.len(),
+                            "Empty response from LLM — guard activated"
+                        );
+                        if any_tools_executed {
+                            "[Task completed — the agent executed tools but did not produce a text summary.]".to_string()
+                        } else {
+                            "[The model returned an empty response. This usually means the model is overloaded, the context is too large, or the API key lacks credits. Try again or check /status.]".to_string()
+                        }
                     }
                 } else {
                     text
@@ -827,25 +885,28 @@ pub async fn run_agent_loop(
                 // Owned strings are required because &str from ClassificationResult
                 // would borrow a local that does not outlive the metadata block.
                 #[cfg(feature = "memory-candle")]
-                let (mem_scope_owned, mem_cat_owned, classification_src): (String, String, &'static str) =
-                    if let Some(clf) = classifier {
-                        match clf.classify(&interaction_text).await {
-                            Ok(result) => {
-                                debug!(
-                                    scope = %result.scope,
-                                    category = %result.category,
-                                    "Candle classifier overriding rule-based classification"
-                                );
-                                (result.scope, result.category, "candle")
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "Candle classifier failed, using rule-based");
-                                (rule_scope.to_string(), rule_cat.to_string(), "rule")
-                            }
+                let (mem_scope_owned, mem_cat_owned, classification_src): (
+                    String,
+                    String,
+                    &'static str,
+                ) = if let Some(clf) = classifier {
+                    match clf.classify(&interaction_text).await {
+                        Ok(result) => {
+                            debug!(
+                                scope = %result.scope,
+                                category = %result.category,
+                                "Candle classifier overriding rule-based classification"
+                            );
+                            (result.scope, result.category, "candle")
                         }
-                    } else {
-                        (rule_scope.to_string(), rule_cat.to_string(), "rule")
-                    };
+                        Err(e) => {
+                            warn!(error = %e, "Candle classifier failed, using rule-based");
+                            (rule_scope.to_string(), rule_cat.to_string(), "rule")
+                        }
+                    }
+                } else {
+                    (rule_scope.to_string(), rule_cat.to_string(), "rule")
+                };
                 #[cfg(feature = "memory-candle")]
                 let (mem_scope, mem_cat) = (mem_scope_owned.as_str(), mem_cat_owned.as_str());
                 #[cfg(not(feature = "memory-candle"))]
@@ -858,13 +919,13 @@ pub async fn run_agent_loop(
                 );
                 mem_meta.insert("source_role".into(), serde_json::json!("assistant"));
                 mem_meta.insert("turn_index".into(), serde_json::json!(turn_index));
-                mem_meta.insert(
-                    "token_count".into(),
-                    serde_json::json!(total_usage.total()),
-                );
+                mem_meta.insert("token_count".into(), serde_json::json!(total_usage.total()));
                 mem_meta.insert("category".into(), serde_json::json!(mem_cat));
                 mem_meta.insert("priority".into(), serde_json::json!(mem_prio));
-                mem_meta.insert("classification_source".into(), serde_json::json!(classification_src));
+                mem_meta.insert(
+                    "classification_source".into(),
+                    serde_json::json!(classification_src),
+                );
 
                 let written_memory_id: Option<String> = if let Some(emb) = embedding_driver {
                     match emb.embed_one(&interaction_text).await {
@@ -989,6 +1050,18 @@ pub async fn run_agent_loop(
                 // Reset MaxTokens continuation counter on tool use
                 consecutive_max_tokens = 0;
                 any_tools_executed = true;
+
+                // Capture any text content from this tool_use turn — the LLM may
+                // produce text alongside tool calls (e.g., a message to the user
+                // before calling memory_store). Without this, the text is lost if
+                // the next iteration returns EndTurn with empty text.
+                let intermediate_text = response.text();
+                if !intermediate_text.trim().is_empty() {
+                    if !accumulated_text.is_empty() {
+                        accumulated_text.push_str("\n\n");
+                    }
+                    accumulated_text.push_str(intermediate_text.trim());
+                }
 
                 // Execute tool calls
                 let assistant_blocks = response.content.clone();
@@ -1717,12 +1790,11 @@ pub async fn run_agent_loop_streaming(
     web_ctx: Option<&WebToolsContext>,
     browser_ctx: Option<&crate::browser::BrowserManager>,
     embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
-    #[cfg(feature = "memory-candle")]
-    reranker: Option<&crate::candle_reranker::CandleReranker>,
-    #[cfg(feature = "memory-candle")]
-    ner_driver: Option<&crate::candle_ner::CandleNerDriver>,
-    #[cfg(feature = "memory-candle")]
-    classifier: Option<&crate::candle_classifier::CandleClassifier>,
+    #[cfg(feature = "memory-candle")] reranker: Option<&crate::candle_reranker::CandleReranker>,
+    #[cfg(feature = "memory-candle")] ner_driver: Option<&crate::candle_ner::CandleNerDriver>,
+    #[cfg(feature = "memory-candle")] classifier: Option<
+        &crate::candle_classifier::CandleClassifier,
+    >,
     workspace_root: Option<&Path>,
     on_phase: Option<&PhaseCallback>,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
@@ -1794,7 +1866,10 @@ pub async fn run_agent_loop_streaming(
         if memories.len() > 1 {
             match rr.rerank(user_message, memories.clone()).await {
                 Ok(reranked) => {
-                    debug!(n = reranked.len(), "Cross-encoder reranked recall results (streaming)");
+                    debug!(
+                        n = reranked.len(),
+                        "Cross-encoder reranked recall results (streaming)"
+                    );
                     memories = reranked;
                 }
                 Err(e) => {
@@ -1811,8 +1886,10 @@ pub async fn run_agent_loop_streaming(
             match ner.extract_entities(user_message, 0.60).await {
                 Ok(query_entities) if !query_entities.is_empty() => {
                     use std::collections::HashSet;
-                    let query_names: HashSet<String> =
-                        query_entities.iter().map(|e| e.text.to_lowercase()).collect();
+                    let query_names: HashSet<String> = query_entities
+                        .iter()
+                        .map(|e| e.text.to_lowercase())
+                        .collect();
                     let mut scored: Vec<(usize, openfang_types::memory::MemoryFragment)> = memories
                         .into_iter()
                         .map(|frag| {
@@ -1829,10 +1906,10 @@ pub async fn run_agent_loop_streaming(
                                                         .find('-')
                                                         .map(|i| &s[i + 1..])
                                                         .unwrap_or(s);
-                                                    query_names.contains(
-                                                        &name_part.replace('_', " "),
-                                                    ) || query_names
-                                                        .contains(&name_part.to_lowercase())
+                                                    query_names
+                                                        .contains(&name_part.replace('_', " "))
+                                                        || query_names
+                                                            .contains(&name_part.to_lowercase())
                                                 })
                                                 .unwrap_or(false)
                                         })
@@ -1852,7 +1929,9 @@ pub async fn run_agent_loop_streaming(
                     );
                 }
                 Ok(_) => {}
-                Err(e) => debug!(error = %e, "NER on query failed (streaming), skipping graph boost"),
+                Err(e) => {
+                    debug!(error = %e, "NER on query failed (streaming), skipping graph boost")
+                }
             }
         }
     }
@@ -1868,8 +1947,14 @@ pub async fn run_agent_loop_streaming(
             }
         };
         memories.sort_by_key(|f| scope_rank(f));
-        let semantic_n = memories.iter().filter(|f| f.scope == mem_scope::SEMANTIC).count();
-        let declarative_n = memories.iter().filter(|f| f.scope == mem_scope::DECLARATIVE).count();
+        let semantic_n = memories
+            .iter()
+            .filter(|f| f.scope == mem_scope::SEMANTIC)
+            .count();
+        let declarative_n = memories
+            .iter()
+            .filter(|f| f.scope == mem_scope::DECLARATIVE)
+            .count();
         if semantic_n > 0 || declarative_n > 0 {
             debug!(
                 semantic = semantic_n,
@@ -1965,12 +2050,10 @@ pub async fn run_agent_loop_streaming(
 
     // Add the user message to session history.
     // When content blocks are provided (e.g. text + image from a channel),
-    // use multimodal message format so the LLM receives the image for vision.
-    if let Some(blocks) = user_content_blocks {
-        session.messages.push(Message::user_with_blocks(blocks));
-    } else {
-        session.messages.push(Message::user(user_message));
-    }
+    // combine them with the user text so the LLM sees the full multimodal turn.
+    session
+        .messages
+        .push(build_user_turn_message(user_message, user_content_blocks));
 
     let llm_messages: Vec<Message> = session
         .messages
@@ -2015,6 +2098,7 @@ pub async fn run_agent_loop_streaming(
 
     let mut total_usage = TokenUsage::default();
     let final_response;
+    let mut accumulated_text = String::new();
 
     // Safety valve: trim excessively long message histories to prevent context overflow.
     if messages.len() > MAX_HISTORY_MESSAGES {
@@ -2030,6 +2114,10 @@ pub async fn run_agent_loop_streaming(
         // pair across the cut boundary, leaving orphaned blocks that cause the LLM
         // to return empty responses (input_tokens=0).
         messages = crate::session_repair::validate_and_repair(&messages);
+        // Ensure history starts with a user turn: trimming may have left an
+        // assistant turn at position 0, which strict providers (e.g. Gemini)
+        // reject with INVALID_ARGUMENT on function-call turns.
+        messages = crate::session_repair::ensure_starts_with_user(messages);
     }
 
     // Use autonomous config max_iterations if set, else default
@@ -2087,6 +2175,8 @@ pub async fn run_agent_loop_streaming(
         // be followed by tool messages" errors after context overflow recovery.)
         if recovery != RecoveryStage::None {
             messages = crate::session_repair::validate_and_repair(&messages);
+            // Ensure history starts with a user turn after overflow recovery.
+            messages = crate::session_repair::ensure_starts_with_user(messages);
         }
 
         // Context guard: compact oversized tool results before LLM call
@@ -2224,20 +2314,29 @@ pub async fn run_agent_loop_streaming(
                     }
                 }
 
-                // Guard against empty response — covers both iteration 0 and post-tool cycles
+                // Guard against empty response — use accumulated text as fallback (streaming).
                 let text = if text.trim().is_empty() {
-                    warn!(
-                        agent = %manifest.name,
-                        iteration,
-                        input_tokens = total_usage.input_tokens,
-                        output_tokens = total_usage.output_tokens,
-                        messages_count = messages.len(),
-                        "Empty response from LLM (streaming) — guard activated"
-                    );
-                    if any_tools_executed {
-                        "[Task completed — the agent executed tools but did not produce a text summary.]".to_string()
+                    if !accumulated_text.is_empty() {
+                        debug!(
+                            agent = %manifest.name,
+                            accumulated_len = accumulated_text.len(),
+                            "Using accumulated text from intermediate tool_use iterations (streaming)"
+                        );
+                        accumulated_text.clone()
                     } else {
-                        "[The model returned an empty response. This usually means the model is overloaded, the context is too large, or the API key lacks credits. Try again or check /status.]".to_string()
+                        warn!(
+                            agent = %manifest.name,
+                            iteration,
+                            input_tokens = total_usage.input_tokens,
+                            output_tokens = total_usage.output_tokens,
+                            messages_count = messages.len(),
+                            "Empty response from LLM (streaming) — guard activated"
+                        );
+                        if any_tools_executed {
+                            "[Task completed — the agent executed tools but did not produce a text summary.]".to_string()
+                        } else {
+                            "[The model returned an empty response. This usually means the model is overloaded, the context is too large, or the API key lacks credits. Try again or check /status.]".to_string()
+                        }
                     }
                 } else {
                     text
@@ -2269,29 +2368,34 @@ pub async fn run_agent_loop_streaming(
                     classify_memory(&interaction_text, &mem_source_s);
                 // Phase 5: attempt ML classification; fall back to rule-based on error/absence.
                 #[cfg(feature = "memory-candle")]
-                let (mem_scope_s_owned, mem_cat_s_owned, classification_src_s): (String, String, &'static str) =
-                    if let Some(clf) = classifier {
-                        match clf.classify(&interaction_text).await {
-                            Ok(result) => {
-                                debug!(
-                                    scope = %result.scope,
-                                    category = %result.category,
-                                    "Candle classifier overriding rule-based classification (streaming)"
-                                );
-                                (result.scope, result.category, "candle")
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "Candle classifier failed (streaming), using rule-based");
-                                (rule_scope_s.to_string(), rule_cat_s.to_string(), "rule")
-                            }
+                let (mem_scope_s_owned, mem_cat_s_owned, classification_src_s): (
+                    String,
+                    String,
+                    &'static str,
+                ) = if let Some(clf) = classifier {
+                    match clf.classify(&interaction_text).await {
+                        Ok(result) => {
+                            debug!(
+                                scope = %result.scope,
+                                category = %result.category,
+                                "Candle classifier overriding rule-based classification (streaming)"
+                            );
+                            (result.scope, result.category, "candle")
                         }
-                    } else {
-                        (rule_scope_s.to_string(), rule_cat_s.to_string(), "rule")
-                    };
+                        Err(e) => {
+                            warn!(error = %e, "Candle classifier failed (streaming), using rule-based");
+                            (rule_scope_s.to_string(), rule_cat_s.to_string(), "rule")
+                        }
+                    }
+                } else {
+                    (rule_scope_s.to_string(), rule_cat_s.to_string(), "rule")
+                };
                 #[cfg(feature = "memory-candle")]
-                let (mem_scope_s, mem_cat_s) = (mem_scope_s_owned.as_str(), mem_cat_s_owned.as_str());
+                let (mem_scope_s, mem_cat_s) =
+                    (mem_scope_s_owned.as_str(), mem_cat_s_owned.as_str());
                 #[cfg(not(feature = "memory-candle"))]
-                let (mem_scope_s, mem_cat_s, classification_src_s) = (rule_scope_s, rule_cat_s, "rule");
+                let (mem_scope_s, mem_cat_s, classification_src_s) =
+                    (rule_scope_s, rule_cat_s, "rule");
                 let turn_index_s = session.messages.len();
                 let mut mem_meta_s: HashMap<String, serde_json::Value> = HashMap::new();
                 mem_meta_s.insert(
@@ -2300,13 +2404,13 @@ pub async fn run_agent_loop_streaming(
                 );
                 mem_meta_s.insert("source_role".into(), serde_json::json!("assistant"));
                 mem_meta_s.insert("turn_index".into(), serde_json::json!(turn_index_s));
-                mem_meta_s.insert(
-                    "token_count".into(),
-                    serde_json::json!(total_usage.total()),
-                );
+                mem_meta_s.insert("token_count".into(), serde_json::json!(total_usage.total()));
                 mem_meta_s.insert("category".into(), serde_json::json!(mem_cat_s));
                 mem_meta_s.insert("priority".into(), serde_json::json!(mem_prio_s));
-                mem_meta_s.insert("classification_source".into(), serde_json::json!(classification_src_s));
+                mem_meta_s.insert(
+                    "classification_source".into(),
+                    serde_json::json!(classification_src_s),
+                );
 
                 let written_memory_id_s: Option<String> = if let Some(emb) = embedding_driver {
                     match emb.embed_one(&interaction_text).await {
@@ -2431,6 +2535,15 @@ pub async fn run_agent_loop_streaming(
                 // Reset MaxTokens continuation counter on tool use
                 consecutive_max_tokens = 0;
                 any_tools_executed = true;
+
+                // Capture text from intermediate tool_use turns (streaming path).
+                let intermediate_text = response.text();
+                if !intermediate_text.trim().is_empty() {
+                    if !accumulated_text.is_empty() {
+                        accumulated_text.push_str("\n\n");
+                    }
+                    accumulated_text.push_str(intermediate_text.trim());
+                }
 
                 let assistant_blocks = response.content.clone();
 
@@ -3724,6 +3837,77 @@ mod tests {
         assert_eq!(MAX_HISTORY_MESSAGES, 20);
     }
 
+    fn sample_image_block() -> ContentBlock {
+        ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "aGVsbG8=".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_build_user_turn_text_only() {
+        let msg = build_user_turn_message("hello", None);
+        assert_eq!(msg.role, Role::User);
+        match msg.content {
+            MessageContent::Text(text) => assert_eq!(text, "hello"),
+            MessageContent::Blocks(_) => panic!("expected Text content for text-only turn"),
+        }
+    }
+
+    #[test]
+    fn test_build_user_turn_images_only() {
+        let msg = build_user_turn_message("", Some(vec![sample_image_block()]));
+        assert_eq!(msg.role, Role::User);
+        match msg.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(matches!(blocks[0], ContentBlock::Image { .. }));
+            }
+            MessageContent::Text(_) => panic!("expected Blocks content for images-only turn"),
+        }
+    }
+
+    #[test]
+    fn test_build_user_turn_text_and_images_combined() {
+        let msg =
+            build_user_turn_message("what is in this image?", Some(vec![sample_image_block()]));
+        assert_eq!(msg.role, Role::User);
+        match msg.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2, "text must be combined with images");
+                match &blocks[0] {
+                    ContentBlock::Text { text, .. } => {
+                        assert_eq!(text, "what is in this image?");
+                    }
+                    _ => panic!("expected first block to be user text"),
+                }
+                assert!(matches!(blocks[1], ContentBlock::Image { .. }));
+            }
+            MessageContent::Text(_) => panic!("expected Blocks content for multimodal turn"),
+        }
+    }
+
+    #[test]
+    fn test_build_user_turn_whitespace_text_treated_as_empty() {
+        let msg = build_user_turn_message("   \n", Some(vec![sample_image_block()]));
+        match msg.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(matches!(blocks[0], ContentBlock::Image { .. }));
+            }
+            MessageContent::Text(_) => panic!("expected Blocks content"),
+        }
+    }
+
+    #[test]
+    fn test_build_user_turn_empty_blocks_falls_back_to_text() {
+        let msg = build_user_turn_message("hi", Some(Vec::new()));
+        match msg.content {
+            MessageContent::Text(text) => assert_eq!(text, "hi"),
+            MessageContent::Blocks(_) => panic!("expected Text content when blocks are empty"),
+        }
+    }
+
     // --- Integration tests for empty response guards ---
 
     fn test_manifest() -> AgentManifest {
@@ -3842,7 +4026,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_response_after_tool_use_returns_fallback() {
-        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
         let agent_id = openfang_types::agent::AgentId::new();
         let mut session = openfang_memory::session::Session {
             id: openfang_types::agent::SessionId::new(),
@@ -3895,7 +4081,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_error_injects_no_fabrication_guidance() {
-        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
         let agent_id = openfang_types::agent::AgentId::new();
         let mut session = openfang_memory::session::Session {
             id: openfang_types::agent::SessionId::new(),
@@ -3950,7 +4138,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_response_max_tokens_returns_fallback() {
-        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
         let agent_id = openfang_types::agent::AgentId::new();
         let mut session = openfang_memory::session::Session {
             id: openfang_types::agent::SessionId::new(),
@@ -4003,7 +4193,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_normal_response_not_replaced_by_fallback() {
-        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
         let agent_id = openfang_types::agent::AgentId::new();
         let mut session = openfang_memory::session::Session {
             id: openfang_types::agent::SessionId::new(),
@@ -4047,7 +4239,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_streaming_empty_response_after_tool_use_returns_fallback() {
-        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
         let agent_id = openfang_types::agent::AgentId::new();
         let mut session = openfang_memory::session::Session {
             id: openfang_types::agent::SessionId::new(),
@@ -4173,7 +4367,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_first_response_retries_and_recovers() {
-        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
         let agent_id = openfang_types::agent::AgentId::new();
         let mut session = openfang_memory::session::Session {
             id: openfang_types::agent::SessionId::new(),
@@ -4220,7 +4416,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_first_response_fallback_when_retry_also_empty() {
-        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
         let agent_id = openfang_types::agent::AgentId::new();
         let mut session = openfang_memory::session::Session {
             id: openfang_types::agent::SessionId::new(),
@@ -4273,7 +4471,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_streaming_empty_response_max_tokens_returns_fallback() {
-        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
         let agent_id = openfang_types::agent::AgentId::new();
         let mut session = openfang_memory::session::Session {
             id: openfang_types::agent::SessionId::new(),
@@ -5239,7 +5439,9 @@ mod tests {
         // This is THE critical test: a model outputs a tool call as text,
         // the recovery code detects it, promotes it to ToolUse, executes the tool,
         // and the agent loop continues to produce a final response.
-        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
         let agent_id = openfang_types::agent::AgentId::new();
         let mut session = openfang_memory::session::Session {
             id: openfang_types::agent::SessionId::new(),
@@ -5310,7 +5512,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_nested_xml_text_tool_call_recovery_e2e() {
-        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
         let agent_id = openfang_types::agent::AgentId::new();
         let mut session = openfang_memory::session::Session {
             id: openfang_types::agent::SessionId::new(),
@@ -5387,7 +5591,9 @@ mod tests {
     /// Verifies recovery does NOT interfere with normal flow.
     #[tokio::test]
     async fn test_normal_flow_unaffected_by_recovery() {
-        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
         let agent_id = openfang_types::agent::AgentId::new();
         let mut session = openfang_memory::session::Session {
             id: openfang_types::agent::SessionId::new(),
@@ -5442,7 +5648,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_text_tool_call_recovery_streaming_e2e() {
-        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
         let agent_id = openfang_types::agent::AgentId::new();
         let mut session = openfang_memory::session::Session {
             id: openfang_types::agent::SessionId::new(),

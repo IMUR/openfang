@@ -113,10 +113,7 @@ pub async fn resolve_model(
             .await
             .map_err(|e| ModelCacheError::Hub(format!("weights: {e}")))?
     };
-    let weights_dest = if weights_hf
-        .to_string_lossy()
-        .ends_with("model.safetensors")
-    {
+    let weights_dest = if weights_hf.to_string_lossy().ends_with("model.safetensors") {
         cache_dir.join("model.safetensors")
     } else {
         cache_dir.join("pytorch_model.bin")

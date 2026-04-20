@@ -6,8 +6,8 @@ use chrono::Utc;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use serde::{Deserialize, Serialize};
-use surrealdb::types::SurrealValue;
 use std::collections::HashMap;
+use surrealdb::types::SurrealValue;
 
 use crate::db::SurrealDb;
 

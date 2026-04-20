@@ -115,6 +115,32 @@ pub async fn build_router(
 
     // Trim whitespace so `api_key = ""` or `api_key = "  "` both disable auth.
     let api_key = state.kernel.config.api_key.trim().to_string();
+    let allow_no_auth = std::env::var("OPENFANG_ALLOW_NO_AUTH")
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false);
+
+    // Fail-closed warning: if no api_key and no dashboard auth, and the
+    // server is bound to a non-loopback address without an explicit opt-in,
+    // shout about it. The middleware will reject non-loopback traffic.
+    let bind_is_loopback = listen_addr.ip().is_loopback();
+    if api_key.is_empty() && !state.kernel.config.auth.enabled && !bind_is_loopback {
+        if allow_no_auth {
+            tracing::warn!(
+                "OPENFANG_ALLOW_NO_AUTH=1 is set. Running WITHOUT authentication on {}. \
+                 Anyone reachable at this address can read/write agents, channels, and keys.",
+                listen_addr
+            );
+        } else {
+            tracing::warn!(
+                "No api_key configured and server is bound to {} (non-loopback). \
+                 Non-loopback requests will be rejected with 401. \
+                 Set OPENFANG_API_KEY (or api_key in config.toml), or bind to 127.0.0.1, \
+                 or set OPENFANG_ALLOW_NO_AUTH=1 to explicitly run open.",
+                listen_addr
+            );
+        }
+    }
+
     let auth_state = crate::middleware::AuthState {
         api_key: api_key.clone(),
         auth_enabled: state.kernel.config.auth.enabled,
@@ -125,10 +151,12 @@ pub async fn build_router(
         } else {
             String::new()
         },
+        allow_no_auth,
     };
     let gcra_limiter = rate_limiter::create_rate_limiter();
 
-    let app = Router::new().route("/", axum::routing::get(webchat::webchat_page))
+    let app = Router::new()
+        .route("/", axum::routing::get(webchat::webchat_page))
         .route("/logo.png", axum::routing::get(webchat::logo_png))
         .route("/favicon.ico", axum::routing::get(webchat::favicon_ico))
         .route("/manifest.json", axum::routing::get(webchat::manifest_json))
@@ -319,6 +347,10 @@ pub async fn build_router(
             "/api/schedules/{id}/run",
             axum::routing::post(routes::run_schedule),
         )
+        .route(
+            "/api/schedules/{id}/delivery-log",
+            axum::routing::get(routes::schedule_delivery_log),
+        )
         // Workflow endpoints
         .route(
             "/api/workflows",
@@ -351,6 +383,14 @@ pub async fn build_router(
         .route(
             "/api/skills/reload",
             axum::routing::post(routes::reload_skills),
+        )
+        .route(
+            "/api/skills/{id}/config",
+            axum::routing::get(routes::get_skill_config).put(routes::put_skill_config),
+        )
+        .route(
+            "/api/skills/{id}/config/{var_name}",
+            axum::routing::delete(routes::delete_skill_config_var),
         )
         .route(
             "/api/marketplace/search",
@@ -824,7 +864,10 @@ pub async fn run_daemon(
                     restrict_permissions(info_path);
                 }
                 Err(e) => {
-                    tracing::error!("Failed to write daemon info to {}: {e}", info_path.display());
+                    tracing::error!(
+                        "Failed to write daemon info to {}: {e}",
+                        info_path.display()
+                    );
                 }
             },
             Err(e) => {

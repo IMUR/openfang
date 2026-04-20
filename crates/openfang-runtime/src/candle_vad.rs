@@ -15,8 +15,8 @@
 //! - Thread-safe via `Arc<Mutex<Inner>>` — sequential access is fine for VAD
 
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{conv1d, conv1d_no_bias, lstm, Conv1d, Conv1dConfig, Module, VarBuilder, LSTM};
 use candle_nn::rnn::{LSTMConfig, LSTMState, RNN};
+use candle_nn::{conv1d, conv1d_no_bias, lstm, Conv1d, Conv1dConfig, Module, VarBuilder, LSTM};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
@@ -78,11 +78,9 @@ impl SileroVad {
         info!("Loading Silero VAD v5 from {}", path.display());
 
         // Load model weights (blocking, offload)
-        let inner = tokio::task::spawn_blocking(move || {
-            Self::load_inner(&path)
-        })
-        .await
-        .map_err(|e| VadError::Load(format!("spawn_blocking: {e}")))??;
+        let inner = tokio::task::spawn_blocking(move || Self::load_inner(&path))
+            .await
+            .map_err(|e| VadError::Load(format!("spawn_blocking: {e}")))??;
 
         info!("Silero VAD v5 loaded (candle, CPU)");
         Ok(Self {
@@ -114,14 +112,52 @@ impl SileroVad {
         // Encoder: 4 Conv1d layers with bias
         // Safetensors keys: encoder.{0,1,2,3}.conv.{weight,bias}
         let encoder = vec![
-            conv1d(129, 128, 3, Conv1dConfig { padding: 1, ..Default::default() }, vb.pp("encoder.0.conv"))
-                .map_err(|e| VadError::Load(format!("encoder.0: {e}")))?,
-            conv1d(128, 64, 3, Conv1dConfig { padding: 1, stride: 2, ..Default::default() }, vb.pp("encoder.1.conv"))
-                .map_err(|e| VadError::Load(format!("encoder.1: {e}")))?,
-            conv1d(64, 64, 3, Conv1dConfig { padding: 1, stride: 2, ..Default::default() }, vb.pp("encoder.2.conv"))
-                .map_err(|e| VadError::Load(format!("encoder.2: {e}")))?,
-            conv1d(64, 128, 3, Conv1dConfig { padding: 1, ..Default::default() }, vb.pp("encoder.3.conv"))
-                .map_err(|e| VadError::Load(format!("encoder.3: {e}")))?,
+            conv1d(
+                129,
+                128,
+                3,
+                Conv1dConfig {
+                    padding: 1,
+                    ..Default::default()
+                },
+                vb.pp("encoder.0.conv"),
+            )
+            .map_err(|e| VadError::Load(format!("encoder.0: {e}")))?,
+            conv1d(
+                128,
+                64,
+                3,
+                Conv1dConfig {
+                    padding: 1,
+                    stride: 2,
+                    ..Default::default()
+                },
+                vb.pp("encoder.1.conv"),
+            )
+            .map_err(|e| VadError::Load(format!("encoder.1: {e}")))?,
+            conv1d(
+                64,
+                64,
+                3,
+                Conv1dConfig {
+                    padding: 1,
+                    stride: 2,
+                    ..Default::default()
+                },
+                vb.pp("encoder.2.conv"),
+            )
+            .map_err(|e| VadError::Load(format!("encoder.2: {e}")))?,
+            conv1d(
+                64,
+                128,
+                3,
+                Conv1dConfig {
+                    padding: 1,
+                    ..Default::default()
+                },
+                vb.pp("encoder.3.conv"),
+            )
+            .map_err(|e| VadError::Load(format!("encoder.3: {e}")))?,
         ];
 
         // LSTM: input=128, hidden=128
@@ -193,7 +229,9 @@ impl SileroVad {
 
         // Reflection padding: pad right by 64 to get 640 samples
         let pad_start = INPUT_SIZE - CONTEXT_SIZE; // 512
-        let pad_slice = x.narrow(1, pad_start - CONTEXT_SIZE, CONTEXT_SIZE).map_err(map_err)?;
+        let pad_slice = x
+            .narrow(1, pad_start - CONTEXT_SIZE, CONTEXT_SIZE)
+            .map_err(map_err)?;
         let pad_slice = pad_slice.flip(&[1]).map_err(map_err)?;
         let x = Tensor::cat(&[&x, &pad_slice], 1).map_err(map_err)?;
         let x = x.unsqueeze(1).map_err(map_err)?; // [1, 1, 640]
@@ -220,7 +258,11 @@ impl SileroVad {
         let mut state = inner.lstm_state.clone();
         let mut last_h = state.h.clone();
         for t in 0..time_steps {
-            let xt = x.narrow(2, t, 1).map_err(map_err)?.squeeze(2).map_err(map_err)?;
+            let xt = x
+                .narrow(2, t, 1)
+                .map_err(map_err)?
+                .squeeze(2)
+                .map_err(map_err)?;
             state = inner.lstm.step(&xt, &state).map_err(map_err)?;
             last_h = state.h.clone();
         }
@@ -235,7 +277,11 @@ impl SileroVad {
         let x = candle_nn::ops::sigmoid(&x).map_err(map_err)?;
 
         // Extract scalar
-        let prob = x.flatten_all().map_err(map_err)?.to_vec1::<f32>().map_err(map_err)?;
+        let prob = x
+            .flatten_all()
+            .map_err(map_err)?
+            .to_vec1::<f32>()
+            .map_err(map_err)?;
         Ok(prob[0])
     }
 

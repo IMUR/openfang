@@ -16,6 +16,7 @@
 //! Server → Client: `{"type":"approval_expired","id":"..."}`
 
 use crate::routes::AppState;
+use crate::voice::{self, VoiceAction, VoiceProtocol, VoiceSession};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ConnectInfo, Path, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
@@ -26,6 +27,7 @@ use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::llm_driver::StreamEvent;
 use openfang_runtime::llm_errors;
 use openfang_types::agent::AgentId;
+use openfang_types::commands::{self, Surfaces};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
@@ -33,7 +35,6 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use crate::voice::{self, VoiceAction, VoiceProtocol, VoiceSession};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -150,11 +151,27 @@ pub async fn agent_ws(
     headers: axum::http::HeaderMap,
     uri: axum::http::Uri,
 ) -> impl IntoResponse {
-    // SECURITY: Authenticate WebSocket upgrades (bypasses middleware).
-    // Trim whitespace so empty/whitespace-only api_key disables auth.
+    // SECURITY: Authenticate WebSocket upgrades (bypasses HTTP middleware).
+    // Trim whitespace so empty/whitespace-only api_key still triggers the
+    // fail-closed path for non-loopback origins (see issue #1034 B2).
     let api_key_raw = &state.kernel.config.api_key;
     let api_key = api_key_raw.trim();
-    if !api_key.is_empty() {
+    let is_loopback = addr.ip().is_loopback();
+
+    if api_key.is_empty() {
+        // No key configured. Only allow loopback, unless the operator has
+        // explicitly opted in to running open via OPENFANG_ALLOW_NO_AUTH=1.
+        let allow_no_auth = std::env::var("OPENFANG_ALLOW_NO_AUTH")
+            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+            .unwrap_or(false);
+        if !is_loopback && !allow_no_auth {
+            warn!(
+                ip = %addr.ip(),
+                "WebSocket upgrade rejected: no api_key configured and origin is not loopback"
+            );
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        }
+    } else {
         // SECURITY: Use constant-time comparison to prevent timing attacks on API key
         let ct_eq = |token: &str, key: &str| -> bool {
             use subtle::ConstantTimeEq;
@@ -174,7 +191,8 @@ pub async fn agent_ws(
         let query_auth = uri
             .query()
             .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")))
-            .map(|token| ct_eq(token, api_key))
+            .map(crate::percent_decode)
+            .map(|token| ct_eq(&token, api_key))
             .unwrap_or(false);
 
         if !header_auth && !query_auth {
@@ -201,9 +219,29 @@ pub async fn agent_ws(
         }
     };
 
-    // Verify agent exists
-    if state.kernel.registry.get(agent_id).is_none() {
-        return axum::http::StatusCode::NOT_FOUND.into_response();
+    // Verify agent exists.
+    // Retry up to 5 times with 200ms backoff to handle a timing race where
+    // the client connects before the agent finishes registering (#804).
+    {
+        let mut found = state.kernel.registry.get(agent_id).is_some();
+        if !found {
+            for attempt in 1..=4 {
+                debug!(
+                    agent_id = %id,
+                    attempt,
+                    "Agent not found yet, retrying in 200ms"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if state.kernel.registry.get(agent_id).is_some() {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            warn!(agent_id = %id, "Agent not found after 5 lookup attempts");
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        }
     }
 
     let id_str = id.clone();
@@ -339,9 +377,7 @@ async fn handle_agent_ws(
                             "id": id.to_string(),
                             "decision": format!("{:?}", decision).to_lowercase(),
                         }),
-                        ApprovalEvent::Expired { id, agent_id }
-                            if *agent_id == agent_id_str =>
-                        {
+                        ApprovalEvent::Expired { id, agent_id } if *agent_id == agent_id_str => {
                             serde_json::json!({
                                 "type": "approval_expired",
                                 "id": id.to_string(),
@@ -525,9 +561,8 @@ async fn handle_agent_ws(
                             VoiceAction::Continue => {}
                             VoiceAction::SpeechStarted => {
                                 // Send VadSpeechStart to client
-                                let frame = voice::encode_binary_frame(
-                                    &VoiceProtocol::VadSpeechStart,
-                                );
+                                let frame =
+                                    voice::encode_binary_frame(&VoiceProtocol::VadSpeechStart);
                                 let mut s = sender.lock().await;
                                 let _ = s.send(Message::Binary(frame.into())).await;
                             }
@@ -546,9 +581,8 @@ async fn handle_agent_ws(
 
                                 // Send SpeechEnd to stop client playback
                                 {
-                                    let frame = voice::encode_binary_frame(
-                                        &VoiceProtocol::SpeechEnd,
-                                    );
+                                    let frame =
+                                        voice::encode_binary_frame(&VoiceProtocol::SpeechEnd);
                                     let mut s = sender.lock().await;
                                     let _ = s.send(Message::Binary(frame.into())).await;
                                 }
@@ -562,7 +596,8 @@ async fn handle_agent_ws(
                             VoiceAction::Transcribe(pcm_buffer) => {
                                 // Send VadSpeechEnd to client
                                 {
-                                    let frame = voice::encode_binary_frame(&VoiceProtocol::VadSpeechEnd);
+                                    let frame =
+                                        voice::encode_binary_frame(&VoiceProtocol::VadSpeechEnd);
                                     let mut s = sender.lock().await;
                                     let _ = s.send(Message::Binary(frame.into())).await;
                                 }
@@ -572,23 +607,25 @@ async fn handle_agent_ws(
                                     &session.config.stt_endpoint,
                                     &session.config.stt_model,
                                 );
-                                let transcription = match stt_client.transcribe(&pcm_buffer, 16000).await {
-                                    Ok(text) if !text.is_empty() => text,
-                                    Ok(_) => {
-                                        session.state = voice::VoiceSessionState::Idle;
-                                        continue; // empty transcription, go back to listening
-                                    }
-                                    Err(e) => {
-                                        warn!(agent_id = %id_str, error = %e, "STT failed");
-                                        let err = voice::encode_binary_frame(&VoiceProtocol::Error(
-                                            format!("Transcription failed: {e}"),
-                                        ));
-                                        let mut s = sender.lock().await;
-                                        let _ = s.send(Message::Binary(err.into())).await;
-                                        session.state = voice::VoiceSessionState::Idle;
-                                        continue;
-                                    }
-                                };
+                                let transcription =
+                                    match stt_client.transcribe(&pcm_buffer, 16000).await {
+                                        Ok(text) if !text.is_empty() => text,
+                                        Ok(_) => {
+                                            session.state = voice::VoiceSessionState::Idle;
+                                            continue; // empty transcription, go back to listening
+                                        }
+                                        Err(e) => {
+                                            warn!(agent_id = %id_str, error = %e, "STT failed");
+                                            let err =
+                                                voice::encode_binary_frame(&VoiceProtocol::Error(
+                                                    format!("Transcription failed: {e}"),
+                                                ));
+                                            let mut s = sender.lock().await;
+                                            let _ = s.send(Message::Binary(err.into())).await;
+                                            session.state = voice::VoiceSessionState::Idle;
+                                            continue;
+                                        }
+                                    };
 
                                 info!(agent_id = %id_str, text = %transcription, "Voice transcription");
                                 session.state = voice::VoiceSessionState::Processing;
@@ -636,8 +673,10 @@ async fn handle_agent_ws(
                                         let use_opus = session.init.codec != "pcm16";
 
                                         // Voice cloning: prefer session-level ref, fall back to config
-                                        let clone_ref = session.init.voice_clone_ref.clone()
-                                            .or_else(|| session.config.tts_voice_clone_ref.clone());
+                                        let clone_ref =
+                                            session.init.voice_clone_ref.clone().or_else(|| {
+                                                session.config.tts_voice_clone_ref.clone()
+                                            });
 
                                         // Create a fresh cancel token for this voice task
                                         voice_cancel = CancellationToken::new();
@@ -648,8 +687,12 @@ async fn handle_agent_ws(
                                                 &tts_endpoint,
                                                 &tts_voice,
                                                 tts_speed,
-                                            ).with_voice_clone_ref(clone_ref.as_deref());
-                                            let mut sentence_buf = voice::SentenceBuffer::with_min_chars(tts_min_chunk);
+                                            )
+                                            .with_voice_clone_ref(clone_ref.as_deref());
+                                            let mut sentence_buf =
+                                                voice::SentenceBuffer::with_min_chars(
+                                                    tts_min_chunk,
+                                                );
                                             let mut accumulated_text = String::new();
 
                                             // Send SpeechStart
@@ -690,12 +733,23 @@ async fn handle_agent_ws(
                                                                 .await
                                                             {
                                                                 Ok(pcm) => {
-                                                                    for frame in voice::encode_pcm_to_frames(&pcm, use_opus) {
+                                                                    for frame in
+                                                                        voice::encode_pcm_to_frames(
+                                                                            &pcm, use_opus,
+                                                                        )
+                                                                    {
                                                                         if cancel.is_cancelled() {
                                                                             break;
                                                                         }
-                                                                        let mut s = sender_voice.lock().await;
-                                                                        if s.send(Message::Binary(frame.into())).await.is_err() {
+                                                                        let mut s = sender_voice
+                                                                            .lock()
+                                                                            .await;
+                                                                        if s.send(Message::Binary(
+                                                                            frame.into(),
+                                                                        ))
+                                                                        .await
+                                                                        .is_err()
+                                                                        {
                                                                             return accumulated_text;
                                                                         }
                                                                     }
@@ -716,19 +770,27 @@ async fn handle_agent_ws(
                                                         )
                                                         .await;
                                                     }
-                                                    StreamEvent::ContentComplete { stop_reason, .. } => {
+                                                    StreamEvent::ContentComplete {
+                                                        stop_reason,
+                                                        ..
+                                                    } => {
                                                         // Only break on a final stop — EndTurn or
                                                         // StopSequence.  A ToolUse stop means the
                                                         // agent loop will continue with more TextDelta
                                                         // events after tool execution; breaking here
                                                         // would silently discard the final spoken reply.
                                                         use openfang_types::message::StopReason;
-                                                        if matches!(stop_reason, StopReason::ToolUse | StopReason::MaxTokens) {
+                                                        if matches!(
+                                                            stop_reason,
+                                                            StopReason::ToolUse
+                                                                | StopReason::MaxTokens
+                                                        ) {
                                                             continue;
                                                         }
                                                         // Flush remaining sentence buffer
                                                         if !cancel.is_cancelled() {
-                                                            if let Some(tail) = sentence_buf.flush() {
+                                                            if let Some(tail) = sentence_buf.flush()
+                                                            {
                                                                 if !tail.trim().is_empty() {
                                                                     if let Ok(pcm) = tts_client
                                                                         .synthesize(&tail)
@@ -744,7 +806,9 @@ async fn handle_agent_ws(
                                                         }
                                                         break;
                                                     }
-                                                    StreamEvent::ToolUseStart { ref name, .. } => {
+                                                    StreamEvent::ToolUseStart {
+                                                        ref name, ..
+                                                    } => {
                                                         // Send tool status as JSON (not spoken)
                                                         let _ = send_json(
                                                             &sender_voice,
@@ -805,9 +869,9 @@ async fn handle_agent_ws(
                                     }
                                     Err(e) => {
                                         warn!(agent_id = %id_str, error = %e, "Voice message dispatch failed");
-                                        let err = voice::encode_binary_frame(&VoiceProtocol::Error(
-                                            format!("Agent error: {e}"),
-                                        ));
+                                        let err = voice::encode_binary_frame(
+                                            &VoiceProtocol::Error(format!("Agent error: {e}")),
+                                        );
                                         let mut s = sender.lock().await;
                                         let _ = s.send(Message::Binary(err.into())).await;
                                         if let Some(ref mut s) = voice_session {
@@ -835,9 +899,7 @@ async fn handle_agent_ws(
 
                             // Send SpeechEnd so client stops playback
                             {
-                                let frame = voice::encode_binary_frame(
-                                    &VoiceProtocol::SpeechEnd,
-                                );
+                                let frame = voice::encode_binary_frame(&VoiceProtocol::SpeechEnd);
                                 let mut s = sender.lock().await;
                                 let _ = s.send(Message::Binary(frame.into())).await;
                             }
@@ -1307,8 +1369,17 @@ async fn handle_command(
     args: &str,
     verbose: &Arc<AtomicU8>,
 ) -> serde_json::Value {
-    match cmd {
-        "new" | "reset" => match state.kernel.reset_session(agent_id).await {
+    // Canonicalise through the unified command registry. This resolves aliases
+    // (e.g. `reset` -> `new`) and is case-insensitive. If the command is not
+    // registered on the WEB surface, fall through to the existing match so any
+    // legacy/un-registered handlers still work byte-identically.
+    let canonical: &str = commands::resolve(cmd)
+        .filter(|def| def.surfaces.contains(Surfaces::WEB))
+        .map(|def| def.name)
+        .unwrap_or(cmd);
+
+    match canonical {
+        "new" => match state.kernel.reset_session(agent_id).await {
             Ok(()) => {
                 serde_json::json!({"type": "command_result", "command": cmd, "message": "Session reset. Chat history cleared."})
             }
@@ -1477,7 +1548,20 @@ async fn handle_command(
             };
             serde_json::json!({"type": "command_result", "command": cmd, "message": msg})
         }
-        _ => serde_json::json!({"type": "error", "content": format!("Unknown command: {cmd}")}),
+        "help" => {
+            serde_json::json!({
+                "type": "command_result",
+                "command": cmd,
+                "message": commands::render_help(Surfaces::WEB),
+            })
+        }
+        _ => serde_json::json!({
+            "type": "error",
+            "content": format!(
+                "Unknown command: /{cmd}\n\n{}",
+                commands::render_help(Surfaces::WEB)
+            ),
+        }),
     }
 }
 

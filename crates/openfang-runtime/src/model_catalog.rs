@@ -8,11 +8,11 @@ use openfang_types::model_catalog::{
     AZURE_OPENAI_BASE_URL, BEDROCK_BASE_URL, CEREBRAS_BASE_URL, CHUTES_BASE_URL, COHERE_BASE_URL,
     DEEPSEEK_BASE_URL, FIREWORKS_BASE_URL, GEMINI_BASE_URL, GITHUB_COPILOT_BASE_URL, GROQ_BASE_URL,
     HUGGINGFACE_BASE_URL, KIMI_CODING_BASE_URL, LEMONADE_BASE_URL, LMSTUDIO_BASE_URL,
-    MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NVIDIA_NIM_BASE_URL, OLLAMA_BASE_URL,
-    OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
-    REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL, VLLM_BASE_URL,
-    VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_CODING_BASE_URL,
-    ZHIPU_BASE_URL, ZHIPU_CODING_BASE_URL,
+    MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NOVITA_BASE_URL, NVIDIA_NIM_BASE_URL,
+    OLLAMA_BASE_URL, OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL,
+    QWEN_BASE_URL, REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL,
+    VLLM_BASE_URL, VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL,
+    ZAI_CODING_BASE_URL, ZHIPU_BASE_URL, ZHIPU_CODING_BASE_URL,
 };
 use std::collections::HashMap;
 
@@ -72,6 +72,21 @@ impl ModelCatalog {
                 } else {
                     AuthStatus::Missing
                 };
+                continue;
+            }
+
+            // GitHub Copilot: check for persisted OAuth tokens
+            if provider.id == "github-copilot" || provider.id == "copilot" {
+                let openfang_dir = std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .map(|h| std::path::PathBuf::from(h).join(".openfang"))
+                    .unwrap_or_else(|_| std::path::PathBuf::from(".openfang"));
+                provider.auth_status =
+                    if crate::drivers::copilot::copilot_auth_available(&openfang_dir) {
+                        AuthStatus::Configured
+                    } else {
+                        AuthStatus::Missing
+                    };
                 continue;
             }
 
@@ -765,6 +780,16 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             auth_status: AuthStatus::Missing,
             model_count: 0,
         },
+        // ── Novita AI ────────────────────────────────────────────────
+        ProviderInfo {
+            id: "novita".into(),
+            display_name: "Novita AI".into(),
+            api_key_env: "NOVITA_API_KEY".into(),
+            base_url: NOVITA_BASE_URL.into(),
+            key_required: true,
+            auth_status: AuthStatus::Missing,
+            model_count: 0,
+        },
         // ── Chinese providers (5) ────────────────────────────────────
         ProviderInfo {
             id: "qwen".into(),
@@ -952,11 +977,10 @@ fn builtin_aliases() -> HashMap<String, String> {
         ("command-r", "command-r-plus"),
         ("command", "command-a"),
         // GitHub Copilot aliases
-        ("copilot", "copilot/gpt-4o"),
-        ("copilot-4o", "copilot/gpt-4o"),
-        ("copilot-4", "copilot/gpt-4"),
-        ("copilot-gpt4o", "copilot/gpt-4o"),
-        ("copilot-gpt4", "copilot/gpt-4"),
+        ("copilot", "gpt-4o"),
+        ("copilot-4o", "gpt-4o"),
+        ("copilot-opus", "claude-opus-4.6"),
+        ("copilot-sonnet", "claude-sonnet-4.6"),
         // Chinese model aliases
         ("qwen", "qwen-plus"),
         ("glm", "glm-5.1"),
@@ -2895,36 +2919,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
         // ══════════════════════════════════════════════════════════════
-        // GitHub Copilot (2) — free for subscribers
+        // GitHub Copilot — models fetched dynamically at runtime.
+        // No static entries needed; see kernel.rs fetch_copilot_models().
         // ══════════════════════════════════════════════════════════════
-        ModelCatalogEntry {
-            id: "copilot/gpt-4o".into(),
-            display_name: "GPT-4o (Copilot)".into(),
-            provider: "github-copilot".into(),
-            tier: ModelTier::Smart,
-            context_window: 128_000,
-            max_output_tokens: 4_096,
-            input_cost_per_m: 0.0,
-            output_cost_per_m: 0.0,
-            supports_tools: true,
-            supports_vision: true,
-            supports_streaming: true,
-            aliases: vec!["copilot-gpt4o".into()],
-        },
-        ModelCatalogEntry {
-            id: "copilot/gpt-4".into(),
-            display_name: "GPT-4 (Copilot)".into(),
-            provider: "github-copilot".into(),
-            tier: ModelTier::Frontier,
-            context_window: 128_000,
-            max_output_tokens: 4_096,
-            input_cost_per_m: 0.0,
-            output_cost_per_m: 0.0,
-            supports_tools: true,
-            supports_vision: false,
-            supports_streaming: true,
-            aliases: vec!["copilot-gpt4".into()],
-        },
         // ══════════════════════════════════════════════════════════════
         // Qwen / Alibaba (6)
         // ══════════════════════════════════════════════════════════════
@@ -3405,6 +3402,23 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_vision: true,
             supports_streaming: true,
             aliases: vec!["kimi-k2.5-0711".into()],
+        },
+        // ══════════════════════════════════════════════════════════════
+        // Novita AI (1)
+        // ══════════════════════════════════════════════════════════════
+        ModelCatalogEntry {
+            id: "moonshotai/kimi-k2.5".into(),
+            display_name: "Kimi K2.5 (Novita)".into(),
+            provider: "novita".into(),
+            tier: ModelTier::Frontier,
+            context_window: 131_072,
+            max_output_tokens: 16_384,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec![],
         },
         // ══════════════════════════════════════════════════════════════
         // Kimi for Code (1)

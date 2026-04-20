@@ -8,11 +8,22 @@
 pub const USER_AGENT: &str = "openfang/0.3.48";
 
 pub mod a2a;
+pub mod agent_context;
 pub mod agent_loop;
 pub mod apply_patch;
 pub mod audit;
 pub mod auth_cooldown;
 pub mod browser;
+#[cfg(feature = "memory-candle")]
+pub mod candle_classifier;
+#[cfg(feature = "memory-candle")]
+pub mod candle_embedding;
+#[cfg(feature = "memory-candle")]
+pub mod candle_ner;
+#[cfg(feature = "memory-candle")]
+pub mod candle_reranker;
+#[cfg(feature = "memory-candle")]
+pub mod candle_vad;
 pub mod command_lane;
 pub mod compactor;
 pub mod context_budget;
@@ -20,19 +31,7 @@ pub mod context_overflow;
 pub mod copilot_oauth;
 pub mod docker_sandbox;
 pub mod drivers;
-#[cfg(feature = "memory-candle")]
-pub mod candle_embedding;
-#[cfg(feature = "memory-candle")]
-pub mod candle_classifier;
-#[cfg(feature = "memory-candle")]
-pub mod candle_ner;
-#[cfg(feature = "memory-candle")]
-pub mod candle_reranker;
-#[cfg(feature = "memory-candle")]
-pub mod candle_vad;
 pub mod embedding;
-#[cfg(feature = "memory-candle")]
-pub mod model_cache;
 pub mod graceful_shutdown;
 pub mod hooks;
 pub mod host_functions;
@@ -45,6 +44,8 @@ pub mod loop_guard;
 pub mod mcp;
 pub mod mcp_server;
 pub mod media_understanding;
+#[cfg(feature = "memory-candle")]
+pub mod model_cache;
 pub mod model_catalog;
 pub mod process_manager;
 pub mod prompt_builder;

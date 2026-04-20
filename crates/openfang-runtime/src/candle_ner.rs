@@ -87,7 +87,10 @@ impl CandleNerDriver {
 
         info!(
             model_id,
-            device = cuda_device.map(|d| format!("cuda:{d}")).as_deref().unwrap_or("cpu"),
+            device = cuda_device
+                .map(|d| format!("cuda:{d}"))
+                .as_deref()
+                .unwrap_or("cpu"),
             "Loading BERT-NER model"
         );
 
@@ -224,8 +227,8 @@ fn run_ner(
         .map_err(|e| NerError::Inference(format!("classifier forward: {e}")))?;
 
     // Softmax to get per-token label probabilities → [1, seq_len, num_labels]
-    let probs = softmax_last_dim(&logits)
-        .map_err(|e| NerError::Inference(format!("softmax: {e}")))?;
+    let probs =
+        softmax_last_dim(&logits).map_err(|e| NerError::Inference(format!("softmax: {e}")))?;
 
     // Extract to CPU f32 [seq_len, num_labels]
     let probs_f32 = probs
@@ -289,9 +292,7 @@ fn decode_bio_tags(
             let etype = label_suffix_to_entity_type(&label[2..]);
             current_entity = Some((token_text.to_string(), etype, confidence, 1));
         } else if label.starts_with("I-") {
-            if let Some((ref mut entity_text, _, ref mut conf, ref mut count)) =
-                current_entity
-            {
+            if let Some((ref mut entity_text, _, ref mut conf, ref mut count)) = current_entity {
                 // Accumulate token text (with space separator for word-piece tokens)
                 if !token_text.starts_with("##") {
                     entity_text.push(' ');

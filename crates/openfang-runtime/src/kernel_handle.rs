@@ -63,11 +63,8 @@ pub trait KernelHandle: Send + Sync {
     /// Recall a value from memory.
     ///
     /// Namespace routing follows the same `self.` convention as `memory_store`.
-    fn memory_recall(
-        &self,
-        agent_id: &str,
-        key: &str,
-    ) -> Result<Option<serde_json::Value>, String>;
+    fn memory_recall(&self, agent_id: &str, key: &str)
+        -> Result<Option<serde_json::Value>, String>;
 
     /// List all keys in an agent's memory namespace.
     ///

@@ -65,7 +65,10 @@ impl CandleEmbeddingDriver {
 
         info!(
             model_id,
-            device = cuda_device.map(|d| format!("cuda:{d}")).as_deref().unwrap_or("cpu"),
+            device = cuda_device
+                .map(|d| format!("cuda:{d}"))
+                .as_deref()
+                .unwrap_or("cpu"),
             "Loading BERT embedding model"
         );
 
@@ -121,7 +124,10 @@ impl CandleEmbeddingDriver {
         info!(
             model_id,
             dims,
-            device = cuda_device.map(|d| format!("cuda:{d}")).as_deref().unwrap_or("cpu"),
+            device = cuda_device
+                .map(|d| format!("cuda:{d}"))
+                .as_deref()
+                .unwrap_or("cpu"),
             "BERT embedding model loaded"
         );
 
@@ -151,16 +157,20 @@ impl EmbeddingDriver for CandleEmbeddingDriver {
         // Tokenization is CPU-bound; `.to_vec2()` synchronizes the CUDA stream.
         // Using std::sync::Mutex (not tokio) avoids nested runtime issues.
         let embeddings = tokio::task::spawn_blocking(move || {
-            let embedder = inner.lock().map_err(|e| {
-                EmbeddingError::Http(format!("Mutex poisoned: {e}"))
-            })?;
+            let embedder = inner
+                .lock()
+                .map_err(|e| EmbeddingError::Http(format!("Mutex poisoned: {e}")))?;
             run_bert_embeddings(&embedder, &texts_owned)
         })
         .await
         .map_err(|e| EmbeddingError::Http(format!("Task join: {e}")))?
         .map_err(|e| e)?;
 
-        debug!(count = embeddings.len(), dims = self.dims, "Candle embed complete");
+        debug!(
+            count = embeddings.len(),
+            dims = self.dims,
+            "Candle embed complete"
+        );
         Ok(embeddings)
     }
 
@@ -183,7 +193,11 @@ fn run_bert_embeddings(
         .map_err(|e| EmbeddingError::Parse(format!("tokenize: {e}")))?;
 
     // Determine max length for padding
-    let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+    let max_len = encodings
+        .iter()
+        .map(|e| e.get_ids().len())
+        .max()
+        .unwrap_or(0);
     if max_len == 0 {
         return Ok(vec![vec![0.0f32; embedder.dims]; texts.len()]);
     }
@@ -286,6 +300,9 @@ mod tests {
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         let normalized: Vec<f32> = v.iter().map(|x| x / norm).collect();
         let check: f32 = normalized.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((check - 1.0).abs() < 1e-5, "L2 norm should be 1.0, got {check}");
+        assert!(
+            (check - 1.0).abs() < 1e-5,
+            "L2 norm should be 1.0, got {check}"
+        );
     }
 }

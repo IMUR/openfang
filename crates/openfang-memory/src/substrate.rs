@@ -21,9 +21,9 @@ use openfang_types::memory::{
     MemoryFilter, MemoryFragment, MemoryId, MemorySource, Relation,
 };
 use serde::{Deserialize, Serialize};
-use surrealdb::types::SurrealValue;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use surrealdb::types::SurrealValue;
 
 fn surreal_err(e: surrealdb::Error) -> OpenFangError {
     OpenFangError::Memory(e.to_string())
@@ -88,7 +88,12 @@ impl MemorySubstrate {
         decay_age_days: i64,
     ) -> OpenFangResult<Self> {
         let handle = db::init(db_path).await?;
-        Ok(Self::from_handle_with_config(handle, decay_rate, min_confidence, decay_age_days))
+        Ok(Self::from_handle_with_config(
+            handle,
+            decay_rate,
+            min_confidence,
+            decay_age_days,
+        ))
     }
 
     /// Create an in-memory substrate (for testing).
@@ -307,7 +312,9 @@ impl MemorySubstrate {
         session: Session,
         sessions_dir: PathBuf,
     ) -> Result<(), std::io::Error> {
-        self.sessions.write_jsonl_mirror(session, sessions_dir).await
+        self.sessions
+            .write_jsonl_mirror(session, sessions_dir)
+            .await
     }
 
     /// Append messages to the agent's canonical session.
@@ -426,7 +433,9 @@ impl MemorySubstrate {
         memory_id: &str,
         entity_ids: Vec<String>,
     ) -> OpenFangResult<()> {
-        self.semantic.set_metadata_entities(memory_id, entity_ids).await
+        self.semantic
+            .set_metadata_entities(memory_id, entity_ids)
+            .await
     }
 
     /// Replace the full metadata of an existing memory record.
@@ -461,7 +470,9 @@ impl MemorySubstrate {
         source_entity_id: &str,
         max_depth: usize,
     ) -> OpenFangResult<Vec<crate::knowledge::TraversalNode>> {
-        self.knowledge.traverse_from(source_entity_id, max_depth).await
+        self.knowledge
+            .traverse_from(source_entity_id, max_depth)
+            .await
     }
 
     /// Async recall_with_embedding (alias — all ops are already async).

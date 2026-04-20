@@ -43,8 +43,7 @@ macro_rules! surreal_via_json {
                 surrealdb::types::Kind::Any
             }
             fn into_value(self) -> surrealdb::types::Value {
-                let json = serde_json::to_value(self)
-                    .unwrap_or(serde_json::Value::Null);
+                let json = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
                 surrealdb::types::SurrealValue::into_value(json)
             }
             fn from_value(value: surrealdb::types::Value) -> Result<Self, surrealdb::types::Error> {
@@ -149,10 +148,11 @@ fn collect_hop(
             .and_then(|v| match v {
                 serde_json::Value::String(s) => {
                     // "entities:acme" → "acme"
-                    s.split_once(':').map(|(_, key)| key.to_string())
+                    s.split_once(':')
+                        .map(|(_, key)| key.to_string())
                         .or_else(|| Some(s.clone()))
                 }
-                _ => Some(format!("{v}"))
+                _ => Some(format!("{v}")),
             })
             .unwrap_or_default();
         if eid.is_empty() || !seen.insert(eid.clone()) {
@@ -169,7 +169,9 @@ fn collect_hop(
         };
         let entity = Entity {
             id: eid.clone(),
-            entity_type: re.entity_type.unwrap_or(EntityType::Custom("unknown".to_string())),
+            entity_type: re
+                .entity_type
+                .unwrap_or(EntityType::Custom("unknown".to_string())),
             name: re.name.unwrap_or_default(),
             properties: re.properties,
             created_at: parse_ts(re.created_at.as_deref()),
@@ -360,27 +362,21 @@ impl KnowledgeStore {
         // We use a single query that projects all hops; SurrealDB resolves them
         // in one round-trip via index-backed edge lookups.
         let sql = match depth {
-            1 => {
-                "SELECT meta::id(id) AS eid,
+            1 => "SELECT meta::id(id) AS eid,
                         (->relations->entities.*) AS hop1
                  FROM type::record('entities', $src)"
-                .to_string()
-            }
-            2 => {
-                "SELECT meta::id(id) AS eid,
+                .to_string(),
+            2 => "SELECT meta::id(id) AS eid,
                         (->relations->entities.*) AS hop1,
                         (->relations->entities->relations->entities.*) AS hop2
                  FROM type::record('entities', $src)"
-                .to_string()
-            }
-            _ => {
-                "SELECT meta::id(id) AS eid,
+                .to_string(),
+            _ => "SELECT meta::id(id) AS eid,
                         (->relations->entities.*) AS hop1,
                         (->relations->entities->relations->entities.*) AS hop2,
                         (->relations->entities->relations->entities->relations->entities.*) AS hop3
                  FROM type::record('entities', $src)"
-                .to_string()
-            }
+                .to_string(),
         };
 
         let mut result = self
@@ -529,5 +525,4 @@ mod tests {
             .unwrap();
         assert!(!rel_id.is_empty());
     }
-
 }

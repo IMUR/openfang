@@ -80,7 +80,10 @@ const CATEGORY_HYPOTHESES: &[(&str, &str)] = &[
         "observation",
         "This text records an observed outcome or piece of evidence.",
     ),
-    ("question", "This text poses a question seeking information."),
+    (
+        "question",
+        "This text poses a question seeking information.",
+    ),
 ];
 
 /// Result of memory classification.

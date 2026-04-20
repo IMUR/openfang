@@ -147,13 +147,15 @@ memory_write = ["self.*"]
 // ---------------------------------------------------------------------------
 
 /// Test that a WASM agent can be spawned and returns a response.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_agent_hello_response() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("hello.wat"), HELLO_WAT).unwrap();
 
     let config = test_config(&tmp);
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = OpenFangKernel::boot_with_config(config)
+        .await
+        .expect("Kernel should boot");
 
     let manifest = wasm_manifest("wasm-hello", "hello.wat");
     let agent_id = kernel.spawn_agent(manifest).unwrap();
@@ -170,13 +172,15 @@ async fn test_wasm_agent_hello_response() {
 }
 
 /// Test that a WASM echo module returns input data.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_agent_echo() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("echo.wat"), ECHO_WAT).unwrap();
 
     let config = test_config(&tmp);
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = OpenFangKernel::boot_with_config(config)
+        .await
+        .expect("Kernel should boot");
 
     let manifest = wasm_manifest("wasm-echo", "echo.wat");
     let agent_id = kernel.spawn_agent(manifest).unwrap();
@@ -197,13 +201,15 @@ async fn test_wasm_agent_echo() {
 }
 
 /// Test that WASM fuel exhaustion is caught and reported as an error.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_agent_fuel_exhaustion() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("loop.wat"), INFINITE_LOOP_WAT).unwrap();
 
     let config = test_config(&tmp);
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = OpenFangKernel::boot_with_config(config)
+        .await
+        .expect("Kernel should boot");
 
     let manifest = wasm_manifest("wasm-loop", "loop.wat");
     let agent_id = kernel.spawn_agent(manifest).unwrap();
@@ -223,13 +229,15 @@ async fn test_wasm_agent_fuel_exhaustion() {
 }
 
 /// Test that a missing WASM module produces a clear error.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_agent_missing_module() {
     let tmp = tempfile::tempdir().unwrap();
     // Don't write any .wat file
 
     let config = test_config(&tmp);
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = OpenFangKernel::boot_with_config(config)
+        .await
+        .expect("Kernel should boot");
 
     let manifest = wasm_manifest("wasm-missing", "nonexistent.wasm");
     let agent_id = kernel.spawn_agent(manifest).unwrap();
@@ -246,13 +254,15 @@ async fn test_wasm_agent_missing_module() {
 }
 
 /// Test that host_call time_now works end-to-end through the kernel.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_agent_host_call_time() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("proxy.wat"), HOST_CALL_PROXY_WAT).unwrap();
 
     let config = test_config(&tmp);
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = OpenFangKernel::boot_with_config(config)
+        .await
+        .expect("Kernel should boot");
 
     // Proxy module forwards input to host_call — send a time_now request
     let toml_str = r#"
@@ -290,13 +300,15 @@ memory_write = ["self.*"]
 }
 
 /// Test WASM agent with streaming (falls back to single event).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_agent_streaming_fallback() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("hello.wat"), HELLO_WAT).unwrap();
 
     let config = test_config(&tmp);
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = OpenFangKernel::boot_with_config(config)
+        .await
+        .expect("Kernel should boot");
     let kernel = Arc::new(kernel);
 
     let manifest = wasm_manifest("wasm-stream", "hello.wat");
@@ -304,6 +316,7 @@ async fn test_wasm_agent_streaming_fallback() {
 
     let (mut rx, handle) = kernel
         .send_message_streaming(agent_id, "Hi!", None, None, None, None)
+        .await
         .expect("Streaming should start");
 
     // Collect all stream events
@@ -326,14 +339,16 @@ async fn test_wasm_agent_streaming_fallback() {
 }
 
 /// Test that spawning multiple WASM agents works concurrently.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_multiple_wasm_agents() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("hello.wat"), HELLO_WAT).unwrap();
     std::fs::write(tmp.path().join("echo.wat"), ECHO_WAT).unwrap();
 
     let config = test_config(&tmp);
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = OpenFangKernel::boot_with_config(config)
+        .await
+        .expect("Kernel should boot");
 
     let hello_id = kernel
         .spawn_agent(wasm_manifest("hello-agent", "hello.wat"))
@@ -357,13 +372,15 @@ async fn test_multiple_wasm_agents() {
 }
 
 /// Test WASM agent alongside LLM agent (mixed fleet).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_mixed_wasm_and_llm_agents() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("hello.wat"), HELLO_WAT).unwrap();
 
     let config = test_config(&tmp);
-    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = OpenFangKernel::boot_with_config(config)
+        .await
+        .expect("Kernel should boot");
 
     // Spawn a WASM agent
     let wasm_id = kernel

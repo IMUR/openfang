@@ -36,8 +36,7 @@ macro_rules! surreal_via_json {
                 surrealdb::types::Kind::Any
             }
             fn into_value(self) -> surrealdb::types::Value {
-                let json = serde_json::to_value(self)
-                    .unwrap_or(serde_json::Value::Null);
+                let json = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
                 surrealdb::types::SurrealValue::into_value(json)
             }
             fn from_value(value: surrealdb::types::Value) -> Result<Self, surrealdb::types::Error> {
@@ -140,7 +139,10 @@ fn build_filter_clauses(
 
     if let Some(agent_id) = f.agent_id {
         conditions.push("agent_id = $filter_aid".to_string());
-        bindings.push(("filter_aid".into(), serde_json::json!(agent_id.0.to_string())));
+        bindings.push((
+            "filter_aid".into(),
+            serde_json::json!(agent_id.0.to_string()),
+        ));
     }
     if let Some(ref scope) = f.scope {
         conditions.push("scope = $filter_scope".to_string());
@@ -352,7 +354,10 @@ impl SemanticStore {
             .map(knn_row_to_fragment)
             .collect();
 
-        debug!("Vector recall: {} results after post-filter", fragments.len());
+        debug!(
+            "Vector recall: {} results after post-filter",
+            fragments.len()
+        );
         Ok(fragments)
     }
 
@@ -389,10 +394,7 @@ impl SemanticStore {
 
         debug!("Text recall: {} results via BM25", rows.len());
 
-        Ok(rows
-            .into_iter()
-            .map(bm25_row_to_fragment)
-            .collect())
+        Ok(rows.into_iter().map(bm25_row_to_fragment).collect())
     }
 
     /// Hybrid search — runs HNSW KNN and BM25 separately, merges by weighted score.
@@ -479,7 +481,10 @@ impl SemanticStore {
         let mut result = q.await.map_err(surreal_err)?;
         let records: Vec<MemoryRecord> = result.take(0).unwrap_or_default();
 
-        Ok(records.into_iter().filter_map(memory_record_to_fragment).collect())
+        Ok(records
+            .into_iter()
+            .filter_map(memory_record_to_fragment)
+            .collect())
     }
 
     /// List all non-deleted memory fragments for an agent, paginated.
@@ -509,7 +514,10 @@ impl SemanticStore {
             .map_err(surreal_err)?;
 
         let records: Vec<MemoryRecord> = result.take(0).unwrap_or_default();
-        Ok(records.into_iter().filter_map(memory_record_to_fragment).collect())
+        Ok(records
+            .into_iter()
+            .filter_map(memory_record_to_fragment)
+            .collect())
     }
 
     /// Soft-delete a memory fragment.
@@ -596,8 +604,7 @@ fn memory_record_to_fragment(r: MemoryRecord) -> Option<MemoryFragment> {
 
 fn knn_row_to_fragment(r: KnnRow) -> MemoryFragment {
     let id = parse_memory_id(r.record_key.as_deref());
-    let agent_id_uuid = uuid::Uuid::parse_str(&r.agent_id)
-        .unwrap_or_else(|_| uuid::Uuid::nil());
+    let agent_id_uuid = uuid::Uuid::parse_str(&r.agent_id).unwrap_or_else(|_| uuid::Uuid::nil());
     MemoryFragment {
         id,
         agent_id: AgentId(agent_id_uuid),
@@ -615,8 +622,7 @@ fn knn_row_to_fragment(r: KnnRow) -> MemoryFragment {
 
 fn bm25_row_to_fragment(r: BM25Row) -> MemoryFragment {
     let id = parse_memory_id(r.record_key.as_deref());
-    let agent_id_uuid = uuid::Uuid::parse_str(&r.agent_id)
-        .unwrap_or_else(|_| uuid::Uuid::nil());
+    let agent_id_uuid = uuid::Uuid::parse_str(&r.agent_id).unwrap_or_else(|_| uuid::Uuid::nil());
     MemoryFragment {
         id,
         agent_id: AgentId(agent_id_uuid),
