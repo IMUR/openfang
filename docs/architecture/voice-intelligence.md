@@ -1,6 +1,7 @@
 # OpenFang Voice Intelligence Architecture
 
-**Date:** 2026-04-07
+**Date:** 2026-04-20
+**Version:** 0.6.0
 **Status:** Active — voice pipeline on drtr RTX 2080 (Chatterbox-Turbo TTS + Parakeet TDT STT)
 
 ---
@@ -260,7 +261,19 @@ Both use `ScriptProcessorNode` for mic capture (deprecated but universally suppo
 
 ### Dev mode (OPENFANG_STATIC_DIR)
 
-`OPENFANG_STATIC_DIR` was originally used for standalone static handlers. The dashboard is currently bundled via `include_str!()` and requires a rebuild for JS changes.
+Set `OPENFANG_STATIC_DIR` to the path of the `static/` directory (e.g. `crates/openfang-api/static`) and the daemon will serve HTML/CSS/JS from disk on every request — no rebuild needed for dashboard or voice-client changes. Unset or empty falls back to the `include_str!()`-compiled copy shipped with the binary.
+
+```bash
+export OPENFANG_STATIC_DIR=$HOME/prj/openfang/crates/openfang-api/static
+systemctl --user restart openfang
+# edit static/js/voice-client.js -> reload the dashboard, changes are live
+```
+
+Implementation: `crates/openfang-api/src/webchat.rs`.
+
+### Localization (i18n)
+
+Dashboard UI strings — including all voice controls — are driven by `static/i18n/i18n.js` and JSON bundles under `static/i18n/`. English (`en.json`) and Russian (`ru.json`) are bundled; add a new locale by dropping `<lang>.json` alongside them and wiring it in `i18n.js`. Voice-specific strings live under the same keys as their text-chat counterparts — no separate voice namespace.
 
 ---
 
@@ -393,3 +406,4 @@ vox.ism.la {
 - **2026-04-07:** Consolidated dashboard voice implementation into shared voice-client.js module
 - **2026-04-07:** Added OPENFANG_STATIC_DIR filesystem fallback for live JS iteration without rebuilds
 - **2026-04-07:** SpeechEnd (0x11) lets audio drain naturally; only 0x40 Interrupt stops immediately
+- **2026-04-20:** v0.6.0 upstream merge landed — `/voice` route removed (voice fully consolidated into dashboard), `OPENFANG_STATIC_DIR` dev-mode fallback reinstated in `webchat.rs`, dashboard + voice controls now localized via `static/i18n/` (English + Russian bundled)

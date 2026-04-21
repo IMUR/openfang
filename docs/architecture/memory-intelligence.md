@@ -1,8 +1,8 @@
 # OpenFang Memory Intelligence Architecture
 
-**Date:** 2026-04-07
+**Date:** 2026-04-20
 **Branch:** `main` (Forgejo `rtr/openfang`)
-**Version:** 0.5.5
+**Version:** 0.6.0
 
 ---
 
@@ -226,6 +226,21 @@ WASM agents go through the same enforcement path: `host_functions.rs` (`host_kv_
 Implementation: `crates/openfang-runtime/src/tool_runner.rs` (dispatch + tool definitions), `crates/openfang-kernel/src/kernel.rs` (`KernelHandle` impl, `resolve_memory_namespace`, `is_system_principal`).
 
 Typical use: agents use `memory_store` to persist structured user preferences (`self.user_name`, `self.preferred_language`, etc.) that they want to look up by exact key in future sessions.
+
+#### Boot-time KV migrations
+
+The kernel runs idempotent KV migrations at startup from a `tokio::spawn` fired inside `start_background_agents`. Currently one migration is wired:
+
+`migrate_shared_memory_schedules` (in `kernel.rs`) sweeps the shared KV namespace for legacy `__openfang_schedules` entries (pre-cron-scheduler agent schedule tools) and replays them into the upstream cron scheduler. On success it clears the legacy key to `[]` and writes a marker:
+
+| Shared-namespace key                    | Value after migration |
+| --------------------------------------- | --------------------- |
+| `__openfang_schedules`                  | `[]` (cleared)        |
+| `__openfang_schedules_migrated_v1`      | `true`                |
+
+Idempotency is gated on the marker — if `__openfang_schedules_migrated_v1 == true` the migration short-circuits and does nothing. Operators running `memory_list shared` will see both keys; **do not delete the marker** or the legacy sweep will re-run (and would be a no-op now, but future migration versions may assume it's present).
+
+Entries pointing at unresolved agent IDs are skipped and logged at `warn` — the migration succeeds partially rather than aborting. Successful migrations trigger `cron_scheduler.persist()`.
 
 ### Layer 3 — Static Workspace Context Files (loaded at session build time)
 
