@@ -251,7 +251,8 @@ impl BrowserSession {
                 "--window-size={},{}",
                 config.viewport_width, config.viewport_height
             ),
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36".to_string(),
+            // Keep this within ~2 major versions of current Chrome stable (currently 136).
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36".to_string(),
             "about:blank".to_string(),
         ];
         if config.headless {
@@ -701,7 +702,9 @@ fn find_chromium(config: &BrowserConfig) -> Result<PathBuf, String> {
         }
     }
 
-    // 4. Try PATH lookup
+    // 4. Walk PATH entries directly — avoids spawning a `which`/`where.exe` subprocess
+    //    on a Tokio worker thread. std::env::split_paths handles OS-specific separators.
+    let path_env = std::env::var("PATH").unwrap_or_default();
     for name in &[
         "google-chrome",
         "google-chrome-stable",
@@ -709,26 +712,17 @@ fn find_chromium(config: &BrowserConfig) -> Result<PathBuf, String> {
         "chromium-browser",
         "chrome",
     ] {
-        if let Ok(output) = std::process::Command::new("which").arg(name).output() {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path.is_empty() {
-                    return Ok(PathBuf::from(path));
-                }
+        for dir in std::env::split_paths(&path_env) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
             }
-        }
-        // Windows: use where.exe
-        #[cfg(windows)]
-        if let Ok(output) = std::process::Command::new("where.exe").arg(name).output() {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if !path.is_empty() {
-                    return Ok(PathBuf::from(path));
+            // Windows: also try with .exe extension
+            #[cfg(windows)]
+            {
+                let candidate_exe = dir.join(format!("{name}.exe"));
+                if candidate_exe.is_file() {
+                    return Ok(candidate_exe);
                 }
             }
         }
@@ -979,11 +973,11 @@ pub async fn tool_browser_screenshot(
     if !b64.is_empty() {
         use base64::Engine;
         let upload_dir = std::env::temp_dir().join("openfang_uploads");
-        let _ = std::fs::create_dir_all(&upload_dir);
+        let _ = tokio::fs::create_dir_all(&upload_dir).await;
         let file_id = uuid::Uuid::new_v4().to_string();
         if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64) {
             let path = upload_dir.join(&file_id);
-            if std::fs::write(&path, &decoded).is_ok() {
+            if tokio::fs::write(&path, &decoded).await.is_ok() {
                 image_urls.push(format!("/api/uploads/{file_id}"));
             }
         }

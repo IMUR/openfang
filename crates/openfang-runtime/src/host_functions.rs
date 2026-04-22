@@ -135,7 +135,7 @@ fn is_ssrf_target(url: &str) -> Result<(), serde_json::Value> {
     let blocked_hostnames = [
         "localhost",
         "metadata.google.internal",
-        "metadata.aws.internal",
+        // AWS IMDS has no named hostname; blocked via "169.254.169.254" entry below.
         "instance-data",
         "169.254.169.254",
     ];

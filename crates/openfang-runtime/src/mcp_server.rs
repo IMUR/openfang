@@ -9,7 +9,12 @@
 use openfang_types::tool::ToolDefinition;
 use serde_json::json;
 
-/// MCP protocol version supported by this server.
+/// MCP protocol version advertised by this stateless stdio handler.
+///
+/// Pinned to 2024-11-05 (the SSE-based protocol) for compatibility with CLI clients
+/// (Claude Desktop, VS Code MCP extension) that pre-date the 2025-03-26 Streamable HTTP
+/// revision. The HTTP transport in `mcp.rs` negotiates 2025-03-26+ via the `rmcp` SDK.
+/// This is a deliberate backward-compat shim, not stale drift.
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Handle an incoming MCP JSON-RPC request and return a response.

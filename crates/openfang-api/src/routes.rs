@@ -3854,17 +3854,17 @@ pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoRespons
     Json(serde_json::json!({ "skills": skills, "total": skills.len() }))
 }
 
-/// POST /api/skills/install — Install a skill from FangHub (GitHub).
+/// POST /api/skills/install — Install a skill from ClawHub.
 pub async fn install_skill(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SkillInstallRequest>,
 ) -> impl IntoResponse {
     let skills_dir = state.kernel.config.home_dir.join("skills");
-    let config = openfang_skills::marketplace::MarketplaceConfig::default();
-    let client = openfang_skills::marketplace::MarketplaceClient::new(config);
+    let cache_dir = state.kernel.config.home_dir.join(".clawhub_cache");
+    let client = openfang_skills::clawhub::ClawHubClient::new(cache_dir);
 
     match client.install(&req.name, &skills_dir).await {
-        Ok(version) => {
+        Ok(result) => {
             // Hot-reload so agents see the new skill immediately
             state.kernel.reload_skills();
             (
@@ -3872,7 +3872,7 @@ pub async fn install_skill(
                 Json(serde_json::json!({
                     "status": "installed",
                     "name": req.name,
-                    "version": version,
+                    "version": result.version,
                 })),
             )
         }
@@ -3920,32 +3920,35 @@ pub async fn reload_skills(State(state): State<Arc<AppState>>) -> impl IntoRespo
     Json(serde_json::json!({"status": "reloaded"}))
 }
 
-/// GET /api/marketplace/search — Search the FangHub marketplace.
+/// GET /api/marketplace/search — Search the ClawHub marketplace.
 pub async fn marketplace_search(
     Query(params): Query<HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     let query = params.get("q").cloned().unwrap_or_default();
     if query.is_empty() {
         return Json(serde_json::json!({"results": [], "total": 0}));
     }
 
-    let config = openfang_skills::marketplace::MarketplaceConfig::default();
-    let client = openfang_skills::marketplace::MarketplaceClient::new(config);
+    let cache_dir = state.kernel.config.home_dir.join(".clawhub_cache");
+    let client = openfang_skills::clawhub::ClawHubClient::new(cache_dir);
 
-    match client.search(&query).await {
-        Ok(results) => {
-            let items: Vec<serde_json::Value> = results
+    match client.search(&query, 20).await {
+        Ok(resp) => {
+            let items: Vec<serde_json::Value> = resp
+                .results
                 .iter()
                 .map(|r| {
                     serde_json::json!({
-                        "name": r.name,
-                        "description": r.description,
-                        "stars": r.stars,
-                        "url": r.url,
+                        "name": r.slug,
+                        "display_name": r.display_name,
+                        "description": r.summary,
+                        "version": r.version,
                     })
                 })
                 .collect();
-            Json(serde_json::json!({"results": items, "total": items.len()}))
+            let total = items.len();
+            Json(serde_json::json!({"results": items, "total": total}))
         }
         Err(e) => {
             tracing::warn!("Marketplace search failed: {e}");

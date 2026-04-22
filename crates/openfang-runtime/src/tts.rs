@@ -249,7 +249,7 @@ mod tests {
         assert_eq!(config.openai.format, "mp3");
         assert_eq!(config.openai.speed, 1.0);
         assert_eq!(config.elevenlabs.voice_id, "21m00Tcm4TlvDq8ikWAM");
-        assert_eq!(config.elevenlabs.model_id, "eleven_monolingual_v1");
+        assert_eq!(config.elevenlabs.model_id, "eleven_turbo_v2_5");
     }
 
     #[tokio::test]

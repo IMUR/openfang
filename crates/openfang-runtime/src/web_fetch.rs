@@ -212,7 +212,8 @@ pub(crate) fn check_ssrf(url: &str, allowed_hosts: &[String]) -> Result<(), Stri
         "localhost",
         "ip6-localhost",
         "metadata.google.internal",
-        "metadata.aws.internal",
+        // AWS IMDS has no named hostname (unlike GCP's metadata.google.internal).
+        // It is blocked via the "169.254.169.254" entry above and is_metadata_ip().
         "instance-data",
         "169.254.169.254",
         "100.100.100.200", // Alibaba Cloud IMDS

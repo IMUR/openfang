@@ -3701,15 +3701,20 @@ fn cmd_skill_install(source: &str) {
         );
         notify_daemon_skill_reload();
     } else {
-        // Remote install from FangHub
-        println!("Installing {source} from FangHub...");
+        // Remote install from ClawHub
+        println!("Installing {source} from ClawHub...");
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let client = openfang_skills::marketplace::MarketplaceClient::new(
-            openfang_skills::marketplace::MarketplaceConfig::default(),
-        );
+        let home = openfang_home();
+        let cache_dir = home.join(".clawhub_cache");
+        let client = openfang_skills::clawhub::ClawHubClient::new(cache_dir);
         match rt.block_on(client.install(source, &skills_dir)) {
-            Ok(version) => {
-                println!("Installed {source} {version}");
+            Ok(result) => {
+                println!("Installed {} {}", result.skill_name, result.version);
+                if !result.warnings.is_empty() {
+                    for w in &result.warnings {
+                        eprintln!("  Warning: {}", w.message);
+                    }
+                }
                 notify_daemon_skill_reload();
             }
             Err(e) => {
@@ -3787,19 +3792,21 @@ fn cmd_skill_remove(name: &str) {
 
 fn cmd_skill_search(query: &str) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let client = openfang_skills::marketplace::MarketplaceClient::new(
-        openfang_skills::marketplace::MarketplaceConfig::default(),
-    );
-    match rt.block_on(client.search(query)) {
-        Ok(results) if results.is_empty() => println!("No skills found for \"{query}\"."),
-        Ok(results) => {
-            println!("Skills matching \"{query}\":\n");
-            for r in results {
-                println!("  {} ({})", r.name, r.stars);
-                if !r.description.is_empty() {
-                    println!("    {}", r.description);
+    let home = openfang_home();
+    let cache_dir = home.join(".clawhub_cache");
+    let client = openfang_skills::clawhub::ClawHubClient::new(cache_dir);
+    match rt.block_on(client.search(query, 20)) {
+        Ok(resp) if resp.results.is_empty() => println!("No skills found for \"{query}\"."),
+        Ok(resp) => {
+            println!("Skills matching \"{query}\" on ClawHub:\n");
+            for r in resp.results {
+                println!("  {} — {}", r.slug, r.display_name);
+                if !r.summary.is_empty() {
+                    println!("    {}", r.summary);
                 }
-                println!("    {}", r.url);
+                if let Some(v) = &r.version {
+                    println!("    version: {v}");
+                }
                 println!();
             }
         }

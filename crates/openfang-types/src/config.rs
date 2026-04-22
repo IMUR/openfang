@@ -546,7 +546,8 @@ impl Default for TtsOpenAiConfig {
 pub struct TtsElevenLabsConfig {
     /// Voice ID. Default: "21m00Tcm4TlvDq8ikWAM" (Rachel).
     pub voice_id: String,
-    /// Model ID. Default: "eleven_monolingual_v1".
+    /// Model ID. Default: `"eleven_turbo_v2_5"` (current fast model).
+    /// See <https://elevenlabs.io/docs/api-reference/text-to-speech> for the full model list.
     pub model_id: String,
     /// Stability (0.0-1.0). Default: 0.5.
     pub stability: f32,
@@ -558,7 +559,7 @@ impl Default for TtsElevenLabsConfig {
     fn default() -> Self {
         Self {
             voice_id: "21m00Tcm4TlvDq8ikWAM".to_string(),
-            model_id: "eleven_monolingual_v1".to_string(),
+            model_id: "eleven_turbo_v2_5".to_string(),
             stability: 0.5,
             similarity_boost: 0.75,
         }
@@ -579,13 +580,17 @@ pub struct VoiceConfig {
     pub stt_endpoint: String,
     /// TTS service endpoint. Default: "http://localhost:7744".
     pub tts_endpoint: String,
-    /// STT model name (passed to service). Default: "distil-large-v3".
+    /// STT model name passed to the Parakeet TDT service. Default: "parakeet-tdt-0.6b-v2".
+    /// Parakeet currently ignores this field (single-model service), but it's set to
+    /// match the deployed model for documentation and forward-compatibility.
     pub stt_model: String,
-    /// TTS voice name. Default: "af_heart".
+    /// TTS voice identifier passed to Chatterbox-Turbo. Default: "default".
+    /// Chatterbox uses its built-in voice unless a `tts_voice_clone_ref` WAV is provided
+    /// for zero-shot voice cloning.
     pub tts_voice: String,
     /// TTS speed multiplier. Default: 1.0.
     pub tts_speed: f32,
-    /// Minimum silence duration (ms) before treating as end-of-utterance. Default: 800.
+    /// Minimum silence duration (ms) before treating as end-of-utterance. Default: 500.
     pub vad_silence_ms: u64,
     /// Energy threshold for speech detection (RMS, 0.0–1.0). Default: 0.01.
     /// Used as fallback when neural VAD is unavailable.
@@ -607,8 +612,8 @@ impl Default for VoiceConfig {
             enabled: false,
             stt_endpoint: "http://localhost:7733".to_string(),
             tts_endpoint: "http://localhost:7744".to_string(),
-            stt_model: "distil-large-v3".to_string(),
-            tts_voice: "af_heart".to_string(),
+            stt_model: "parakeet-tdt-0.6b-v2".to_string(),
+            tts_voice: "default".to_string(),
             tts_speed: 1.0,
             vad_silence_ms: 500,
             vad_energy_threshold: 0.01,
@@ -1639,6 +1644,8 @@ impl Default for DefaultModelConfig {
 #[serde(default)]
 pub struct MemoryConfig {
     /// Path to the SurrealDB data directory.
+    // TODO(migration-shim): remove `sqlite_path` alias after 2026-06-01.
+    // Exists for backward compat with pre-SurrealDB config files.
     #[serde(alias = "sqlite_path")]
     pub db_path: Option<PathBuf>,
     /// Embedding model for semantic search.
@@ -1861,28 +1868,35 @@ impl MemoryConfig {
     }
 }
 
-/// Network layer configuration.
+/// OFP (OpenFang Protocol) peer-to-peer network configuration.
+///
+/// OFP uses plain TCP connections authenticated with HMAC-SHA256. On single-node
+/// deployments this subsystem is inactive (`network_enabled = false`) and the
+/// defaults are designed to be safe rather than functional.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NetworkConfig {
-    /// libp2p listen addresses.
+    /// OFP listen addresses (host:port format, e.g. "0.0.0.0:4478").
     pub listen_addresses: Vec<String>,
-    /// Bootstrap peers for DHT.
+    /// Initial peers to connect to on startup (host:port format).
     pub bootstrap_peers: Vec<String>,
-    /// Enable mDNS for local discovery.
+    /// Unused — mDNS is not implemented in the OFP wire layer.
+    #[deprecated(note = "mDNS is not implemented in OFP; field kept for config compat")]
     pub mdns_enabled: bool,
-    /// Maximum number of connected peers.
+    /// Unused — OFP does not enforce a peer limit.
+    #[deprecated(note = "OFP does not enforce a peer limit; field kept for config compat")]
     pub max_peers: u32,
     /// Pre-shared secret for OFP HMAC authentication (required when network is enabled).
     pub shared_secret: String,
 }
 
+#[allow(deprecated)]
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            listen_addresses: vec!["/ip4/0.0.0.0/tcp/0".to_string()],
+            listen_addresses: vec!["0.0.0.0:4478".to_string()],
             bootstrap_peers: vec![],
-            mdns_enabled: true,
+            mdns_enabled: false,
             max_peers: 50,
             shared_secret: String::new(),
         }
@@ -1890,6 +1904,7 @@ impl Default for NetworkConfig {
 }
 
 /// SECURITY: Custom Debug impl redacts sensitive fields (shared_secret).
+#[allow(deprecated)]
 impl std::fmt::Debug for NetworkConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NetworkConfig")

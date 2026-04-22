@@ -298,7 +298,8 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Serialize an embedding vector to bytes (for SQLite BLOB storage).
+/// Serialize an embedding vector to raw bytes (little-endian f32 per component).
+/// Used for binary encoding over transport or storage where a flat byte buffer is needed.
 pub fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(embedding.len() * 4);
     for &val in embedding {
@@ -307,7 +308,7 @@ pub fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
     bytes
 }
 
-/// Deserialize an embedding vector from bytes.
+/// Deserialize an embedding vector from raw bytes (little-endian f32 per component).
 pub fn embedding_from_bytes(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
