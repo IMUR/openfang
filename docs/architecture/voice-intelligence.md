@@ -279,23 +279,22 @@ Dashboard UI strings — including all voice controls — are driven by `static/
 
 ## OpenFang Voice Configuration (`~/.openfang/config.toml`)
 
-```toml
-[voice]
-enabled               = true
-stt_endpoint          = "http://100.64.0.2:7733"     # Parakeet TDT on drtr
-tts_endpoint          = "http://100.64.0.2:7744"     # Chatterbox-Turbo on drtr
-stt_model             = "parakeet-tdt-0.6b-v2"
-tts_voice             = "default"
-tts_speed             = 1.0
-vad_silence_ms        = 500
-vad_energy_threshold  = 0.01                          # fallback (energy VAD)
-vad_speech_threshold  = 0.5                           # Silero VAD probability threshold
-max_utterance_secs    = 30
-tts_min_chunk_chars   = 30                            # ClauseBuffer threshold
-# tts_voice_clone_ref = "/path/to/reference.wav"     # 10-30s WAV for voice cloning
-```
+All fields have defaults; only `enabled = true` is required to activate voice. Source of truth for defaults: `openfang-types/src/config.rs` `VoiceConfig::default()`.
 
-All fields have defaults; only `enabled = true` is required to activate voice.
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `false` | Master switch. Voice WS handler is a no-op when false. |
+| `stt_endpoint` | string | `http://localhost:7733` | Base URL of the OpenAI-compatible STT service (`POST /v1/audio/transcriptions`). |
+| `tts_endpoint` | string | `http://localhost:7744` | Base URL of the OpenAI-compatible TTS service (`POST /v1/audio/speech`). |
+| `stt_model` | string | `distil-large-v3` | Model name passed to the STT service. Ignored by most local servers but required by the protocol. |
+| `tts_voice` | string | `af_heart` | Voice identifier passed to the TTS service. Valid values depend on the serving model. |
+| `tts_speed` | float | `1.0` | Speed multiplier passed to TTS. Most services accept 0.5–2.0. |
+| `vad_silence_ms` | u64 | `500` | How long continuous silence must last (ms) before the server treats the utterance as complete and sends it to STT. Lower values feel more responsive; too low triggers on natural pauses mid-sentence. |
+| `vad_energy_threshold` | float (0–1) | `0.01` | RMS energy level below which a frame is considered silence. Used by the fallback energy VAD when Silero is unavailable. Raise if ambient noise causes false speech detection. |
+| `vad_speech_threshold` | float (0–1) | `0.5` | Silero VAD speech-probability cutoff. Frames above this are speech; frames below are silence. Higher values require more confident speech detection before accumulating audio. |
+| `max_utterance_secs` | u32 | `30` | Hard cap on utterance length. If the user speaks continuously beyond this, the buffer is force-sent to STT regardless of VAD state. Guards against runaway accumulation. |
+| `tts_min_chunk_chars` | usize | `30` | Minimum characters a clause must reach before being sent to TTS. Prevents sending single punctuation marks or very short fragments that produce audible gaps. Sentence-ending punctuation (`.!?`) always flushes regardless of this threshold. |
+| `tts_voice_clone_ref` | path (optional) | — | Absolute path to a 10–30s reference WAV. When set, sent to the TTS service as `reference_audio` (base64-encoded) for zero-shot voice cloning. Chatterbox-Turbo supports this; other backends may ignore it. |
 
 ---
 
