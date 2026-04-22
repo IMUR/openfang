@@ -1299,7 +1299,7 @@ impl OpenFangKernel {
             self_handle: OnceLock::new(),
         };
 
-        // Restore persisted agents from SQLite
+        // Restore persisted agents from SurrealDB
         match kernel.memory.load_all_agents().await {
             Ok(agents) => {
                 let count = agents.len();
@@ -1649,7 +1649,7 @@ impl OpenFangKernel {
             self.registry.add_child(parent_id, agent_id);
         }
 
-        // Persist agent to SQLite so it survives restarts
+        // Persist agent to SurrealDB so it survives restarts
         self.memory
             .save_agent(&entry)
             .await
@@ -3609,7 +3609,7 @@ impl OpenFangKernel {
     /// `<home_dir>/agents/<name>/agent.toml`.
     ///
     /// This is best-effort: a failure to write is logged but does not
-    /// propagate as an error — the authoritative copy lives in SQLite.
+    /// propagate as an error — the authoritative copy lives in SurrealDB.
     pub fn persist_manifest_to_disk(&self, agent_id: AgentId) {
         if let Some(entry) = self.registry.get(agent_id) {
             let dir = self.config.home_dir.join("agents").join(&entry.name);

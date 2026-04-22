@@ -495,12 +495,10 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
     Err(LlmError::Api {
         status: 0,
         message: format!(
-            "Unknown provider '{}'. Supported: anthropic, gemini, openai, azure, bedrock, groq, \
-             openrouter, deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, \
-             perplexity, cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, \
-             github-copilot, chutes, venice, nvidia, codex, claude-code. \
+            "Unknown provider '{}'. Supported: {}. \
              Or set base_url for a custom OpenAI-compatible endpoint.",
-            provider
+            provider,
+            known_providers().join(", ")
         ),
     })
 }
@@ -525,7 +523,7 @@ pub fn detect_available_provider() -> Option<(&'static str, &'static str, &'stat
         ("mistral", "mistral-large-latest", "MISTRAL_API_KEY"),
         (
             "together",
-            "meta-llama/Llama-3-70b-chat-hf",
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
             "TOGETHER_API_KEY",
         ),
         (
@@ -533,10 +531,10 @@ pub fn detect_available_provider() -> Option<(&'static str, &'static str, &'stat
             "accounts/fireworks/models/llama-v3p1-70b-instruct",
             "FIREWORKS_API_KEY",
         ),
-        ("xai", "grok-2", "XAI_API_KEY"),
+        ("xai", "grok-3-mini", "XAI_API_KEY"),
         (
             "perplexity",
-            "llama-3.1-sonar-large-128k-online",
+            "sonar-pro",
             "PERPLEXITY_API_KEY",
         ),
         ("cohere", "command-r-plus", "COHERE_API_KEY"),

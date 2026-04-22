@@ -156,7 +156,7 @@ pub fn build_reload_plan(old: &KernelConfig, new: &KernelConfig) -> ReloadPlan {
             .push("network config changed".to_string());
     }
 
-    // Memory config (requires restarting SQLite connections)
+    // Memory config (requires restarting SurrealDB connections)
     if field_changed(&old.memory, &new.memory) {
         plan.restart_required = true;
         plan.restart_reasons

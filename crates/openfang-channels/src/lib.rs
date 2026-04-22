@@ -1,6 +1,6 @@
 //! Channel Bridge Layer for the OpenFang Agent OS.
 //!
-//! Provides 40 pluggable messaging integrations that convert platform messages
+//! Provides 45 pluggable messaging integrations that convert platform messages
 //! into unified `ChannelMessage` events for the kernel.
 
 pub mod bridge;

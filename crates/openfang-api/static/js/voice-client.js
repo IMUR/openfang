@@ -163,6 +163,10 @@ var VoiceClient = (function() {
 
       case 0x30: // VadSpeechStart
         this._onSystemMessage('Listening...');
+        // If server VAD detects speech (barge-in or otherwise), instantly stop local playback
+        if (this._ttsPlaying || this._playing) {
+          this.stopPlayback();
+        }
         break;
 
       case 0x31: // VadSpeechEnd
@@ -239,20 +243,8 @@ var VoiceClient = (function() {
 
     var float32 = e.inputBuffer.getChannelData(0);
 
-    // During TTS playback: only check for barge-in, don't send audio to server
-    if (this._ttsPlaying) {
-      if (!this._bargeInCooldown) {
-        var energy = 0;
-        for (var j = 0; j < float32.length; j++) energy += float32[j] * float32[j];
-        energy = Math.sqrt(energy / float32.length);
-        if (energy > this._bargeInThreshold) {
-          this._doBargeIn();
-        }
-      }
-      return; // never send mic audio during TTS — prevents ghost messages
-    }
-
-    // Normal mode: send PCM16 to server
+    // Send PCM16 to server natively — no client-side TTS muting so the server's
+    // neural Silero VAD handles barge-in detection continuously.
     var pcm = new Int16Array(float32.length);
     for (var i = 0; i < float32.length; i++) {
       var s = Math.max(-1, Math.min(1, float32[i]));

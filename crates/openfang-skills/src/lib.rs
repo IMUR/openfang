@@ -5,13 +5,12 @@
 //! - TOML + Python scripts
 //! - TOML + WASM modules
 //! - TOML + Node.js modules (OpenClaw compatibility)
-//! - Remote skills from FangHub registry
+//! - Remote skills from the ClawHub marketplace
 
 pub mod bundled;
 pub mod clawhub;
 pub mod config_injection;
 pub mod loader;
-pub mod marketplace;
 pub mod openclaw_compat;
 pub mod registry;
 pub mod verify;

@@ -525,14 +525,15 @@ Authenticated **GET** `/api/health/detail` includes a `memory_intelligence` obje
 | `embedding_active`     | `true` only if `embedding_driver` initialized                              |
 | `ner_backend`          | Raw config value: `auto`, `candle`, `none`, etc.                           |
 | `reranker_backend`     | Raw config value: `auto`, `candle`, `none`, etc.                           |
+| `classification_backend` | Raw config value: `auto`, `candle`, `none`, etc.                         |
 | `ner_active`           | NER model loaded                                                           |
 | `reranker_active`      | Cross-encoder loaded                                                       |
+| `classifier_active`    | Zero-shot NLI classifier loaded                                            |
 | `memory_candle_binary` | `true` if compiled with `--features memory-candle`                         |
 | `cuda_device`          | Config value (JSON `null` if unset -- CPU mode)                            |
 | `models_cached`        | Heuristic: `~/.openfang/models/<embedding_model>/model.safetensors` exists |
 
 
-> **Note:** `classification_backend` and `classifier_active` are not yet surfaced by the health endpoint despite being wired in the kernel. They should be added to the `memory_intelligence` block in `server.rs` when the health response is next revised.
 
 ---
 

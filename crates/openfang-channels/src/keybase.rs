@@ -4,6 +4,12 @@
 //! messages. Polls for new messages using the `list` + `read` API methods and
 //! sends messages via the `send` method. Authentication is performed using a
 //! Keybase username and paper key.
+//!
+//! **Platform status (as of June 2023):** Keybase's consumer app and desktop
+//! client were discontinued after Zoom's acquisition. The local daemon and
+//! JSON API at `127.0.0.1:5222` remain functional for existing Linux
+//! installations, but the platform has no active development. New account
+//! creation is not encouraged and user base is shrinking.
 
 use crate::types::{
     split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,

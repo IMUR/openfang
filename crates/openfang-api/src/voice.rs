@@ -23,7 +23,7 @@
 use openfang_types::config::VoiceConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -392,16 +392,21 @@ impl VoiceSession {
     /// Process incoming decoded PCM audio. Returns a `VoiceAction` indicating
     /// whether to keep listening or trigger transcription.
     pub fn handle_audio(&mut self, pcm: &[i16]) -> VoiceAction {
-        // During Speaking state, don't run VAD on incoming audio.
-        // Server-side VAD during TTS playback causes false barge-ins from
-        // mic bleed or ambient noise, killing TTS mid-response.
-        // Barge-in is handled client-side: the client detects user speech
-        // and sends 0x40 Interrupt explicitly.
+        let is_speech = self.detect_speech(pcm);
+
+        // If we detect speech while the bot is Speaking, trigger a barge-in
+        // and transition to Listening state immediately.
         if self.state == VoiceSessionState::Speaking {
+            if is_speech {
+                self.speech_detected = true;
+                self.state = VoiceSessionState::Listening;
+                self.silence_frames = 0;
+                self.pcm_buffer.extend_from_slice(pcm);
+                return VoiceAction::BargeIn;
+            }
             return VoiceAction::Continue;
         }
 
-        let is_speech = self.detect_speech(pcm);
         let silence_threshold_frames = (self.config.vad_silence_ms as f32 / 20.0).ceil() as u32;
         let max_samples = self.config.max_utterance_secs as usize * 16000;
 
@@ -528,7 +533,7 @@ pub fn encode_pcm_to_frames(pcm: &[i16], use_opus: bool) -> Vec<Vec<u8>> {
 // STT Client
 // ---------------------------------------------------------------------------
 
-/// HTTP client for the Whisper STT service.
+/// HTTP client for the Parakeet TDT STT service (drtr:7733, `/v1/audio/transcriptions`).
 pub struct SttClient {
     endpoint: String,
     model: String,
@@ -544,7 +549,7 @@ impl SttClient {
         }
     }
 
-    /// Transcribe PCM16 audio to text via the Whisper service.
+    /// Transcribe PCM16 audio to text via the Parakeet TDT STT service.
     pub async fn transcribe(&self, pcm: &[i16], sample_rate: u32) -> Result<String, String> {
         let wav = pcm_to_wav(pcm, sample_rate);
         let part = reqwest::multipart::Part::bytes(wav)
@@ -587,7 +592,7 @@ impl SttClient {
 // TTS Client
 // ---------------------------------------------------------------------------
 
-/// HTTP client for the TTS service (Chatterbox / Kokoro / any OpenAI-compatible).
+/// HTTP client for the Chatterbox-Turbo TTS service (drtr:7744, `/v1/audio/speech`).
 pub struct TtsClient {
     endpoint: String,
     voice: String,

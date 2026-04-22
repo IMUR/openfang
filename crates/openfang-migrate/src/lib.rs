@@ -13,9 +13,15 @@ use std::path::PathBuf;
 pub enum MigrateSource {
     /// OpenClaw agent framework.
     OpenClaw,
-    /// LangChain (future).
+    /// LangChain — aspirational: declared but not yet implemented.
+    /// Returns `UnsupportedSource` at runtime. Kept for public API compat
+    /// and upstream merge compatibility; do not remove without coordinating
+    /// with upstream.
     LangChain,
-    /// AutoGPT (future).
+    /// AutoGPT — aspirational: declared but not yet implemented.
+    /// Returns `UnsupportedSource` at runtime. Kept for public API compat
+    /// and upstream merge compatibility; do not remove without coordinating
+    /// with upstream.
     AutoGpt,
 }
 

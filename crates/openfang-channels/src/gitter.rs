@@ -3,6 +3,12 @@
 //! Connects to the Gitter Streaming API for real-time messages and posts
 //! replies via the REST API. Uses Bearer token authentication and
 //! newline-delimited JSON streaming.
+//!
+//! **Platform status (as of 2023):** Gitter was acquired by GitLab in 2017
+//! and reached end-of-life. The web app, new account creation, and new room
+//! creation are no longer available. The streaming API backend may still
+//! respond for legacy room IDs held by existing accounts, but new deployments
+//! cannot practically use this adapter.
 
 use crate::types::{
     split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,

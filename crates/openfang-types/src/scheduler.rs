@@ -225,7 +225,12 @@ pub struct CronJob {
     pub schedule: CronSchedule,
     /// What to do when fired.
     pub action: CronAction,
-    /// Where to deliver the result (single legacy destination).
+    /// Legacy single-destination delivery. Kept as a backward-compat shim for
+    /// jobs created before multi-destination fan-out (`delivery_targets`) was
+    /// introduced. Both fields are still dispatched — fan-out runs first, then
+    /// this field — so existing jobs continue to work unchanged. New jobs should
+    /// use `delivery_targets` instead. This field may be removed once all live
+    /// jobs have migrated to `delivery_targets`.
     pub delivery: CronDelivery,
     /// Additional fan-out destinations. May be empty; each target is
     /// delivered concurrently after the job produces its output.

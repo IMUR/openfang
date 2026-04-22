@@ -3645,6 +3645,10 @@ pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoRespo
     let reranker_active = state.kernel.reranker.is_some();
     #[cfg(not(feature = "memory-candle"))]
     let reranker_active = false;
+    #[cfg(feature = "memory-candle")]
+    let classifier_active = state.kernel.classifier.is_some();
+    #[cfg(not(feature = "memory-candle"))]
+    let classifier_active = false;
     let memory_candle_feature = cfg!(feature = "memory-candle");
     let cuda_device = state.kernel.config.memory.cuda_device;
     let models_cached = {
@@ -3671,8 +3675,10 @@ pub async fn health_detail(State(state): State<Arc<AppState>>) -> impl IntoRespo
             "embedding_active": embedding_active,
             "ner_backend": state.kernel.config.memory.ner_backend,
             "reranker_backend": state.kernel.config.memory.reranker_backend,
+            "classification_backend": state.kernel.config.memory.classification_backend,
             "ner_active": ner_active,
             "reranker_active": reranker_active,
+            "classifier_active": classifier_active,
             "memory_candle_binary": memory_candle_feature,
             "cuda_device": cuda_device,
             "models_cached": models_cached,

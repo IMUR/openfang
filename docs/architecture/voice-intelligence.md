@@ -14,7 +14,7 @@ Three complementary layers handle voice:
 
 1. **Voice inference services** — standalone Python services on **drtr RTX 2080** exposing OpenAI-compatible HTTP APIs. STT (Parakeet TDT 0.6B, fp16) on port 7733. TTS (Chatterbox-Turbo 350M) on port 7744. Total VRAM: 4.6GB / 8GB. OpenFang calls these over HTTP via Tailscale (~7ms RTT).
 
-2. **Voice transport layer** — implemented in `crates/openfang-api/src/voice.rs` and `ws.rs`, with the shared client in `static/js/voice-client.js`. Handles the binary WebSocket protocol, codec, STT/TTS client calls, clause buffering, barge-in via CancellationToken (server) and energy VAD (client), and the full conversation turn loop.
+2. **Voice transport layer** — implemented in `crates/openfang-api/src/voice.rs` and `ws.rs`, with the shared client in `static/js/voice-client.js`. Handles the binary WebSocket protocol, codec, STT/TTS client calls, clause buffering, barge-in via Silero Neural VAD and CancellationToken (server), and the full conversation turn loop.
 
 3. **Neural VAD** — Silero VAD v5 loaded via candle (safetensors, CPU inference on prtr i9-9900X). Processes 512-sample chunks at 16kHz, returns speech probability. Falls back to energy-based RMS if model unavailable.
 
@@ -207,21 +207,18 @@ Loads `idle-intelligence/silero-vad-v5-safetensors` from HuggingFace hub (cached
 
 **Integration:** `VoiceSession` receives `Option<Arc<SileroVad>>` at creation. `detect_speech()` accumulates PCM in a 512-sample buffer and feeds complete chunks to Silero. Falls back to RMS energy when Silero is unavailable (feature not compiled or model failed to load). Config: `vad_speech_threshold = 0.5` (Silero), `vad_energy_threshold = 0.01` (fallback).
 
-**Note:** Server-side VAD is **disabled during Speaking state** — `handle_audio()` returns `VoiceAction::Continue` while TTS is playing. This prevents false barge-ins from ambient mic noise. Barge-in during playback is handled client-side.
+**Note:** Server-side VAD operates continuously, even during the Speaking state. When speech is detected while the agent is speaking, it instantly triggers a `VoiceAction::BargeIn` which cancels the active TTS and halts playback.
 
 ### Barge-in (Interrupt)
 
-Barge-in uses a **client-side primary path** with server-side CancellationToken support:
+Barge-in uses a **server-side primary path** powered entirely by the neural VAD model (Silero v5) with CancellationToken support:
 
-1. **Client-side energy VAD (primary path):** `voice-client.js` computes RMS energy on each mic audio frame during TTS playback. When energy exceeds the threshold (0.008), the client immediately calls `stopPlayback()` (which calls `.stop()` on the active `AudioBufferSourceNode` and flushes the queue) and sends a 0x40 Interrupt frame to the server. A 2-second cooldown prevents rapid-fire triggers. This runs entirely in the browser — no server round-trip needed for detection.
+1. **Server-side Neural VAD (primary path):** The client continuously streams microphone audio to the server, relying on the browser's native echo cancellation. If Silero detects speech while the TTS is streaming (`VoiceSessionState::Speaking`), it returns `VoiceAction::BargeIn`.
+2. **Server-side CancellationToken:** The WS handler cancels the `CancellationToken`, aborts the `voice_task` JoinHandle, sends `SpeechEnd` (0x11), and resets the session to Idle.
+3. **Client-side Playback Cancellation:** When the server resets to Idle, the next audio frame of the user's speech triggers `SpeechStarted`, causing the server to send `VadSpeechStart` (0x30). The client intercepts this and immediately calls `stopPlayback()` on the active `AudioBufferSourceNode`, killing the bot's voice instantly.
+4. **Non-blocking select! loop:** The voice_task is spawned but NOT awaited inline. The main WS `select!` loop polls both the receiver and the voice_task, allowing the server to process incoming audio frames and trigger barge-in while TTS is streaming.
 
-2. **Server-side 0x40 handler:** WS handler cancels the `CancellationToken`, aborts the `voice_task` JoinHandle, sends SpeechEnd (0x11), resets session to Idle with a fresh CancellationToken.
-
-3. **Non-blocking select! loop:** The voice_task is spawned but NOT awaited inline. The main WS `select!` loop polls both the receiver and the voice_task, allowing Interrupt messages to be processed while TTS is streaming.
-
-**Server-side VAD during Speaking is disabled.** Both Silero and energy VAD produced false positives from ambient mic noise during TTS playback, killing TTS mid-response. `handle_audio()` returns `VoiceAction::Continue` during Speaking state.
-
-**SpeechEnd (0x11) behavior:** On natural completion, SpeechEnd lets the client's audio queue drain — the currently-playing `AudioBufferSourceNode` finishes, then `drainPlayQueue()` finds the queue empty and transitions state. On interrupt (0x40), `stopPlayback()` kills the active source immediately.
+**SpeechEnd (0x11) behavior:** On natural completion, SpeechEnd lets the client's audio queue drain — the currently-playing `AudioBufferSourceNode` finishes, then `drainPlayQueue()` finds the queue empty and transitions state. During a barge-in, the immediate `VadSpeechStart` (0x30) from the user's speech ensures the queue is flushed immediately.
 
 ### Clause-Level TTS Chunking
 
@@ -363,7 +360,7 @@ vox.ism.la {
 | ClauseBuffer (split on `,;:.!?\n—`, 30-char min) | Complete |
 | Markdown stripper (for TTS-safe text) | Complete |
 | VoiceSession state machine | Complete |
-| Barge-in via CancellationToken | Working — client-side energy VAD + server CancellationToken + voice-client.js consolidation. Known remaining bugs under investigation. |
+| Barge-in via CancellationToken | Working — server-side Neural VAD + server CancellationToken. |
 | Non-blocking voice_task select! loop | Complete |
 | WS integration in `ws.rs` | Complete |
 | Voice mode context (`[VOICE MODE]` prefix) | Complete |
@@ -406,3 +403,4 @@ vox.ism.la {
 - **2026-04-07:** Added OPENFANG_STATIC_DIR filesystem fallback for live JS iteration without rebuilds
 - **2026-04-07:** SpeechEnd (0x11) lets audio drain naturally; only 0x40 Interrupt stops immediately
 - **2026-04-20:** v0.6.0 upstream merge landed — `/voice` route removed (voice fully consolidated into dashboard), `OPENFANG_STATIC_DIR` dev-mode fallback reinstated in `webchat.rs`, dashboard + voice controls now localized via `static/i18n/` (English + Russian bundled)
+- **2026-04-22:** Removed client-side energy VAD hack completely; shifted 100% of barge-in and speech detection logic to the server-side Silero Neural VAD, allowing configuration-free responsiveness.

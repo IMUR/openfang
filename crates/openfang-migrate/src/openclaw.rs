@@ -418,7 +418,6 @@ struct LegacyYamlChannelConfig {
 struct OpenFangConfig {
     default_model: OpenFangModelConfig,
     memory: OpenFangMemorySection,
-    network: OpenFangNetworkSection,
     #[serde(skip_serializing_if = "Option::is_none")]
     channels: Option<toml::Value>,
 }
@@ -437,10 +436,6 @@ struct OpenFangMemorySection {
     decay_rate: f32,
 }
 
-#[derive(Serialize)]
-struct OpenFangNetworkSection {
-    listen_addr: String,
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1387,9 +1382,6 @@ fn migrate_config_from_json(
             base_url: resolved.base_url,
         },
         memory: OpenFangMemorySection { decay_rate: 0.05 },
-        network: OpenFangNetworkSection {
-            listen_addr: "127.0.0.1:4200".to_string(),
-        },
         channels,
     };
 
@@ -2545,7 +2537,7 @@ fn report_skipped_features(root: &OpenClawRoot, source: &Path, report: &mut Migr
             kind: ItemKind::Config,
             name: "memory".to_string(),
             reason:
-                "Memory backend config not migrated — OpenFang uses SQLite with vector embeddings"
+                "Memory backend config not migrated — OpenFang uses SurrealDB with vector embeddings"
                     .to_string(),
         });
     }
@@ -2620,9 +2612,6 @@ fn migrate_legacy_config(
                 .as_ref()
                 .and_then(|m| m.decay_rate)
                 .unwrap_or(0.05),
-        },
-        network: OpenFangNetworkSection {
-            listen_addr: "127.0.0.1:4200".to_string(),
         },
         channels,
     };

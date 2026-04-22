@@ -1,6 +1,6 @@
 //! Lenient serde deserializers for backwards-compatible agent manifest loading.
 //!
-//! When agent manifests are stored as msgpack blobs in SQLite, schema changes
+//! When agent manifests are stored as msgpack blobs in SurrealDB, schema changes
 //! (e.g., a field changing from integer to struct, or from map to Vec) cause
 //! hard deserialization failures. These helpers gracefully return defaults
 //! for type-mismatched fields instead of failing the entire deserialization.

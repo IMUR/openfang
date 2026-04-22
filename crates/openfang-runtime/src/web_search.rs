@@ -178,7 +178,6 @@ impl WebSearchEngine {
             resolve_api_key(&self.config.tavily.api_key_env).ok_or("Tavily API key not set")?;
 
         let body = serde_json::json!({
-            "api_key": api_key.as_str(),
             "query": query,
             "search_depth": self.config.tavily.search_depth,
             "max_results": max_results,
@@ -188,6 +187,7 @@ impl WebSearchEngine {
         let resp = self
             .client
             .post("https://api.tavily.com/search")
+            .header("Authorization", format!("Bearer {}", api_key.as_str()))
             .json(&body)
             .send()
             .await

@@ -210,10 +210,13 @@ impl ClawHubSort {
 
 // -- Backward compat aliases -----------------------------------------------
 
+#[deprecated(note = "Use ClawHubBrowseResponse instead")]
 /// Alias kept for code that still references the old name.
 pub type ClawHubListResponse = ClawHubBrowseResponse;
+#[deprecated(note = "Use ClawHubSearchResponse instead")]
 /// Alias kept for code that still references the old name.
 pub type ClawHubSearchResults = ClawHubSearchResponse;
+#[deprecated(note = "Use ClawHubBrowseEntry instead")]
 /// Alias kept for code that still references the old name.
 pub type ClawHubEntry = ClawHubBrowseEntry;
 
