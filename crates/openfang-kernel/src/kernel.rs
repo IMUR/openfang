@@ -4022,7 +4022,10 @@ impl OpenFangKernel {
         }
 
         // Remove from persistent storage
-        std::mem::drop(self.memory.remove_agent(agent_id));
+        let _ = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(self.memory.remove_agent(agent_id))
+        });
 
         // SECURITY: Record agent kill in audit trail
         self.audit_log.record(

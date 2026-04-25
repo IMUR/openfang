@@ -39,7 +39,8 @@
 use crate::model_cache;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{linear, Linear, Module, VarBuilder};
-use candle_transformers::models::bert::{BertModel, Config};
+use candle_transformers::models::bert::{BertModel, Config as BertConfig};
+use candle_transformers::models::distilbert::{DistilBertModel, Config as DistilBertConfig};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
@@ -110,9 +111,14 @@ pub enum ClassifierError {
     Cache(String),
 }
 
+enum NliModelType {
+    Bert(BertModel),
+    DistilBert(DistilBertModel),
+}
+
 /// Inner NLI classifier state.
 struct NliModel {
-    model: BertModel,
+    model: NliModelType,
     /// Linear(hidden_size → 3) for NLI: contradiction / neutral / entailment
     classifier: Linear,
     tokenizer: Tokenizer,
@@ -167,8 +173,7 @@ impl CandleClassifier {
         let nli = tokio::task::spawn_blocking(move || {
             let config_str = std::fs::read_to_string(&config_path)
                 .map_err(|e| ClassifierError::Load(format!("config.json: {e}")))?;
-            let bert_config: Config = serde_json::from_str(&config_str)
-                .map_err(|e| ClassifierError::Load(format!("bert config: {e}")))?;
+            let is_distilbert = config_str.contains("\"dim\"") && config_str.contains("\"n_layers\"");
 
             let dtype = if matches!(device_clone, Device::Cuda(_)) {
                 DType::F16
@@ -181,14 +186,25 @@ impl CandleClassifier {
                     .map_err(|e| ClassifierError::Load(format!("weights load: {e}")))?
             };
 
-            // Try to load from "bert.*" prefix first (fine-tuned checkpoint layout),
-            // then fall back to root prefix (raw DistilBERT layout).
-            let model = BertModel::load(vb.pp("bert"), &bert_config)
-                .or_else(|_| BertModel::load(vb.clone(), &bert_config))
-                .map_err(|e| ClassifierError::Load(format!("BertModel: {e}")))?;
+            // Re-load models with correct varbuilder
+            let (model_type, hidden_size) = if is_distilbert {
+                let db_config: DistilBertConfig = serde_json::from_str(&config_str)
+                    .map_err(|e| ClassifierError::Load(format!("distilbert config: {e}")))?;
+                let m = DistilBertModel::load(vb.pp("distilbert"), &db_config)
+                    .or_else(|_| DistilBertModel::load(vb.clone(), &db_config))
+                    .map_err(|e| ClassifierError::Load(format!("DistilBertModel: {e}")))?;
+                (NliModelType::DistilBert(m), db_config.dim)
+            } else {
+                let bert_config: BertConfig = serde_json::from_str(&config_str)
+                    .map_err(|e| ClassifierError::Load(format!("bert config: {e}")))?;
+                let m = BertModel::load(vb.pp("bert"), &bert_config)
+                    .or_else(|_| BertModel::load(vb.clone(), &bert_config))
+                    .map_err(|e| ClassifierError::Load(format!("BertModel: {e}")))?;
+                (NliModelType::Bert(m), bert_config.hidden_size)
+            };
 
             // NLI classification head: hidden_size → 3
-            let classifier = linear(bert_config.hidden_size, 3, vb.pp("classifier"))
+            let classifier = linear(hidden_size, 3, vb.pp("classifier"))
                 .map_err(|e| ClassifierError::Load(format!("classifier head: {e}")))?;
 
             let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
@@ -209,7 +225,7 @@ impl CandleClassifier {
             info!(model_id = model_id_owned, "NLI classifier model loaded");
 
             Ok::<_, ClassifierError>(NliModel {
-                model,
+                model: model_type,
                 classifier,
                 tokenizer,
                 device: device_clone,
@@ -343,11 +359,15 @@ fn nli_score_all(
     let attention_mask = Tensor::from_vec(all_masks, (n, max_len), device)
         .map_err(|e| ClassifierError::Inference(format!("attention_mask tensor: {e}")))?;
 
-    // Forward pass through the BERT encoder
-    let hidden = nli
-        .model
-        .forward(&input_ids, &token_type_ids, Some(&attention_mask))
-        .map_err(|e| ClassifierError::Inference(format!("BERT forward: {e}")))?;
+    // Forward pass through the encoder
+    let hidden = match &nli.model {
+        NliModelType::Bert(m) => m
+            .forward(&input_ids, &token_type_ids, Some(&attention_mask))
+            .map_err(|e| ClassifierError::Inference(format!("BERT forward: {e}")))?,
+        NliModelType::DistilBert(m) => m
+            .forward(&input_ids, &attention_mask)
+            .map_err(|e| ClassifierError::Inference(format!("DistilBERT forward: {e}")))?,
+    };
 
     // Extract [CLS] token (index 0) for each item in the batch
     let cls = hidden

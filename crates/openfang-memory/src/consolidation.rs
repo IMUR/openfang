@@ -96,7 +96,7 @@ impl ConsolidationEngine {
 
         let mut result = self
             .db
-            .query("SELECT DISTINCT agent_id FROM memories WHERE deleted = false")
+            .query("SELECT agent_id FROM memories WHERE deleted = false GROUP BY agent_id")
             .await
             .map_err(surreal_err)?;
 

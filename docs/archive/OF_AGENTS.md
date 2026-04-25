@@ -169,7 +169,7 @@ If your manifest grants `agent_send` and `agent_list`:
 
 When communicating with other agents:
 
-- They have their own memory namespaces — they cannot see your `self.*` keys
+- They have their own memory namespaces — they cannot see your `self.`* keys
 - They may have different capability grants — don't assume they can do what you can
 - Messages are synchronous — you wait for their response before continuing
 

@@ -49,20 +49,22 @@ openfang-types          Shared types: Agent, Capability, Event, Memory, Message,
 
 ### Crate Responsibilities
 
-| Crate | Description |
-|-------|-------------|
-| **openfang-types** | Core type definitions used across all crates. Defines `AgentManifest`, `AgentId`, `Capability`, `Event`, `ToolDefinition`, `KernelConfig`, `OpenFangError`, taint tracking (`TaintLabel`, `TaintSet`), Ed25519 manifest signing, model catalog types (`ModelCatalogEntry`, `ProviderInfo`, `ModelTier`), tool compatibility mappings (21 OpenClaw-to-OpenFang), MCP/A2A config types, and web config types. All config structs use `#[serde(default)]` for forward-compatible TOML parsing. |
-| **openfang-memory** | SQLite-backed memory substrate (schema v5). Uses `Arc<Mutex<Connection>>` with `spawn_blocking` for async bridge. Provides structured KV storage, semantic search with vector embeddings, knowledge graph (entities and relations), session management, task board, usage event persistence (`usage_events` table, `UsageStore`), and canonical sessions for cross-channel memory. Five schema versions: V1 core, V2 collab, V3 embeddings, V4 usage, V5 canonical_sessions. |
-| **openfang-runtime** | Agent execution engine. Contains the agent loop (`run_agent_loop`, `run_agent_loop_streaming`), 3 native LLM drivers (Anthropic, Gemini, OpenAI-compatible covering 20 providers), 23 built-in tools, WASM sandbox (Wasmtime with dual fuel+epoch metering), MCP client/server (JSON-RPC 2.0 over stdio/SSE), A2A protocol (AgentCard, task management), web search engine (4 providers: Tavily/Brave/Perplexity/DuckDuckGo), web fetch with SSRF protection, loop guard (SHA256-based tool loop detection), session repair (history validation), LLM session compactor (block-aware), Merkle hash chain audit trail, and embedding driver. Defines the `KernelHandle` trait that enables inter-agent tools without circular crate dependencies. |
-| **openfang-kernel** | The central coordinator. `OpenFangKernel` assembles all subsystems: `AgentRegistry`, `AgentScheduler`, `CapabilityManager`, `EventBus`, `Supervisor`, `WorkflowEngine`, `TriggerEngine`, `BackgroundExecutor`, `WasmSandbox`, `ModelCatalog`, `MeteringEngine`, `ModelRouter`, `AuthManager` (RBAC), `HeartbeatMonitor`, `SetupWizard`, `SkillRegistry`, MCP connections, and `WebToolsContext`. Implements `KernelHandle` for inter-agent operations. Handles agent spawn/kill, message dispatch, workflow execution, trigger evaluation, capability inheritance validation, and graceful shutdown with state persistence. |
-| **openfang-api** | HTTP API server built on Axum 0.8 with 76 endpoints. Routes for agents, workflows, triggers, memory, channels, templates, models, providers, skills, ClawHub, MCP, health, status, version, and shutdown. WebSocket handler for real-time agent chat with streaming. SSE endpoint for streaming responses. OpenAI-compatible endpoints (`POST /v1/chat/completions`, `GET /v1/models`). A2A endpoints (`/.well-known/agent.json`, `/a2a/*`). Middleware: Bearer token auth, request ID injection, structured request logging, GCRA rate limiter (cost-aware), security headers (CSP, X-Frame-Options, etc.), health endpoint redaction. |
+
+| Crate                 | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **openfang-types**    | Core type definitions used across all crates. Defines `AgentManifest`, `AgentId`, `Capability`, `Event`, `ToolDefinition`, `KernelConfig`, `OpenFangError`, taint tracking (`TaintLabel`, `TaintSet`), Ed25519 manifest signing, model catalog types (`ModelCatalogEntry`, `ProviderInfo`, `ModelTier`), tool compatibility mappings (21 OpenClaw-to-OpenFang), MCP/A2A config types, and web config types. All config structs use `#[serde(default)]` for forward-compatible TOML parsing.                                                                                                                                                                                                                                                                                                                 |
+| **openfang-memory**   | SQLite-backed memory substrate (schema v5). Uses `Arc<Mutex<Connection>>` with `spawn_blocking` for async bridge. Provides structured KV storage, semantic search with vector embeddings, knowledge graph (entities and relations), session management, task board, usage event persistence (`usage_events` table, `UsageStore`), and canonical sessions for cross-channel memory. Five schema versions: V1 core, V2 collab, V3 embeddings, V4 usage, V5 canonical_sessions.                                                                                                                                                                                                                                                                                                                                |
+| **openfang-runtime**  | Agent execution engine. Contains the agent loop (`run_agent_loop`, `run_agent_loop_streaming`), 3 native LLM drivers (Anthropic, Gemini, OpenAI-compatible covering 20 providers), 23 built-in tools, WASM sandbox (Wasmtime with dual fuel+epoch metering), MCP client/server (JSON-RPC 2.0 over stdio/SSE), A2A protocol (AgentCard, task management), web search engine (4 providers: Tavily/Brave/Perplexity/DuckDuckGo), web fetch with SSRF protection, loop guard (SHA256-based tool loop detection), session repair (history validation), LLM session compactor (block-aware), Merkle hash chain audit trail, and embedding driver. Defines the `KernelHandle` trait that enables inter-agent tools without circular crate dependencies.                                                            |
+| **openfang-kernel**   | The central coordinator. `OpenFangKernel` assembles all subsystems: `AgentRegistry`, `AgentScheduler`, `CapabilityManager`, `EventBus`, `Supervisor`, `WorkflowEngine`, `TriggerEngine`, `BackgroundExecutor`, `WasmSandbox`, `ModelCatalog`, `MeteringEngine`, `ModelRouter`, `AuthManager` (RBAC), `HeartbeatMonitor`, `SetupWizard`, `SkillRegistry`, MCP connections, and `WebToolsContext`. Implements `KernelHandle` for inter-agent operations. Handles agent spawn/kill, message dispatch, workflow execution, trigger evaluation, capability inheritance validation, and graceful shutdown with state persistence.                                                                                                                                                                                 |
+| **openfang-api**      | HTTP API server built on Axum 0.8 with 76 endpoints. Routes for agents, workflows, triggers, memory, channels, templates, models, providers, skills, ClawHub, MCP, health, status, version, and shutdown. WebSocket handler for real-time agent chat with streaming. SSE endpoint for streaming responses. OpenAI-compatible endpoints (`POST /v1/chat/completions`, `GET /v1/models`). A2A endpoints (`/.well-known/agent.json`, `/a2a/`*). Middleware: Bearer token auth, request ID injection, structured request logging, GCRA rate limiter (cost-aware), security headers (CSP, X-Frame-Options, etc.), health endpoint redaction.                                                                                                                                                                     |
 | **openfang-channels** | Channel bridge layer with 40 adapters. Each adapter implements the `ChannelAdapter` trait. Includes: Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Email, SMS, Webhook, Teams, Mattermost, IRC, Google Chat, Twitch, Rocket.Chat, Zulip, XMPP, LINE, Viber, Messenger, Reddit, Mastodon, Bluesky, Feishu, Revolt, Nextcloud, Guilded, Keybase, Threema, Nostr, Webex, Pumble, Flock, Twist, Mumble, DingTalk, Discourse, Gitter, Ntfy, Gotify, LinkedIn. Features: `AgentRouter` for message routing, `BridgeManager` for lifecycle coordination, `ChannelRateLimiter` (per-user DashMap tracking), `formatter.rs` (Markdown to TelegramHTML/SlackMrkdwn/PlainText), `ChannelOverrides` (model/system_prompt/dm_policy/group_policy/rate_limit/threading/output_format), DM/group policy enforcement. |
-| **openfang-wire** | OpenFang Protocol (OFP) for peer-to-peer agent communication. JSON-framed messages over TCP with HMAC-SHA256 mutual authentication (nonce + constant-time verify via `subtle`). `PeerNode` listens for connections and manages peers. `PeerRegistry` tracks known remote peers and their agents. |
-| **openfang-cli** | Clap-based CLI. Supports all commands: `init`, `start`, `status`, `doctor`, `agent spawn/list/chat/kill`, `workflow list/create/run`, `trigger list/create/delete`, `migrate`, `skill install/list/remove/search/create`, `channel list/setup/test/enable/disable`, `config show/edit`, `chat`, `mcp`. Daemon auto-detect: checks `~/.openfang/daemon.json` and health pings; uses HTTP when a daemon is running, boots an in-process kernel as fallback. Built-in MCP server mode. |
-| **openfang-desktop** | Tauri 2.0 native desktop application. Boots the kernel in-process, runs the axum server on a background thread, and points a WebView at `http://127.0.0.1:{random_port}`. Features: system tray (Show/Browser/Status/Quit), single-instance enforcement, desktop notifications, hide-to-tray on close. IPC commands: `get_port`, `get_status`. Mobile-ready with `#[cfg(desktop)]` guards. |
-| **openfang-migrate** | Migration engine. Supports OpenClaw (`~/.openclaw/`). Converts YAML configs to TOML, maps tool names, maps provider names, imports agent manifests, copies memory files, converts channel configs. Produces a `MigrationReport` with imported items, skipped items, and warnings. |
-| **openfang-skills** | Skill system for pluggable tool bundles. 60 bundled skills compiled via `include_str!()`. Skills are `skill.toml` + Python/WASM/Node.js/PromptOnly code. `SkillManifest` defines metadata, runtime config, provided tools, and requirements. `SkillRegistry` manages installed and bundled skills. `FangHubClient` connects to FangHub marketplace. `ClawHubClient` connects to clawhub.ai for cross-ecosystem skill discovery. `SKILL.md` parser for OpenClaw compatibility (YAML frontmatter + Markdown body). `SkillVerifier` with SHA256 verification. Prompt injection scanner (`scan_prompt_content()`) detects override attempts, data exfiltration, and shell references. |
-| **xtask** | Build automation tasks (cargo-xtask pattern). |
+| **openfang-wire**     | OpenFang Protocol (OFP) for peer-to-peer agent communication. JSON-framed messages over TCP with HMAC-SHA256 mutual authentication (nonce + constant-time verify via `subtle`). `PeerNode` listens for connections and manages peers. `PeerRegistry` tracks known remote peers and their agents.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| **openfang-cli**      | Clap-based CLI. Supports all commands: `init`, `start`, `status`, `doctor`, `agent spawn/list/chat/kill`, `workflow list/create/run`, `trigger list/create/delete`, `migrate`, `skill install/list/remove/search/create`, `channel list/setup/test/enable/disable`, `config show/edit`, `chat`, `mcp`. Daemon auto-detect: checks `~/.openfang/daemon.json` and health pings; uses HTTP when a daemon is running, boots an in-process kernel as fallback. Built-in MCP server mode.                                                                                                                                                                                                                                                                                                                         |
+| **openfang-desktop**  | Tauri 2.0 native desktop application. Boots the kernel in-process, runs the axum server on a background thread, and points a WebView at `http://127.0.0.1:{random_port}`. Features: system tray (Show/Browser/Status/Quit), single-instance enforcement, desktop notifications, hide-to-tray on close. IPC commands: `get_port`, `get_status`. Mobile-ready with `#[cfg(desktop)]` guards.                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| **openfang-migrate**  | Migration engine. Supports OpenClaw (`~/.openclaw/`). Converts YAML configs to TOML, maps tool names, maps provider names, imports agent manifests, copies memory files, converts channel configs. Produces a `MigrationReport` with imported items, skipped items, and warnings.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| **openfang-skills**   | Skill system for pluggable tool bundles. 60 bundled skills compiled via `include_str!()`. Skills are `skill.toml` + Python/WASM/Node.js/PromptOnly code. `SkillManifest` defines metadata, runtime config, provided tools, and requirements. `SkillRegistry` manages installed and bundled skills. `FangHubClient` connects to FangHub marketplace. `ClawHubClient` connects to clawhub.ai for cross-ecosystem skill discovery. `SKILL.md` parser for OpenClaw compatibility (YAML frontmatter + Markdown body). `SkillVerifier` with SHA256 verification. Prompt injection scanner (`scan_prompt_content()`) detects override attempts, data exfiltration, and shell references.                                                                                                                           |
+| **xtask**             | Build automation tasks (cargo-xtask pattern).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+
 
 ---
 
@@ -198,11 +200,11 @@ When the daemon wraps the kernel in `Arc`, additional steps occur:
 3. **Quota check**: `AgentScheduler` verifies the agent has not exceeded its token-per-hour limit.
 4. **Entry lookup**: Fetch `AgentEntry` from the registry.
 5. **Module dispatch**: Based on `manifest.module`:
-   - `builtin:chat` or unrecognized: LLM agent loop
-   - `wasm:path/to/module.wasm`: WASM sandbox execution
-   - `python:path/to/script.py`: Python subprocess execution (env_clear() + selective vars)
+  - `builtin:chat` or unrecognized: LLM agent loop
+  - `wasm:path/to/module.wasm`: WASM sandbox execution
+  - `python:path/to/script.py`: Python subprocess execution (env_clear() + selective vars)
 6. **LLM agent loop** (for `builtin:chat`):
-   a. Load or create session from memory.
+  a. Load or create session from memory.
    b. Load canonical context summary (cross-channel memory) into system prompt.
    c. Append stability guidelines to system prompt.
    d. Resolve LLM driver (per-agent override or kernel default).
@@ -310,6 +312,7 @@ Conversation history storage. Each agent has a session containing its message hi
 ### 5. Task Board
 
 A shared task queue for multi-agent collaboration:
+
 - `task_post`: Create a task with title, description, and optional assignee.
 - `task_claim`: Claim the next available task.
 - `task_complete`: Mark a task as done with a result.
@@ -359,35 +362,35 @@ pub trait LlmDriver: Send + Sync {
 Three native driver implementations cover all 20 providers with 51 models:
 
 1. **AnthropicDriver**: Native Anthropic Messages API. Handles Claude-specific features (content blocks including images, tool use blocks, streaming deltas). Supports `ContentBlock::Image` with media type validation and 5MB cap.
-
 2. **GeminiDriver**: Native Google Gemini API (v1beta). Uses `x-goog-api-key` auth, `systemInstruction`, `functionDeclarations`, `streamGenerateContent?alt=sse`. Maps Gemini function call responses to the unified `ToolUse` stop reason.
-
 3. **OpenAiCompatDriver**: OpenAI-compatible Chat Completions API. Works with any provider that implements the OpenAI API format. Configured with different base URLs per provider. Covers 18+ providers including OpenAI, DeepSeek, Groq, Mistral, Together, and local runners.
 
 ### Provider Configuration
 
-| Provider | Driver | Base URL | Key Required |
-|----------|--------|----------|--------------|
-| `anthropic` | Anthropic | `https://api.anthropic.com` | Yes |
-| `gemini` | Gemini | `https://generativelanguage.googleapis.com` | Yes |
-| `openai` | OpenAI-compat | `https://api.openai.com` | Yes |
-| `deepseek` | OpenAI-compat | `https://api.deepseek.com` | Yes |
-| `groq` | OpenAI-compat | `https://api.groq.com/openai` | Yes |
-| `openrouter` | OpenAI-compat | `https://openrouter.ai/api` | Yes |
-| `mistral` | OpenAI-compat | `https://api.mistral.ai` | Yes |
-| `together` | OpenAI-compat | `https://api.together.xyz` | Yes |
-| `fireworks` | OpenAI-compat | `https://api.fireworks.ai/inference` | Yes |
-| `perplexity` | OpenAI-compat | `https://api.perplexity.ai` | Yes |
-| `cohere` | OpenAI-compat | `https://api.cohere.ai` | Yes |
-| `ai21` | OpenAI-compat | `https://api.ai21.com` | Yes |
-| `cerebras` | OpenAI-compat | `https://api.cerebras.ai` | Yes |
-| `sambanova` | OpenAI-compat | `https://api.sambanova.ai` | Yes |
-| `huggingface` | OpenAI-compat | `https://api-inference.huggingface.co` | Yes |
-| `xai` | OpenAI-compat | `https://api.x.ai` | Yes |
-| `replicate` | OpenAI-compat | `https://api.replicate.com` | Yes |
-| `ollama` | OpenAI-compat | `http://localhost:11434` | No |
-| `vllm` | OpenAI-compat | `http://localhost:8000` | No |
-| `lmstudio` | OpenAI-compat | `http://localhost:1234` | No |
+
+| Provider      | Driver        | Base URL                                    | Key Required |
+| ------------- | ------------- | ------------------------------------------- | ------------ |
+| `anthropic`   | Anthropic     | `https://api.anthropic.com`                 | Yes          |
+| `gemini`      | Gemini        | `https://generativelanguage.googleapis.com` | Yes          |
+| `openai`      | OpenAI-compat | `https://api.openai.com`                    | Yes          |
+| `deepseek`    | OpenAI-compat | `https://api.deepseek.com`                  | Yes          |
+| `groq`        | OpenAI-compat | `https://api.groq.com/openai`               | Yes          |
+| `openrouter`  | OpenAI-compat | `https://openrouter.ai/api`                 | Yes          |
+| `mistral`     | OpenAI-compat | `https://api.mistral.ai`                    | Yes          |
+| `together`    | OpenAI-compat | `https://api.together.xyz`                  | Yes          |
+| `fireworks`   | OpenAI-compat | `https://api.fireworks.ai/inference`        | Yes          |
+| `perplexity`  | OpenAI-compat | `https://api.perplexity.ai`                 | Yes          |
+| `cohere`      | OpenAI-compat | `https://api.cohere.ai`                     | Yes          |
+| `ai21`        | OpenAI-compat | `https://api.ai21.com`                      | Yes          |
+| `cerebras`    | OpenAI-compat | `https://api.cerebras.ai`                   | Yes          |
+| `sambanova`   | OpenAI-compat | `https://api.sambanova.ai`                  | Yes          |
+| `huggingface` | OpenAI-compat | `https://api-inference.huggingface.co`      | Yes          |
+| `xai`         | OpenAI-compat | `https://api.x.ai`                          | Yes          |
+| `replicate`   | OpenAI-compat | `https://api.replicate.com`                 | Yes          |
+| `ollama`      | OpenAI-compat | `http://localhost:11434`                    | No           |
+| `vllm`        | OpenAI-compat | `http://localhost:8000`                     | No           |
+| `lmstudio`    | OpenAI-compat | `http://localhost:1234`                     | No           |
+
 
 ### Per-Agent Driver Resolution
 
@@ -402,6 +405,7 @@ base_url = "https://custom.api.com"   # Optional custom endpoint
 ```
 
 When resolving the driver for an agent:
+
 1. If the agent uses the same provider as the kernel default (and no custom key/URL), reuse the kernel's shared driver instance.
 2. Otherwise, create a dedicated driver for that agent.
 
@@ -586,12 +590,14 @@ The channel system (`openfang-channels`) provides 40 adapters for messaging plat
 
 ### Adapter List
 
-| Wave | Channels |
-|------|----------|
+
+| Wave              | Channels                                                                                                                          |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | **Original (15)** | Telegram, Discord, Slack, WhatsApp, Signal, Matrix, Email, SMS, Webhook, Teams, Mattermost, IRC, Google Chat, Twitch, Rocket.Chat |
-| **Wave 2 (8)** | Zulip, XMPP, LINE, Viber, Messenger, Reddit, Mastodon, Bluesky |
-| **Wave 3 (8)** | Feishu, Revolt, Nextcloud, Guilded, Keybase, Threema, Nostr, Webex |
-| **Wave 4 (9)** | Pumble, Flock, Twist, Mumble, DingTalk, Discourse, Gitter, Ntfy, Gotify, LinkedIn |
+| **Wave 2 (8)**    | Zulip, XMPP, LINE, Viber, Messenger, Reddit, Mastodon, Bluesky                                                                    |
+| **Wave 3 (8)**    | Feishu, Revolt, Nextcloud, Guilded, Keybase, Threema, Nostr, Webex                                                                |
+| **Wave 4 (9)**    | Pumble, Flock, Twist, Mumble, DingTalk, Discourse, Gitter, Ntfy, Gotify, LinkedIn                                                 |
+
 
 ### Channel Features
 
@@ -707,12 +713,14 @@ WireMessage {
 ```
 
 **Request types:**
+
 - `Discover` -- Request peer information and agent list
 - `Advertise` -- Announce local agents to a peer
 - `RouteMessage` -- Send a message to a remote agent
 - `Ping` -- Keepalive
 
 **Response types:**
+
 - `DiscoverResponse` -- Peer info and agent list
 - `RouteResponse` -- Agent's response to a routed message
 - `Pong` -- Keepalive response
@@ -740,6 +748,7 @@ pub struct RemoteAgent {
 ### Capability Gating
 
 OFP operations require capabilities:
+
 - `OfpDiscover` -- Required to send discover requests
 - `OfpConnect(addr)` -- Required to connect to a specific peer
 - `OfpAdvertise` -- Required to advertise agents to peers
@@ -925,3 +934,4 @@ The desktop app (`openfang-desktop`) wraps the full OpenFang stack in a native T
 | Web Config       |
 +------------------+
 ```
+

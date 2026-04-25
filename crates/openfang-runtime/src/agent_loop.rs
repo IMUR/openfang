@@ -548,9 +548,35 @@ pub async fn run_agent_loop(
     // we append recalled memories here since they are resolved at loop time.
     let mut system_prompt = manifest.model.system_prompt.clone();
     if !memories.is_empty() {
+        let now = chrono::Utc::now();
         let mem_pairs: Vec<(String, String)> = memories
             .iter()
-            .map(|m| (String::new(), m.content.clone()))
+            .map(|m| {
+                let mut c = m.scope.chars();
+                let scope_cap = match c.next() {
+                    None => String::new(),
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                };
+                let diff = now.signed_duration_since(m.created_at);
+                let time_str = if diff.num_days() > 0 {
+                    let days = diff.num_days();
+                    if days == 1 { "1 day ago".to_string() } else { format!("{days} days ago") }
+                } else if diff.num_hours() > 0 {
+                    let hours = diff.num_hours();
+                    if hours == 1 { "1 hour ago".to_string() } else { format!("{hours} hours ago") }
+                } else if diff.num_minutes() > 0 {
+                    let mins = diff.num_minutes();
+                    if mins == 1 { "1 minute ago".to_string() } else { format!("{mins} minutes ago") }
+                } else {
+                    "Just now".to_string()
+                };
+                let label = if scope_cap.is_empty() {
+                    time_str
+                } else {
+                    format!("{} - {}", scope_cap, time_str)
+                };
+                (label, m.content.clone())
+            })
             .collect();
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));

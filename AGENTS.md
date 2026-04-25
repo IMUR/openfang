@@ -49,6 +49,13 @@ The core is **Rust-first**. These rules apply to one-off scripts (linters, teste
 3. **Markdown:** Project rules live in `.markdownlint-cli2.jsonc` at the repo root.
 4. **Tool the Tooling:** When building capabilities or bindings, adhere aggressively to the MCP specification.
 5. **Config Semantics:** `KernelConfig` uses flat maps (`provider_urls`, `provider_api_keys`), not nested provider tables. Nested `[providers.X]` blocks are silently ignored.
+6. **Known Bug — kill_agent DB deletion:** `kernel.rs:kill_agent` calls `std::mem::drop(self.memory.remove_agent(agent_id))` which drops the async future without awaiting it. The SurrealDB DELETE never runs. Agents killed via `DELETE /api/agents/{id}` return on daemon restart. Fix: use `block_in_place` as in `spawn_agent`. *(Fixed 2026-04-25 — verify across restart.)*
+7. **Use absolute paths in `config.toml`.** Rust does not expand `~`. The systemd unit sets `WorkingDirectory=%h/.openfang`, so a literal `~` creates a nested `~` directory inside `.openfang`.
+8. **`workspace/.cargo/config.toml`** sets `git-fetch-with-cli = true` so `[patch]` git dependencies fetch via system `git` and SSH agent. Required for Forgejo-hosted patches.
+9. **Standard build for this deployment** (Candle memory pipeline active):
+   ```bash
+   cargo build --release --features memory-candle -p openfang-cli
+   ```
 
 ## Key Crate Map
 

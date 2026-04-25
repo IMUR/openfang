@@ -36,18 +36,22 @@ Health detail includes `memory_candle_binary: true|false` so operators know whet
 
 ### prtr (Projector)
 
-| GPU | VRAM | CC | Role | Status |
-|-----|------|----|------|--------|
-| GTX 970 #0 | 4GB (3.5GB fast) | 5.2 | Unassigned | Idle |
-| GTX 1080 #1 | 8GB | 6.1 | Freed (prev. Whisper+Kokoro, retired) | Idle |
-| GTX 1080 #2 | 8GB | 6.1 | Ollama LLMs | Active |
-| GTX 970 #3 | 4GB (3.5GB fast) | 5.2 | Unassigned | Idle |
+
+| GPU         | VRAM             | CC  | Role                                  | Status |
+| ----------- | ---------------- | --- | ------------------------------------- | ------ |
+| GTX 970 #0  | 4GB (3.5GB fast) | 5.2 | Unassigned                            | Idle   |
+| GTX 1080 #1 | 8GB              | 6.1 | Freed (prev. Whisper+Kokoro, retired) | Idle   |
+| GTX 1080 #2 | 8GB              | 6.1 | Ollama LLMs                           | Active |
+| GTX 970 #3  | 4GB (3.5GB fast) | 5.2 | Unassigned                            | Idle   |
+
 
 ### drtr (Director)
 
-| GPU | VRAM | CC | Role | Status |
-|-----|------|----|------|--------|
-| RTX 2080 | 8GB | 7.5 (Turing) | **Voice pipeline** (Chatterbox 3.2GB + Parakeet 1.4GB) | Active, ~4.6GB used |
+
+| GPU      | VRAM | CC           | Role                                                   | Status              |
+| -------- | ---- | ------------ | ------------------------------------------------------ | ------------------- |
+| RTX 2080 | 8GB  | 7.5 (Turing) | **Voice pipeline** (Chatterbox 3.2GB + Parakeet 1.4GB) | Active, ~4.6GB used |
+
 
 Memory intelligence runs on **CPU** (i9-9900X with AVX-512). All Candle BERT models load FP32 in-process with `cuda_device` omitted.
 
@@ -95,13 +99,13 @@ All six stores share one embedded SurrealDB 3.0.5 handle backed by SurrealKV at 
 The upgrade from SurrealDB 2.6.5 to 3.0.5 required several DDL syntax changes:
 
 
-| v2 Syntax                             | v3 Syntax                    | Reason                                                 |
-| ------------------------------------- | ---------------------------- | ------------------------------------------------------ |
-| `FLEXIBLE TYPE any`                   | `TYPE any`                   | `FLEXIBLE` restricted to object-containing types       |
-| `FLEXIBLE TYPE object`                | `TYPE object FLEXIBLE`       | `FLEXIBLE` moved after `TYPE`                          |
-| `SEARCH ANALYZER ... BM25(1.2, 0.75)` | `FULLTEXT ANALYZER ... BM25` | Keyword renamed, BM25 params removed                   |
-| `type::thing('table', $id)`           | `type::record('table', $id)` | Function renamed                                       |
-| `TYPE option<T>`                      | `TYPE option<T> | null`      | v3 distinguishes NULL from NONE; `| null` accepts both |
+| v2 Syntax                             | v3 Syntax                    | Reason                                           |
+| ------------------------------------- | ---------------------------- | ------------------------------------------------ |
+| `FLEXIBLE TYPE any`                   | `TYPE any`                   | `FLEXIBLE` restricted to object-containing types |
+| `FLEXIBLE TYPE object`                | `TYPE object FLEXIBLE`       | `FLEXIBLE` moved after `TYPE`                    |
+| `SEARCH ANALYZER ... BM25(1.2, 0.75)` | `FULLTEXT ANALYZER ... BM25` | Keyword renamed, BM25 params removed             |
+| `type::thing('table', $id)`           | `type::record('table', $id)` | Function renamed                                 |
+| `TYPE option<T>`                      | `TYPE option                 | null`                                            |
 
 
 ### SurrealDB v3 Rust SDK Changes
@@ -155,9 +159,9 @@ The recall pipeline in order:
 2. Cross-encoder reranking of candidates (`memory-candle`)
 3. Graph-boosted re-ordering via NER entity overlap (`memory-candle`)
 4. Scope-weighted stable-sort (`semantic` first, then `declarative`, then `episodic`)
-5. Top-5 fragments injected via `prompt_builder::build_memory_section()`
+5. Top-5 fragments injected via `prompt_builder::build_memory_section()` with semantic scope and relative timestamp metadata (e.g., `[Episodic - 3 days ago]`).
 
-This layer queries the **semantic store** (`memories` table — HNSW + BM25). It is assembled in `crates/openfang-runtime/src/prompt_builder.rs`.
+This layer queries the **semantic store** (`memories` table — HNSW + BM25). It is assembled in `crates/openfang-runtime/src/prompt_builder.rs` and `agent_loop.rs`.
 
 ### Layer 2 — Explicit Tool Calls (agent-driven, KV store)
 
@@ -233,10 +237,12 @@ The kernel runs idempotent KV migrations at startup from a `tokio::spawn` fired 
 
 `migrate_shared_memory_schedules` (in `kernel.rs`) sweeps the shared KV namespace for legacy `__openfang_schedules` entries (pre-cron-scheduler agent schedule tools) and replays them into the upstream cron scheduler. On success it clears the legacy key to `[]` and writes a marker:
 
-| Shared-namespace key                    | Value after migration |
-| --------------------------------------- | --------------------- |
-| `__openfang_schedules`                  | `[]` (cleared)        |
-| `__openfang_schedules_migrated_v1`      | `true`                |
+
+| Shared-namespace key               | Value after migration |
+| ---------------------------------- | --------------------- |
+| `__openfang_schedules`             | `[]` (cleared)        |
+| `__openfang_schedules_migrated_v1` | `true`                |
+
 
 Idempotency is gated on the marker — if `__openfang_schedules_migrated_v1 == true` the migration short-circuits and does nothing. Operators running `memory_list shared` will see both keys; **do not delete the marker** or the legacy sweep will re-run (and would be a no-op now, but future migration versions may assume it's present).
 
@@ -382,7 +388,7 @@ Kernel background loop (start_background_agents)
 
 ## Memory Scope Vocabulary
 
-All memories carry a `scope` field that drives weighted recall.
+All memories carry a `scope` field that drives weighted recall. As of the recent prompt architecture update, this scope (along with relative timestamps) is injected directly into the agent's prompt during `Layer 1` pre-turn injection, allowing the LLM to differentiate between its own raw conversation history and curated facts.
 
 
 | Scope         | Source           | Written By                          | Description                              |
@@ -518,21 +524,20 @@ The backfill pipeline:
 Authenticated **GET** `/api/health/detail` includes a `memory_intelligence` object:
 
 
-| Field                  | Meaning                                                                    |
-| ---------------------- | -------------------------------------------------------------------------- |
-| `embedding_provider`   | Config string, e.g. `candle`                                               |
-| `embedding_model`      | Configured model id                                                        |
-| `embedding_active`     | `true` only if `embedding_driver` initialized                              |
-| `ner_backend`          | Raw config value: `auto`, `candle`, `none`, etc.                           |
-| `reranker_backend`     | Raw config value: `auto`, `candle`, `none`, etc.                           |
-| `classification_backend` | Raw config value: `auto`, `candle`, `none`, etc.                         |
-| `ner_active`           | NER model loaded                                                           |
-| `reranker_active`      | Cross-encoder loaded                                                       |
-| `classifier_active`    | Zero-shot NLI classifier loaded                                            |
-| `memory_candle_binary` | `true` if compiled with `--features memory-candle`                         |
-| `cuda_device`          | Config value (JSON `null` if unset -- CPU mode)                            |
-| `models_cached`        | Heuristic: `~/.openfang/models/<embedding_model>/model.safetensors` exists |
-
+| Field                    | Meaning                                                                    |
+| ------------------------ | -------------------------------------------------------------------------- |
+| `embedding_provider`     | Config string, e.g. `candle`                                               |
+| `embedding_model`        | Configured model id                                                        |
+| `embedding_active`       | `true` only if `embedding_driver` initialized                              |
+| `ner_backend`            | Raw config value: `auto`, `candle`, `none`, etc.                           |
+| `reranker_backend`       | Raw config value: `auto`, `candle`, `none`, etc.                           |
+| `classification_backend` | Raw config value: `auto`, `candle`, `none`, etc.                           |
+| `ner_active`             | NER model loaded                                                           |
+| `reranker_active`        | Cross-encoder loaded                                                       |
+| `classifier_active`      | Zero-shot NLI classifier loaded                                            |
+| `memory_candle_binary`   | `true` if compiled with `--features memory-candle`                         |
+| `cuda_device`            | Config value (JSON `null` if unset -- CPU mode)                            |
+| `models_cached`          | Heuristic: `~/.openfang/models/<embedding_model>/model.safetensors` exists |
 
 
 ---
@@ -573,6 +578,12 @@ All four subsystems active on CPU. Verify via `/api/health/detail`.
 | SurrealDB v3      | Upgrade from 2.6.5 to 3.0.5 -- DDL, SDK, type system                                                                      | Complete |
 | Memory middleware | Capability enforcement, `self.*` namespace routing, `memory_list`/`memory_delete` tools, system principal, WASM alignment | Complete |
 
+
+### Recent Fixes & Observations
+
+- **Candle Classifier (`distilbert`)**: The `candle_classifier` was updated to dynamically parse the architecture from `config.json` (checking for `"dim"` vs `"hidden_size"`) to support both `BertModel` and `DistilBertModel` wrappers. This resolved the "missing field hidden_size" error on boot.
+- **SurrealDB `DISTINCT` Compatibility**: The consolidation backfill query was updated from `SELECT DISTINCT agent_id FROM memories` to `SELECT agent_id FROM memories WHERE deleted = false GROUP BY agent_id` to comply with the embedded SurrealDB engine's parser, resolving `500 Internal Server Error`s during CLI backfills.
+- **The "Agent's Perspective"**: Because Layer 1 (Semantic Recall) operates completely transparently before the LLM prompt is assembled, agents interacting with the system often cannot distinguish between raw conversation history and HNSW-surfaced semantic memories. The prompt masks the complexity of the HNSW + Cross-Encoder reranking happening underneath. When auditing the system from the "outside," it may incorrectly appear as if memory is a "flat dump" or that vector search is disabled.
 
 ---
 
@@ -623,7 +634,7 @@ systemctl --user start openfang
 
 ### Primary instance (FIXED — was causing missing WebSocket response)
 
-**`crates/openfang-runtime/src/agent_loop.rs` — `run_agent_loop_streaming`**
+`**crates/openfang-runtime/src/agent_loop.rs` — `run_agent_loop_streaming`**
 
 After the LLM emitted its final `EndTurn` response, `stream_tx` (the mpsc `Sender` whose closure signals "stream done" to all consumers) was held alive through all post-response persistence:
 
@@ -643,6 +654,7 @@ All WebSocket, SSE, OpenAI-compat, and TUI consumers wait for `rx.recv() → Non
 **Fix (commit `ad3499e`):** `drop(stream_tx)` called immediately after `final_response = text.clone()` at all exit paths (EndTurn, silent/NO_REPLY, MaxTokens, max iterations). Post-response persistence continues in the same async context but no longer holds any consumer hostage. Additionally, the voice TTS task was fixed to continue reading on `ContentComplete(ToolUse)` rather than breaking — tool-use responses now correctly reach TTS.
 
 The fix restored correct behaviour for:
+
 - WebSocket `type: "response"` arriving without page refresh
 - Voice spoken replies after tool use
 - SSE and OpenAI-compat stream completion timing
@@ -650,10 +662,11 @@ The fix restored correct behaviour for:
 ### Remaining instances
 
 
-| Location | Pattern | Severity |
-|----------|---------|----------|
-| `tool_runner.rs` MCP branch ~483–496 | `mcp_connections.lock().await` held across MCP I/O (not SurrealDB, but same class) | MEDIUM |
-| `kernel.rs` compaction + immediate `get_session` | Write-then-read ordering assumption | LOW |
+| Location                                         | Pattern                                                                            | Severity |
+| ------------------------------------------------ | ---------------------------------------------------------------------------------- | -------- |
+| `tool_runner.rs` MCP branch ~483–496             | `mcp_connections.lock().await` held across MCP I/O (not SurrealDB, but same class) | MEDIUM   |
+| `kernel.rs` compaction + immediate `get_session` | Write-then-read ordering assumption                                                | LOW      |
+
 
 The `agent_loop.rs` silent/NO_REPLY and tool-use iteration paths that previously appeared here are resolved by the same `ad3499e` fix — `drop(stream_tx)` was added to all exit paths.
 

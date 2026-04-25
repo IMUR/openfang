@@ -44,11 +44,13 @@ Templates are organized into 4 tiers based on task complexity and the LLM models
 
 For tasks requiring the deepest reasoning: multi-agent orchestration, system architecture, and security analysis.
 
-| Template | Provider | Model |
-|----------|----------|-------|
-| orchestrator | deepseek | deepseek-chat |
-| architect | deepseek | deepseek-chat |
+
+| Template         | Provider | Model         |
+| ---------------- | -------- | ------------- |
+| orchestrator     | deepseek | deepseek-chat |
+| architect        | deepseek | deepseek-chat |
 | security-auditor | deepseek | deepseek-chat |
+
 
 All Tier 1 agents fall back to `groq/llama-3.3-70b-versatile` if the DeepSeek API key is unavailable.
 
@@ -56,16 +58,18 @@ All Tier 1 agents fall back to `groq/llama-3.3-70b-versatile` if the DeepSeek AP
 
 For tasks requiring strong analytical and coding abilities: software engineering, data science, research, testing, and legal review.
 
-| Template | Provider | Model |
-|----------|----------|-------|
-| coder | gemini | gemini-2.5-flash |
-| code-reviewer | gemini | gemini-2.5-flash |
-| data-scientist | gemini | gemini-2.5-flash |
-| debugger | gemini | gemini-2.5-flash |
-| researcher | gemini | gemini-2.5-flash |
-| analyst | gemini | gemini-2.5-flash |
-| test-engineer | gemini | gemini-2.5-flash |
-| legal-assistant | gemini | gemini-2.5-flash |
+
+| Template        | Provider | Model            |
+| --------------- | -------- | ---------------- |
+| coder           | gemini   | gemini-2.5-flash |
+| code-reviewer   | gemini   | gemini-2.5-flash |
+| data-scientist  | gemini   | gemini-2.5-flash |
+| debugger        | gemini   | gemini-2.5-flash |
+| researcher      | gemini   | gemini-2.5-flash |
+| analyst         | gemini   | gemini-2.5-flash |
+| test-engineer   | gemini   | gemini-2.5-flash |
+| legal-assistant | gemini   | gemini-2.5-flash |
+
 
 All Tier 2 agents fall back to `groq/llama-3.3-70b-versatile` if the Gemini API key is unavailable.
 
@@ -73,34 +77,38 @@ All Tier 2 agents fall back to `groq/llama-3.3-70b-versatile` if the Gemini API 
 
 For everyday business and productivity tasks: planning, writing, email, customer support, sales, recruiting, and meetings.
 
-| Template | Provider | Model | Fallback |
-|----------|----------|-------|----------|
-| planner | groq | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
-| writer | groq | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
-| doc-writer | groq | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
-| devops-lead | groq | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
-| assistant | groq | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
-| email-assistant | groq | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
-| social-media | groq | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
-| customer-support | groq | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
-| sales-assistant | groq | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
-| recruiter | groq | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
-| meeting-assistant | groq | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
+
+| Template          | Provider | Model                   | Fallback                |
+| ----------------- | -------- | ----------------------- | ----------------------- |
+| planner           | groq     | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
+| writer            | groq     | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
+| doc-writer        | groq     | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
+| devops-lead       | groq     | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
+| assistant         | groq     | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
+| email-assistant   | groq     | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
+| social-media      | groq     | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
+| customer-support  | groq     | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
+| sales-assistant   | groq     | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
+| recruiter         | groq     | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
+| meeting-assistant | groq     | llama-3.3-70b-versatile | gemini/gemini-2.0-flash |
+
 
 ### Tier 4 -- Fast (Groq Only)
 
 For lightweight, high-speed tasks: ops monitoring, translation, tutoring, wellness tracking, budgeting, travel, and home automation. No fallback model configured (except `ops` which uses a smaller 8B model for speed).
 
-| Template | Provider | Model |
-|----------|----------|-------|
-| ops | groq | llama-3.1-8b-instant |
-| hello-world | groq | llama-3.3-70b-versatile |
-| translator | groq | llama-3.3-70b-versatile |
-| tutor | groq | llama-3.3-70b-versatile |
-| health-tracker | groq | llama-3.3-70b-versatile |
-| personal-finance | groq | llama-3.3-70b-versatile |
-| travel-planner | groq | llama-3.3-70b-versatile |
-| home-automation | groq | llama-3.3-70b-versatile |
+
+| Template         | Provider | Model                   |
+| ---------------- | -------- | ----------------------- |
+| ops              | groq     | llama-3.1-8b-instant    |
+| hello-world      | groq     | llama-3.3-70b-versatile |
+| translator       | groq     | llama-3.3-70b-versatile |
+| tutor            | groq     | llama-3.3-70b-versatile |
+| health-tracker   | groq     | llama-3.3-70b-versatile |
+| personal-finance | groq     | llama-3.3-70b-versatile |
+| travel-planner   | groq     | llama-3.3-70b-versatile |
+| home-automation  | groq     | llama-3.3-70b-versatile |
+
 
 ---
 
@@ -165,7 +173,7 @@ Focuses on OWASP Top 10, input validation, auth flaws, cryptographic misuse, inj
 - **Token quota**: 150,000/hour
 - **Schedule**: Proactive on `event:agent_spawned`, `event:agent_terminated`
 - **Tools**: `file_read`, `file_list`, `shell_exec`, `memory_store`, `memory_recall`
-- **Shell access**: `cargo audit *`, `cargo tree *`, `git log *`
+- **Shell access**: `cargo audit `*, `cargo tree *`, `git log *`
 - **Capabilities**: `memory_read = ["*"]`, `memory_write = ["self.*", "shared.*"]`
 
 ```bash
@@ -189,7 +197,7 @@ Writes clean, production-quality code with a step-by-step reasoning approach. Re
 - **Token quota**: 200,000/hour
 - **Max concurrent tools**: 10
 - **Tools**: `file_read`, `file_write`, `file_list`, `shell_exec`
-- **Shell access**: `cargo *`, `rustc *`, `git *`, `npm *`, `python *`
+- **Shell access**: `cargo `*, `rustc *`, `git *`, `npm *`, `python *`
 - **Capabilities**: `memory_read = ["*"]`, `memory_write = ["self.*"]`
 
 ```bash
@@ -212,7 +220,7 @@ Reviews code by priority: correctness, security, performance, maintainability, s
 - **Max tokens**: 4096
 - **Token quota**: 150,000/hour
 - **Tools**: `file_read`, `file_list`, `shell_exec`, `memory_store`, `memory_recall`
-- **Shell access**: `cargo clippy *`, `cargo fmt *`, `git diff *`, `git log *`
+- **Shell access**: `cargo clippy `*, `cargo fmt *`, `git diff *`, `git log *`
 - **Capabilities**: `memory_read = ["*"]`, `memory_write = ["self.*", "shared.*"]`
 
 ```bash
@@ -235,7 +243,7 @@ Follows a structured methodology: understand the question, explore data (shape, 
 - **Max tokens**: 4096
 - **Token quota**: 150,000/hour
 - **Tools**: `file_read`, `file_write`, `file_list`, `shell_exec`, `memory_store`, `memory_recall`
-- **Shell access**: `python *`
+- **Shell access**: `python `*
 - **Capabilities**: `memory_read = ["*"]`, `memory_write = ["self.*", "shared.*"]`
 
 ```bash
@@ -258,7 +266,7 @@ Follows a strict methodology: reproduce, isolate (binary search through code/dat
 - **Max tokens**: 4096
 - **Token quota**: 150,000/hour
 - **Tools**: `file_read`, `file_list`, `shell_exec`, `memory_store`, `memory_recall`
-- **Shell access**: `cargo *`, `git log *`, `git diff *`, `git show *`
+- **Shell access**: `cargo `*, `git log *`, `git diff *`, `git show *`
 - **Capabilities**: `memory_read = ["*"]`, `memory_write = ["self.*", "shared.*"]`
 
 ```bash
@@ -303,7 +311,7 @@ Analyzes data, finds patterns, generates insights, and creates structured report
 - **Max tokens**: 4096
 - **Token quota**: 150,000/hour
 - **Tools**: `file_read`, `file_write`, `file_list`, `shell_exec`
-- **Shell access**: `python *`, `cargo *`
+- **Shell access**: `python `*, `cargo *`
 - **Capabilities**: `memory_read = ["*"]`, `memory_write = ["self.*", "shared.*"]`
 
 ```bash
@@ -326,7 +334,7 @@ Tests document behavior, not implementation. Prefers fast, deterministic tests. 
 - **Max tokens**: 4096
 - **Token quota**: 150,000/hour
 - **Tools**: `file_read`, `file_write`, `file_list`, `shell_exec`, `memory_store`, `memory_recall`
-- **Shell access**: `cargo test *`, `cargo check *`
+- **Shell access**: `cargo test `*, `cargo check *`
 - **Capabilities**: `memory_read = ["*"]`, `memory_write = ["self.*", "shared.*"]`
 
 ```bash
@@ -438,7 +446,7 @@ Covers CI/CD pipeline design, container orchestration (Docker, Kubernetes), Infr
 - **Max tokens**: 4096
 - **Token quota**: 150,000/hour
 - **Tools**: `file_read`, `file_write`, `file_list`, `shell_exec`, `memory_store`, `memory_recall`, `agent_send`
-- **Shell access**: `docker *`, `git *`, `cargo *`, `kubectl *`
+- **Shell access**: `docker `*, `git *`, `cargo *`, `kubectl *`
 - **Capabilities**: `agent_message = ["*"]`, `memory_read = ["*"]`, `memory_write = ["self.*", "shared.*"]`
 
 ```bash
@@ -462,7 +470,7 @@ The versatile default agent covering conversational intelligence, task execution
 - **Token quota**: 300,000/hour
 - **Max concurrent tools**: 10
 - **Tools**: `file_read`, `file_write`, `file_list`, `memory_store`, `memory_recall`, `web_fetch`, `shell_exec`, `agent_send`, `agent_list`
-- **Shell access**: `python *`, `cargo *`, `git *`, `npm *`
+- **Shell access**: `python `*, `cargo *`, `git *`, `npm *`
 - **Capabilities**: `network = ["*"]`, `agent_message = ["*"]`, `memory_read = ["*"]`, `memory_write = ["self.*", "shared.*"]`
 
 ```bash
@@ -624,7 +632,7 @@ Monitors system health, runs diagnostics, and helps with deployments. Precise an
 - **Token quota**: 50,000/hour
 - **Schedule**: Periodic every 5 minutes
 - **Tools**: `shell_exec`, `file_read`, `file_list`
-- **Shell access**: `docker *`, `git *`, `cargo *`, `systemctl *`, `ps *`, `df *`, `free *`
+- **Shell access**: `docker `*, `git *`, `cargo *`, `systemctl *`, `ps *`, `df *`, `free *`
 - **Capabilities**: `memory_read = ["*"]`, `memory_write = ["self.*"]`
 
 ```bash
@@ -693,7 +701,7 @@ Explains concepts at the learner's level using the Feynman Technique. Uses Socra
 - **Token quota**: 200,000/hour
 - **Max concurrent tools**: 5
 - **Tools**: `file_read`, `file_write`, `file_list`, `memory_store`, `memory_recall`, `shell_exec`, `web_fetch`
-- **Shell access**: `python *`
+- **Shell access**: `python `*
 - **Capabilities**: `network = ["*"]`, `memory_read = ["*"]`, `memory_write = ["self.*", "shared.*"]`
 
 ```bash
@@ -741,7 +749,7 @@ Creates detailed budgets using frameworks like 50/30/20, zero-based budgeting, a
 - **Token quota**: 150,000/hour
 - **Max concurrent tools**: 5
 - **Tools**: `file_read`, `file_write`, `file_list`, `memory_store`, `memory_recall`, `shell_exec`
-- **Shell access**: `python *`
+- **Shell access**: `python `*
 - **Capabilities**: `memory_read = ["*"]`, `memory_write = ["self.*", "shared.*"]`
 
 ```bash
@@ -788,7 +796,7 @@ Manages smart home devices (lights, thermostats, security, appliances, sensors).
 - **Token quota**: 100,000/hour
 - **Max concurrent tools**: 10
 - **Tools**: `file_read`, `file_write`, `file_list`, `memory_store`, `memory_recall`, `shell_exec`, `web_fetch`
-- **Shell access**: `curl *`, `python *`, `ping *`
+- **Shell access**: `curl `*, `python *`, `ping *`
 - **Capabilities**: `network = ["*"]`, `memory_read = ["*"]`, `memory_write = ["self.*", "shared.*"]`
 
 ```bash
@@ -857,19 +865,21 @@ shell = ["python *", "cargo *"]     # Allowed shell command patterns (whitelist)
 
 ### Available Tools
 
-| Tool | Description |
-|------|-------------|
-| `file_read` | Read file contents |
-| `file_write` | Write/create files |
-| `file_list` | List directory contents |
-| `shell_exec` | Execute shell commands (restricted by `shell` whitelist) |
-| `memory_store` | Persist key-value data to memory |
-| `memory_recall` | Retrieve data from memory |
-| `web_fetch` | Fetch content from URLs (SSRF-protected) |
-| `agent_send` | Send a message to another agent |
-| `agent_list` | List all running agents |
-| `agent_spawn` | Spawn a new agent |
-| `agent_kill` | Terminate a running agent |
+
+| Tool            | Description                                              |
+| --------------- | -------------------------------------------------------- |
+| `file_read`     | Read file contents                                       |
+| `file_write`    | Write/create files                                       |
+| `file_list`     | List directory contents                                  |
+| `shell_exec`    | Execute shell commands (restricted by `shell` whitelist) |
+| `memory_store`  | Persist key-value data to memory                         |
+| `memory_recall` | Retrieve data from memory                                |
+| `web_fetch`     | Fetch content from URLs (SSRF-protected)                 |
+| `agent_send`    | Send a message to another agent                          |
+| `agent_list`    | List all running agents                                  |
+| `agent_spawn`   | Spawn a new agent                                        |
+| `agent_kill`    | Terminate a running agent                                |
+
 
 ### Tips for Custom Agents
 
@@ -967,10 +977,12 @@ Orchestrator:
 
 Set the following API keys to enable the corresponding model providers:
 
-| Variable | Provider | Used By |
-|----------|----------|---------|
-| `DEEPSEEK_API_KEY` | DeepSeek | Tier 1 (orchestrator, architect, security-auditor) |
-| `GEMINI_API_KEY` | Google Gemini | Tier 2 primary, Tier 3 fallback |
-| `GROQ_API_KEY` | Groq | Tier 3 primary, Tier 1/2 fallback, Tier 4 |
+
+| Variable           | Provider      | Used By                                            |
+| ------------------ | ------------- | -------------------------------------------------- |
+| `DEEPSEEK_API_KEY` | DeepSeek      | Tier 1 (orchestrator, architect, security-auditor) |
+| `GEMINI_API_KEY`   | Google Gemini | Tier 2 primary, Tier 3 fallback                    |
+| `GROQ_API_KEY`     | Groq          | Tier 3 primary, Tier 1/2 fallback, Tier 4          |
+
 
 At minimum, set `GROQ_API_KEY` to enable all Tier 3 and Tier 4 agents. Add `GEMINI_API_KEY` for Tier 2 agents. Add `DEEPSEEK_API_KEY` for Tier 1 frontier agents.
