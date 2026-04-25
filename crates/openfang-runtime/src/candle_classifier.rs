@@ -41,6 +41,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{linear, Linear, Module, VarBuilder};
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use candle_transformers::models::distilbert::{DistilBertModel, Config as DistilBertConfig};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
@@ -123,6 +124,9 @@ struct NliModel {
     classifier: Linear,
     tokenizer: Tokenizer,
     device: Device,
+    /// Index of the ENTAILMENT class in the model's label ordering.
+    /// Read from config.json `id2label`; falls back to 2 (standard MNLI order).
+    entailment_idx: usize,
 }
 
 /// Candle zero-shot memory classification driver.
@@ -222,6 +226,26 @@ impl CandleClassifier {
                 ..Default::default()
             }));
 
+            // Resolve entailment index from model config's id2label.
+            let id2label: HashMap<String, String> = serde_json::from_str(&config_str)
+                .map(|v: serde_json::Value| {
+                    v.get("id2label")
+                        .and_then(|m| m.as_object())
+                        .map(|obj| {
+                            obj.iter()
+                                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                                .collect::<HashMap<String, String>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            let entailment_idx = id2label
+                .iter()
+                .find(|(_, v)| v.to_uppercase() == "ENTAILMENT")
+                .and_then(|(k, _)| k.parse::<usize>().ok())
+                .unwrap_or(2);
+            info!(entailment_idx, "Resolved entailment label index from config");
+
             info!(model_id = model_id_owned, "NLI classifier model loaded");
 
             Ok::<_, ClassifierError>(NliModel {
@@ -229,6 +253,7 @@ impl CandleClassifier {
                 classifier,
                 tokenizer,
                 device: device_clone,
+                entailment_idx,
             })
         })
         .await
@@ -359,13 +384,34 @@ fn nli_score_all(
     let attention_mask = Tensor::from_vec(all_masks, (n, max_len), device)
         .map_err(|e| ClassifierError::Inference(format!("attention_mask tensor: {e}")))?;
 
+    // DistilBERT attention mask preparation:
+    // Tokenizer gives [batch, seq_len] U32: 1=real, 0=padding.
+    // candle's masked_fill treats non-zero as "fill with -inf".
+    // So we need padding=1, real=0. We invert by subtracting from ones
+    // (staying in U32 to avoid the F32 where_cond error in candle-transformers
+    // 0.10.2). Reshape to 4D (batch, 1, 1, seq_len) because DistilBertModel
+    // does NOT auto-expand a 2D mask — it tries to broadcast directly to
+    // [batch, heads, q_len, k_len] and fails.
+    let attention_mask_for_distilbert = if matches!(&nli.model, NliModelType::DistilBert(_)) {
+        let ones = Tensor::ones_like(&attention_mask)
+            .map_err(|e| ClassifierError::Inference(format!("ones: {e}")))?;
+        let inverted = ones
+            .broadcast_sub(&attention_mask)
+            .map_err(|e| ClassifierError::Inference(format!("mask sub: {e}")))?;
+        inverted
+            .reshape((n, 1, 1, max_len))
+            .map_err(|e| ClassifierError::Inference(format!("mask reshape 4D: {e}")))?
+    } else {
+        attention_mask.clone()
+    };
+
     // Forward pass through the encoder
     let hidden = match &nli.model {
         NliModelType::Bert(m) => m
             .forward(&input_ids, &token_type_ids, Some(&attention_mask))
             .map_err(|e| ClassifierError::Inference(format!("BERT forward: {e}")))?,
         NliModelType::DistilBert(m) => m
-            .forward(&input_ids, &attention_mask)
+            .forward(&input_ids, &attention_mask_for_distilbert)
             .map_err(|e| ClassifierError::Inference(format!("DistilBERT forward: {e}")))?,
     };
 
@@ -386,10 +432,9 @@ fn nli_score_all(
     let probs = candle_nn::ops::softmax(&logits, 1)
         .map_err(|e| ClassifierError::Inference(format!("softmax: {e}")))?;
 
-    // Entailment class index = 2 (CONTRADICTION=0, NEUTRAL=1, ENTAILMENT=2)
-    // This is the standard label order for MNLI-fine-tuned models.
+    // Use the entailment index resolved from the model's id2label at load time.
     let entailment_probs = probs
-        .narrow(1, 2, 1)
+        .narrow(1, nli.entailment_idx, 1)
         .map_err(|e| ClassifierError::Inference(format!("entailment narrow: {e}")))?
         .squeeze(1)
         .map_err(|e| ClassifierError::Inference(format!("entailment squeeze: {e}")))?;
@@ -402,4 +447,127 @@ fn nli_score_all(
         .map_err(|e| ClassifierError::Inference(format!("to_vec1: {e}")))?;
 
     Ok(probs_f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    /// Contract test: DistilBERT mask preparation must produce shape (n, 1, 1, max_len) in U32.
+    ///
+    /// This tests the mask preparation boundary that was broken in production:
+    /// - Tokenizer outputs [batch, seq_len] U32 mask (1=real, 0=padding)
+    /// - We invert it (padding=1, real=0) staying in U32
+    /// - Then reshape to (batch, 1, 1, seq_len) for DistilBertModel::forward()
+    ///
+    /// The reshape is needed because candle's DistilBertModel does NOT expand a 2D
+    /// mask internally (unlike BertModel which uses get_extended_attention_mask).
+    /// Without the reshape, DistilBertModel tries to broadcast [batch, seq_len] to
+    /// [batch, heads, q_len, k_len] and fails.
+    #[test]
+    fn distilbert_mask_shape_contract() {
+        let device = Device::Cpu;
+        let n = 4;
+        let max_len = 54;
+
+        // Simulate tokenizer output: U32 [batch, seq_len], 1=real, 0=padding
+        // Batch of 4: two sequences of length 54, two with padding
+        let mask_values: Vec<u32> = (0..n * max_len)
+            .map(|i| {
+                let seq_idx = i / max_len;
+                let pos = i % max_len;
+                if seq_idx < 2 {
+                    1 // first two sequences: all real tokens
+                } else if pos < 20 {
+                    1 // last two: 20 real tokens, rest padding
+                } else {
+                    0
+                }
+            })
+            .collect();
+
+        let attention_mask = Tensor::from_vec(mask_values, (n, max_len), &device)
+            .expect("failed to create attention mask tensor");
+
+        // Assert preconditions from tokenizer
+        assert_eq!(attention_mask.shape().dims(), &[n, max_len]);
+        assert_eq!(attention_mask.dtype(), DType::U32);
+
+        // --- Replicate the DistilBERT mask preparation from nli_score_all ---
+        let ones = Tensor::ones_like(&attention_mask).expect("ones");
+        let inverted = ones
+            .broadcast_sub(&attention_mask)
+            .expect("mask inversion");
+        let reshaped = inverted.reshape((n, 1, 1, max_len)).expect("4D reshape");
+
+        // Contract assertions
+        assert_eq!(
+            reshaped.shape().dims(),
+            &[n, 1, 1, max_len],
+            "DistilBERT mask must be 4D: (batch, 1, 1, seq_len)"
+        );
+        assert_eq!(
+            reshaped.dtype(),
+            DType::U32,
+            "Mask dtype must remain U32 (avoids F32 where_cond bug in candle 0.10.2)"
+        );
+
+        // Verify inversion correctness: padding positions should be 1, real tokens 0
+        let flat = reshaped
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1::<u32>()
+            .expect("to_vec1");
+
+        // First two sequences (all real): every position should be 0 after inversion
+        for i in 0..(2 * max_len) {
+            assert_eq!(
+                flat[i], 0u32,
+                "Real token at flat index {} should be 0 after inversion",
+                i
+            );
+        }
+
+        // Third sequence: first 20 real → 0, rest padding → 1
+        for pos in 0..max_len {
+            let idx = 2 * max_len + pos;
+            let expected = if pos < 20 { 0u32 } else { 1u32 };
+            assert_eq!(
+                flat[idx], expected,
+                "Seq 2 pos {}: expected {} after inversion",
+                pos, expected
+            );
+        }
+    }
+
+    /// Verify that the 4D mask shape is compatible with the attention score dimensions.
+    /// The mask [n, 1, 1, max_len] must broadcast against [n, heads, q_len, k_len].
+    /// We test this by expanding the mask to the full attention shape.
+    #[test]
+    fn distilbert_mask_broadcasts_to_attention_shape() {
+        let device = Device::Cpu;
+        let n = 4;
+        let max_len = 54;
+        let num_heads = 12;
+
+        let mask_values: Vec<u32> = vec![1u32; n * max_len];
+        let attention_mask = Tensor::from_vec(mask_values, (n, max_len), &device).unwrap();
+
+        let ones = Tensor::ones_like(&attention_mask).unwrap();
+        let inverted = ones.broadcast_sub(&attention_mask).unwrap();
+        let reshaped = inverted.reshape((n, 1, 1, max_len)).unwrap();
+
+        // Verify the 4D shape is correct for broadcasting to [batch, heads, q_len, k_len]
+        assert_eq!(reshaped.shape().dims(), &[n, 1, 1, max_len]);
+        assert_eq!(reshaped.dtype(), DType::U32);
+
+        // Expand the mask to the full attention shape to confirm broadcast compatibility.
+        // This is what candle's DistilBertModel attention layer needs to do internally.
+        let attention_shape = (n, num_heads, max_len, max_len);
+        let expanded = reshaped
+            .expand(attention_shape)
+            .expect("4D mask must be expandable to [n, heads, q_len, k_len]");
+        assert_eq!(expanded.shape().dims(), &[n, num_heads, max_len, max_len]);
+    }
 }
