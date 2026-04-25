@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-25
 **Authors:** Cursor agent session
-**Status:** Final
+**Status:** Final — codebase follow-up completed 2026-04-25 (see Verification)
 **Duration:** ~4 hours of active diagnosis and remediation
 **Severity:** Operational — primary agent repeatedly lost tool access and exhibited inconsistent behavior
 
@@ -12,7 +12,7 @@
 
 The newly created OpenFangOps agent experienced repeated cycles of losing MCP tool access, running with incorrect capabilities, and exhibiting bootstrap confusion despite workspace files being correctly populated. The root causes were: (1) the SurrealDB agent record injecting stale manifest values that overrode correct agent.toml template settings, (2) the OpenFang daemon systemd service lacking PATH entries for mise-managed tools, and (3) an architectural ambiguity in the memory layer where no single tier is designated authoritative for agent state.
 
-The instability was resolved through a clean agent spawn (bypassing the stale DB record), switching emcp-global to HTTP transport (eliminating the fragile SSE subprocess), and adding PATH configuration to the systemd service. However, the underlying architectural issue remains unfixed in the codebase.
+The instability was first mitigated with a clean spawn, HTTP `emcp-global`, and systemd `PATH`. The **architectural** issue (stale DB manifest vs `agent.toml`) is now addressed in **openfang** `kernel.rs`: on boot, a valid `agent.toml` **fully replaces** the embedded manifest, then normalization runs; SurrealDB is updated as a cache. Bootstrap suppression also considers a filled name line in `USER.md` (see `prompt_builder`). Async persistence `mem::drop` anti-patterns on `save_agent` / session deletes are fixed.
 
 ---
 
@@ -120,24 +120,29 @@ The core gap: there's no way to inspect what configuration a running agent is ac
 
 ## Action Items
 
-| Priority | Action | Location |
+| Priority | Action | Status |
 |---|---|---|
-| P0 | Remove manual symlinks from `~/.local/bin/` (bun, bunx, node); ensure mise shims cover them | prtr ops |
-| P0 | Move ai-filesystem into eMCP on crtr as a container (emcp-add-server pattern) | crtr ops |
-| P1 | Fix: agent boot should always read agent.toml as authoritative, not the DB record | `kernel.rs` boot sequence |
-| P1 | Define which memory tier owns which domain (user identity, persistent facts, behavior) | architecture decision |
-| P2 | Add `mcp_connected_servers` to health/detail API response | `openfang-api` |
-| P2 | Log which manifest fields were updated by the diff-check at each boot | `kernel.rs` |
-| P2 | Remove `max_results` from `[web.searxng]` in config.toml (silently ignored field) | `~/.openfang/config.toml` |
-| P3 | Bootstrap suppression should read USER.md or corefile, not only KV | `kernel.rs` prompt builder |
-| P3 | Document the manifest DB vs template authority model explicitly in AGENTS.md | `AGENTS.md` |
+| P0 | Remove manual symlinks from `~/.local/bin/` (bun, bunx, node); ensure mise shims cover them | prtr ops (open) |
+| P0 | Move ai-filesystem into eMCP on crtr as a container (emcp-add-server pattern) | crtr ops (open) |
+| P1 | Boot reads full `agent.toml` when present; DB manifest is cache | **Done** (`kernel.rs`, tests) |
+| P1 | Clarify memory tiers: manifest vs corefiles (prompt) | **Done** (AGENTS.md, canon `memory-intelligence.md`) |
+| P2 | Add `mcp_connected_servers` to health/detail API response | `openfang-api` (open) |
+| P2 | Boot observability: `source=disk` / `db_fallback` logging | **Done** |
+| P2 | Remove `max_results` from `[web.searxng]` in config.toml (silently ignored field) | `~/.openfang/config.toml` (open) |
+| P3 | Bootstrap: consider `USER.md` name line | **Done** (`prompt_builder.rs`) |
+| P3 | Document manifest authority in AGENTS.md | **Done** |
+
+## Verification (2026-04-25)
+
+- `cargo test -p openfang-kernel --test agent_manifest_authority_test` — disk manifest wins over stale DB; DB fallback when `agent.toml` missing.
+- `cargo test -p openfang-runtime --lib prompt_builder::tests::test_bootstrap_suppressed_when_user_md_has_name`
+- `cargo build -p openfang-kernel` (full workspace build recommended before deploy).
+- Runtime: edit a previously non-diffed field (e.g. `temperature` or `profile`) in `agent.toml`, restart daemon, confirm agent reflects change **without** delete/respawn.
 
 ---
 
 ## Architectural Note
 
-The most significant finding of this session is not any individual bug but a structural ambiguity: the SurrealDB agent record stores a manifest that competes with agent.toml, and the memory system has three tiers (corefile, KV, semantic memory) covering the same domain with no designated winner.
+**Update:** The kernel now treats `agent.toml` as authoritative for declarative manifest on boot (when the file exists and parses) and re-persists the normalized manifest to SurrealDB. The DB record remains valuable for **identity, sessions, and accumulated runtime state**; the embedded manifest is a **cache** aligned with disk at boot and after in-memory updates.
 
-The manifest in the DB serves no purpose that agent.toml doesn't already serve — agent.toml is on disk and survives restarts. The only things the DB genuinely needs to own are accumulated runtime state: session history, memories, and KV data. If the manifest were not stored in the DB record (or were treated as a strictly derived cache that agent.toml always overrides), the entire class of stale-DB-manifest failures disappears.
-
-This is worth an architecture decision record before the agent ecosystem grows.
+Corefiles remain prompt/reference (Layer 3), not a second manifest. KV and semantic memory still serve different stores; cross-tier consistency is an ongoing product concern but no longer conflated with `agent.toml` vs DB manifest drift.

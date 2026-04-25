@@ -524,7 +524,141 @@ fn gethostname() -> Option<String> {
     }
 }
 
+/// Options for [`OpenFangKernel::normalize_manifest_for_runtime`].
+#[derive(Clone, Copy, Debug)]
+struct ManifestNormalizeOptions {
+    /// Create workspace dirs / `generate_identity_files` and set `manifest.workspace`.
+    ensure_workspace: bool,
+    /// Stock `assistant` agent: always follow kernel `default_model` (plus hot-reload override).
+    force_kernel_default_model: bool,
+}
+
 impl OpenFangKernel {
+    /// Run an async memory/substrate operation from synchronous kernel code.
+    fn run_memory_sync<T>(
+        &self,
+        context: &'static str,
+        fut: impl std::future::Future<Output = openfang_types::error::OpenFangResult<T>>,
+    ) {
+        let res = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(fut)
+        });
+        if let Err(e) = res {
+            warn!("{context}: {e}");
+        }
+    }
+
+    /// Normalize manifest fields for runtime: exec policy, default model overlay, catalog
+    /// resolution, budgets, and workspace. Used by spawn and boot restore so both paths match.
+    fn normalize_manifest_for_runtime(
+        &self,
+        agent_folder_name: &str,
+        manifest: &mut AgentManifest,
+        opts: ManifestNormalizeOptions,
+    ) -> KernelResult<()> {
+        if manifest.name != agent_folder_name {
+            warn!(
+                manifest_name = %manifest.name,
+                folder = %agent_folder_name,
+                "Disk manifest name mismatched agent folder; coercing manifest name to folder"
+            );
+            manifest.name = agent_folder_name.to_string();
+        }
+
+        if manifest.exec_policy.is_none() {
+            manifest.exec_policy = Some(self.config.exec_policy.clone());
+        }
+        info!(
+            agent = %manifest.name,
+            exec_mode = ?manifest.exec_policy.as_ref().map(|p| &p.mode),
+            "Agent exec_policy resolved"
+        );
+
+        let override_guard = self
+            .default_model_override
+            .read()
+            .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+        let dm = override_guard
+            .as_ref()
+            .unwrap_or(&self.config.default_model);
+
+        let is_default_provider =
+            manifest.model.provider.is_empty() || manifest.model.provider == "default";
+        let is_default_model =
+            manifest.model.model.is_empty() || manifest.model.model == "default";
+
+        if opts.force_kernel_default_model {
+            if !dm.provider.is_empty() {
+                manifest.model.provider = dm.provider.clone();
+            }
+            if !dm.model.is_empty() {
+                manifest.model.model = dm.model.clone();
+            }
+            if !dm.api_key_env.is_empty() {
+                manifest.model.api_key_env = Some(dm.api_key_env.clone());
+            }
+            if dm.base_url.is_some() {
+                manifest.model.base_url.clone_from(&dm.base_url);
+            }
+        } else if is_default_provider && is_default_model {
+            if !dm.provider.is_empty() {
+                manifest.model.provider = dm.provider.clone();
+            }
+            if !dm.model.is_empty() {
+                manifest.model.model = dm.model.clone();
+            }
+            if !dm.api_key_env.is_empty() && manifest.model.api_key_env.is_none() {
+                manifest.model.api_key_env = Some(dm.api_key_env.clone());
+            }
+            if dm.base_url.is_some() && manifest.model.base_url.is_none() {
+                manifest.model.base_url.clone_from(&dm.base_url);
+            }
+        }
+
+        if let Ok(catalog) = self.model_catalog.read() {
+            if let Some(entry) = catalog.find_model(&manifest.model.model) {
+                let provider_is_default =
+                    manifest.model.provider.is_empty() || manifest.model.provider == "default";
+                if provider_is_default || manifest.model.provider == entry.provider {
+                    manifest.model.provider = entry.provider.clone();
+                    manifest.model.model = strip_provider_prefix(&entry.id, &entry.provider);
+                    if manifest.model.api_key_env.is_none() {
+                        manifest.model.api_key_env =
+                            Some(self.config.resolve_api_key_env(&entry.provider));
+                    }
+                }
+            }
+        }
+        if manifest.model.api_key_env.is_none()
+            && !manifest.model.provider.is_empty()
+            && manifest.model.provider != "default"
+        {
+            manifest.model.api_key_env =
+                Some(self.config.resolve_api_key_env(&manifest.model.provider));
+        }
+
+        let normalized = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
+        if normalized != manifest.model.model {
+            manifest.model.model = normalized;
+        }
+
+        apply_budget_defaults(&self.config.budget, &mut manifest.resources);
+
+        if opts.ensure_workspace {
+            let workspace_dir = manifest
+                .workspace
+                .clone()
+                .unwrap_or_else(|| self.config.effective_workspaces_dir().join(agent_folder_name));
+            ensure_workspace(&workspace_dir)?;
+            if manifest.generate_identity_files {
+                generate_identity_files(&workspace_dir, manifest);
+            }
+            manifest.workspace = Some(workspace_dir);
+        }
+
+        Ok(())
+    }
+
     /// Boot the kernel with configuration from the given path.
     pub async fn boot(config_path: Option<&Path>) -> KernelResult<Self> {
         let config = load_config(config_path);
@@ -622,6 +756,8 @@ impl OpenFangKernel {
             .db_path
             .clone()
             .unwrap_or_else(|| config.data_dir.join("openfang.db"));
+        // Consolidation tuning: `decay_rate` is runtime-configurable via `MemoryConfig`.
+        // `min_confidence` / `decay_age_days` are fixed invariants here (not yet exposed as config).
         let memory = Arc::new(
             MemorySubstrate::open_with_config(
                 &db_path,
@@ -707,7 +843,7 @@ impl OpenFangKernel {
                             info!(
                                 provider = %provider,
                                 model = %model,
-                                "Auto-detected provider from {} — using as default",
+                                "Auto-detected provider from {} — using as default (in-memory default_model only; not written to config.toml)",
                                 env_var
                             );
                             driver_chain.push(d);
@@ -1307,7 +1443,8 @@ impl OpenFangKernel {
                     let agent_id = entry.id;
                     let name = entry.name.clone();
 
-                    // Check if TOML on disk is newer/different — if so, update from file
+                    // `agent.toml` is authoritative for declarative manifest fields; SurrealDB
+                    // holds a cache that we refresh on boot so runtime matches disk templates.
                     let mut entry = entry;
                     let toml_path = kernel
                         .config
@@ -1315,6 +1452,8 @@ impl OpenFangKernel {
                         .join("agents")
                         .join(&name)
                         .join("agent.toml");
+
+                    let mut manifest_source = "db_fallback";
                     if toml_path.exists() {
                         match std::fs::read_to_string(&toml_path) {
                             Ok(toml_str) => {
@@ -1322,45 +1461,21 @@ impl OpenFangKernel {
                                     &toml_str,
                                 ) {
                                     Ok(disk_manifest) => {
-                                        // Compare key fields to detect changes
-                                        let changed = disk_manifest.name != entry.manifest.name
-                                            || disk_manifest.description
-                                                != entry.manifest.description
-                                            || disk_manifest.model.system_prompt
-                                                != entry.manifest.model.system_prompt
-                                            || disk_manifest.model.provider
-                                                != entry.manifest.model.provider
-                                            || disk_manifest.model.model
-                                                != entry.manifest.model.model
-                                            || disk_manifest.capabilities.tools
-                                                != entry.manifest.capabilities.tools
-                                            || disk_manifest.tool_allowlist
-                                                != entry.manifest.tool_allowlist
-                                            || disk_manifest.tool_blocklist
-                                                != entry.manifest.tool_blocklist
-                                            || disk_manifest.skills != entry.manifest.skills
-                                            || disk_manifest.mcp_servers
-                                                != entry.manifest.mcp_servers;
-                                        if changed {
-                                            info!(
-                                                agent = %name,
-                                                "Agent TOML on disk differs from DB, updating"
-                                            );
-                                            entry.manifest = disk_manifest;
-                                            // Persist the update back to DB
-                                            if let Err(e) = kernel.memory.save_agent(&entry).await {
-                                                warn!(
-                                                    agent = %name,
-                                                    "Failed to persist TOML update: {e}"
-                                                );
-                                            }
-                                        }
+                                        info!(
+                                            agent = %name,
+                                            path = %toml_path.display(),
+                                            source = "disk",
+                                            "Restored declarative manifest from agent.toml (replaces DB cache)"
+                                        );
+                                        entry.manifest = disk_manifest;
+                                        manifest_source = "disk";
                                     }
                                     Err(e) => {
                                         warn!(
                                             agent = %name,
                                             path = %toml_path.display(),
-                                            "Invalid agent TOML on disk, using DB version: {e}"
+                                            source = "db_fallback",
+                                            "Invalid agent TOML on disk; using persisted DB manifest: {e}"
                                         );
                                     }
                                 }
@@ -1368,10 +1483,41 @@ impl OpenFangKernel {
                             Err(e) => {
                                 warn!(
                                     agent = %name,
+                                    source = "db_fallback",
                                     "Failed to read agent TOML: {e}"
                                 );
                             }
                         }
+                    } else {
+                        info!(
+                            agent = %name,
+                            path = %toml_path.display(),
+                            source = "db_fallback",
+                            "No agent.toml template; using manifest from SurrealDB"
+                        );
+                    }
+
+                    let force_default_assistant = entry.name == "assistant"
+                        && entry.manifest.description == "General-purpose assistant";
+
+                    if let Err(e) = kernel.normalize_manifest_for_runtime(
+                        &name,
+                        &mut entry.manifest,
+                        ManifestNormalizeOptions {
+                            ensure_workspace: true,
+                            force_kernel_default_model: force_default_assistant,
+                        },
+                    ) {
+                        warn!(agent = %name, "Failed to normalize restored agent manifest: {e}");
+                        continue;
+                    }
+
+                    if let Err(e) = kernel.memory.save_agent(&entry).await {
+                        warn!(
+                            agent = %name,
+                            manifest_source,
+                            "Failed to persist normalized manifest to database: {e}"
+                        );
                     }
 
                     // Re-grant capabilities
@@ -1391,53 +1537,6 @@ impl OpenFangKernel {
                     restored_entry.state = AgentState::Running;
                     restored_entry.last_active = chrono::Utc::now();
 
-                    // Inherit kernel exec_policy for agents that lack one
-                    if restored_entry.manifest.exec_policy.is_none() {
-                        restored_entry.manifest.exec_policy =
-                            Some(kernel.config.exec_policy.clone());
-                    }
-
-                    // Apply global budget defaults to restored agents
-                    apply_budget_defaults(
-                        &kernel.config.budget,
-                        &mut restored_entry.manifest.resources,
-                    );
-
-                    // Apply default_model to restored agents.
-                    //
-                    // Two cases:
-                    // 1. Agent has empty/default provider → always apply default_model
-                    // 2. Agent named "assistant" (auto-spawned) → update to match
-                    //    default_model so config.toml changes take effect on restart
-                    {
-                        let dm = &kernel.config.default_model;
-                        let is_default_provider = restored_entry.manifest.model.provider.is_empty()
-                            || restored_entry.manifest.model.provider == "default";
-                        let is_default_model = restored_entry.manifest.model.model.is_empty()
-                            || restored_entry.manifest.model.model == "default";
-                        let is_auto_spawned = restored_entry.name == "assistant"
-                            && restored_entry.manifest.description == "General-purpose assistant";
-                        if is_default_provider && is_default_model || is_auto_spawned {
-                            if !dm.provider.is_empty() {
-                                restored_entry.manifest.model.provider = dm.provider.clone();
-                            }
-                            if !dm.model.is_empty() {
-                                restored_entry.manifest.model.model = dm.model.clone();
-                            }
-                            if !dm.api_key_env.is_empty() {
-                                restored_entry.manifest.model.api_key_env =
-                                    Some(dm.api_key_env.clone());
-                            }
-                            if dm.base_url.is_some() {
-                                restored_entry
-                                    .manifest
-                                    .model
-                                    .base_url
-                                    .clone_from(&dm.base_url);
-                            }
-                        }
-                    }
-
                     if let Err(e) = kernel.registry.register(restored_entry) {
                         tracing::warn!(agent = %name, "Failed to restore agent: {e}");
                     } else {
@@ -1453,8 +1552,10 @@ impl OpenFangKernel {
             }
         }
 
-        // If no agents exist (fresh install), spawn a default assistant
-        if kernel.registry.list().is_empty() {
+        // If no agents exist (fresh install), optionally spawn the stock assistant
+        if kernel.registry.list().is_empty()
+            && kernel.config.spawn_default_assistant_on_empty_registry
+        {
             info!("No agents found — spawning default assistant");
             let dm = &kernel.config.default_model;
             let manifest = AgentManifest {
@@ -1478,6 +1579,10 @@ impl OpenFangKernel {
                 Ok(id) => info!(id = %id, "Default assistant spawned"),
                 Err(e) => warn!("Failed to spawn default assistant: {e}"),
             }
+        } else if kernel.registry.list().is_empty() {
+            info!(
+                "No agents found and spawn_default_assistant_on_empty_registry = false; booting with an empty agent registry"
+            );
         }
 
         // Validate routing configs against model catalog
@@ -1529,90 +1634,16 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
         let session_id = session.id;
 
-        // Inherit kernel exec_policy as fallback if agent manifest doesn't have one
         let mut manifest = manifest;
-        if manifest.exec_policy.is_none() {
-            manifest.exec_policy = Some(self.config.exec_policy.clone());
-        }
-        info!(agent = %name, id = %agent_id, exec_mode = ?manifest.exec_policy.as_ref().map(|p| &p.mode), "Agent exec_policy resolved");
-
-        // Overlay kernel default_model onto agent if agent didn't explicitly choose.
-        // Treat empty or "default" as "use the kernel's configured default_model".
-        // This allows bundled agents to defer to the user's configured provider/model,
-        // even if the agent manifest specifies an api_key_env (which is just a hint
-        // about which env var to check, not a hard lock on provider/model).
-        {
-            let is_default_provider =
-                manifest.model.provider.is_empty() || manifest.model.provider == "default";
-            let is_default_model =
-                manifest.model.model.is_empty() || manifest.model.model == "default";
-            if is_default_provider && is_default_model {
-                // Check hot-reloaded override first, fall back to boot-time config
-                let override_guard = self
-                    .default_model_override
-                    .read()
-                    .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
-                let dm = override_guard
-                    .as_ref()
-                    .unwrap_or(&self.config.default_model);
-                if !dm.provider.is_empty() {
-                    manifest.model.provider = dm.provider.clone();
-                }
-                if !dm.model.is_empty() {
-                    manifest.model.model = dm.model.clone();
-                }
-                if !dm.api_key_env.is_empty() && manifest.model.api_key_env.is_none() {
-                    manifest.model.api_key_env = Some(dm.api_key_env.clone());
-                }
-                if dm.base_url.is_some() && manifest.model.base_url.is_none() {
-                    manifest.model.base_url.clone_from(&dm.base_url);
-                }
-            }
-        }
-
-        // Normalize catalog-backed model labels/aliases into canonical IDs and
-        // fill provider/auth hints when the manifest did not fully specify them.
-        if let Ok(catalog) = self.model_catalog.read() {
-            if let Some(entry) = catalog.find_model(&manifest.model.model) {
-                let provider_is_default =
-                    manifest.model.provider.is_empty() || manifest.model.provider == "default";
-                if provider_is_default || manifest.model.provider == entry.provider {
-                    manifest.model.provider = entry.provider.clone();
-                    manifest.model.model = strip_provider_prefix(&entry.id, &entry.provider);
-                    if manifest.model.api_key_env.is_none() {
-                        manifest.model.api_key_env =
-                            Some(self.config.resolve_api_key_env(&entry.provider));
-                    }
-                }
-            }
-        }
-        if manifest.model.api_key_env.is_none()
-            && !manifest.model.provider.is_empty()
-            && manifest.model.provider != "default"
-        {
-            manifest.model.api_key_env =
-                Some(self.config.resolve_api_key_env(&manifest.model.provider));
-        }
-
-        // Normalize: strip provider prefix from model name if present
-        let normalized = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
-        if normalized != manifest.model.model {
-            manifest.model.model = normalized;
-        }
-
-        // Apply global budget defaults to agent resource quotas
-        apply_budget_defaults(&self.config.budget, &mut manifest.resources);
-
-        // Create workspace directory for the agent (name-based, so SOUL.md survives recreation)
-        let workspace_dir = manifest
-            .workspace
-            .clone()
-            .unwrap_or_else(|| self.config.effective_workspaces_dir().join(&name));
-        ensure_workspace(&workspace_dir)?;
-        if manifest.generate_identity_files {
-            generate_identity_files(&workspace_dir, &manifest);
-        }
-        manifest.workspace = Some(workspace_dir);
+        self.normalize_manifest_for_runtime(
+            &name,
+            &mut manifest,
+            ManifestNormalizeOptions {
+                ensure_workspace: true,
+                force_kernel_default_model: false,
+            },
+        )?;
+        info!(agent = %name, id = %agent_id, "Spawning agent (manifest normalized)");
 
         // Register capabilities
         let caps = manifest_to_capabilities(&manifest);
@@ -3376,12 +3407,16 @@ impl OpenFangKernel {
         // Auto-save session context to workspace memory before clearing
         if let Ok(Some(old_session)) = self.memory.get_session(entry.session_id).await {
             if old_session.messages.len() >= 2 {
-                self.save_session_summary(agent_id, &entry, &old_session);
+                self.save_session_summary(agent_id, &entry, &old_session)
+                    .await;
             }
         }
 
         // Delete the old session
-        std::mem::drop(self.memory.delete_session(entry.session_id));
+        self.memory
+            .delete_session(entry.session_id)
+            .await
+            .map_err(KernelError::OpenFang)?;
 
         // Create a fresh session
         let new_session = self
@@ -3411,10 +3446,16 @@ impl OpenFangKernel {
         })?;
 
         // Delete all regular sessions
-        std::mem::drop(self.memory.delete_agent_sessions(agent_id));
+        self.memory
+            .delete_agent_sessions(agent_id)
+            .await
+            .map_err(KernelError::OpenFang)?;
 
         // Delete canonical (cross-channel) session
-        std::mem::drop(self.memory.delete_canonical_session(agent_id));
+        self.memory
+            .delete_canonical_session(agent_id)
+            .await
+            .map_err(KernelError::OpenFang)?;
 
         // Create a fresh session
         let new_session = self
@@ -3529,7 +3570,7 @@ impl OpenFangKernel {
     }
 
     /// Save a summary of the current session to agent memory before reset.
-    fn save_session_summary(
+    async fn save_session_summary(
         &self,
         agent_id: AgentId,
         entry: &AgentEntry,
@@ -3583,11 +3624,17 @@ impl OpenFangKernel {
 
         // Save to structured memory store (key = "session_{date}_{slug}")
         let key = format!("session_{date}_{slug}");
-        std::mem::drop(self.memory.structured_set(
-            agent_id,
-            &key,
-            serde_json::Value::String(summary.clone()),
-        ));
+        if let Err(e) = self
+            .memory
+            .structured_set(
+                agent_id,
+                &key,
+                serde_json::Value::String(summary.clone()),
+            )
+            .await
+        {
+            warn!(agent_id = %agent_id, key = %key, "Failed to save session summary to structured memory: {e}");
+        }
 
         // Also write to workspace memory/ dir if workspace exists
         if let Some(ref workspace) = entry.manifest.workspace {
@@ -3605,11 +3652,13 @@ impl OpenFangKernel {
 
     /// Persist an agent's manifest to its `agent.toml` on disk so that
     /// dashboard-driven config changes (model, provider, fallback, etc.)
-    /// survive a restart.  The on-disk file lives at
+    /// are easy to edit and version. The on-disk file lives at
     /// `<home_dir>/agents/<name>/agent.toml`.
     ///
     /// This is best-effort: a failure to write is logged but does not
-    /// propagate as an error — the authoritative copy lives in SurrealDB.
+    /// propagate as an error. Declarative manifest fields are **authoritative on
+    /// disk**; SurrealDB stores the effective runtime copy (cache) updated on
+    /// spawn, boot, and in-memory updates.
     pub fn persist_manifest_to_disk(&self, agent_id: AgentId) {
         if let Some(entry) = self.registry.get(agent_id) {
             let dir = self.config.home_dir.join("agents").join(&entry.name);
@@ -3716,14 +3765,17 @@ impl OpenFangKernel {
 
         // Persist the updated entry
         if let Some(entry) = self.registry.get(agent_id) {
-            std::mem::drop(self.memory.save_agent(&entry));
+            self.run_memory_sync("save_agent after set_agent_model", self.memory.save_agent(&entry));
         }
 
         // Write updated manifest to agent.toml so changes survive restart (#996, #1018)
         self.persist_manifest_to_disk(agent_id);
 
         // Clear canonical session to prevent memory poisoning from old model's responses
-        std::mem::drop(self.memory.delete_canonical_session(agent_id));
+        self.run_memory_sync(
+            "delete_canonical_session after set_agent_model",
+            self.memory.delete_canonical_session(agent_id),
+        );
         debug!(agent_id = %agent_id, "Cleared canonical session after model switch");
 
         Ok(())
@@ -3752,7 +3804,7 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
 
         if let Some(entry) = self.registry.get(agent_id) {
-            std::mem::drop(self.memory.save_agent(&entry));
+            self.run_memory_sync("save_agent after set_agent_skills", self.memory.save_agent(&entry));
         }
 
         info!(agent_id = %agent_id, skills = ?skills, "Agent skills updated");
@@ -3791,7 +3843,10 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
 
         if let Some(entry) = self.registry.get(agent_id) {
-            std::mem::drop(self.memory.save_agent(&entry));
+            self.run_memory_sync(
+                "save_agent after set_agent_mcp_servers",
+                self.memory.save_agent(&entry),
+            );
         }
 
         info!(agent_id = %agent_id, servers = ?servers, "Agent MCP servers updated");
@@ -3810,7 +3865,10 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
 
         if let Some(entry) = self.registry.get(agent_id) {
-            std::mem::drop(self.memory.save_agent(&entry));
+            self.run_memory_sync(
+                "save_agent after set_agent_tool_filters",
+                self.memory.save_agent(&entry),
+            );
         }
 
         info!(
@@ -5511,7 +5569,7 @@ impl OpenFangKernel {
             let _ = self.registry.set_state(entry.id, AgentState::Suspended);
             // Re-save with Suspended state for clean resume on next boot
             if let Some(updated) = self.registry.get(entry.id) {
-                std::mem::drop(self.memory.save_agent(&updated));
+                self.run_memory_sync("save_agent on shutdown", self.memory.save_agent(&updated));
             }
         }
 
@@ -6946,11 +7004,13 @@ async fn cron_deliver_response(
             tracing::debug!(channel = %channel, to = %to, "Cron: delivering to channel");
             // Persist as last channel for this agent (survives restarts)
             let kv_val = serde_json::json!({"channel": channel, "recipient": to});
-            std::mem::drop(
-                kernel
-                    .memory
-                    .structured_set(agent_id, "delivery.last_channel", kv_val),
-            );
+            if let Err(e) = kernel
+                .memory
+                .structured_set(agent_id, "delivery.last_channel", kv_val)
+                .await
+            {
+                tracing::warn!(agent_id = %agent_id, error = %e, "Cron: failed to persist last channel");
+            }
             // Deliver via the registered channel adapter
             kernel
                 .send_channel_message(channel, to, response, None)

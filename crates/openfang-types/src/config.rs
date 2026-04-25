@@ -1224,6 +1224,10 @@ pub struct KernelConfig {
     /// Heartbeat monitor settings.
     #[serde(default)]
     pub heartbeat: HeartbeatSettings,
+    /// When the agent registry is empty on boot, spawn the stock `assistant` agent.
+    /// Set to `false` for headless deployments that only load explicit templates.
+    #[serde(default = "default_true")]
+    pub spawn_default_assistant_on_empty_registry: bool,
     /// Per-skill runtime config (from `[skills.<skill-name>]` sections).
     ///
     /// When a skill declares a `config:` section in its SKILL.md frontmatter,
@@ -1478,6 +1482,7 @@ impl Default for KernelConfig {
             auth: AuthConfig::default(),
             workflows_dir: None,
             heartbeat: HeartbeatSettings::default(),
+            spawn_default_assistant_on_empty_registry: true,
             skills: HashMap::new(),
         }
     }
@@ -1598,6 +1603,10 @@ impl std::fmt::Debug for KernelConfig {
             )
             .field("auth", &format!("enabled={}", self.auth.enabled))
             .field("skills", &format!("{} skill config(s)", self.skills.len()))
+            .field(
+                "spawn_default_assistant_on_empty_registry",
+                &self.spawn_default_assistant_on_empty_registry,
+            )
             .finish()
     }
 }

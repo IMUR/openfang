@@ -6,6 +6,44 @@
 
 use crate::str_utils::safe_truncate_str;
 
+/// True when the user is already known well enough to skip the first-run bootstrap block.
+fn bootstrap_user_profile_established(ctx: &PromptContext) -> bool {
+    if ctx.user_name.is_some() {
+        return true;
+    }
+    if ctx
+        .recalled_memories
+        .iter()
+        .any(|(k, _)| k == "user_name")
+    {
+        return true;
+    }
+    if let Some(ref md) = ctx.user_md {
+        if user_md_has_filled_name_line(md) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Heuristic: `USER.md` template uses `- Name:` lines; a non-empty value means the human
+/// (or agent) already recorded a name.
+fn user_md_has_filled_name_line(md: &str) -> bool {
+    for line in md.lines() {
+        let t = line.trim();
+        if let Some(rest) = t
+            .strip_prefix("- Name:")
+            .or_else(|| t.strip_prefix("Name:"))
+        {
+            let v = rest.trim();
+            if !v.is_empty() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// All the context needed to build a system prompt for an agent.
 #[derive(Debug, Clone, Default)]
 pub struct PromptContext {
@@ -188,9 +226,9 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     if !ctx.is_subagent {
         if let Some(ref bootstrap) = ctx.bootstrap_md {
             if !bootstrap.trim().is_empty() {
-                // Only inject if no user_name memory exists (first-run heuristic)
-                let has_user_name = ctx.recalled_memories.iter().any(|(k, _)| k == "user_name");
-                if !has_user_name && ctx.user_name.is_none() {
+                // First-run: skip if shared KV, recalled memory, or USER.md already
+                // identifies the user (USER.md is human-curated prompt context, not a control plane).
+                if !bootstrap_user_profile_established(ctx) {
                     sections.push(format!(
                         "## First-Run Protocol\n{}",
                         cap_str(bootstrap, 1500)
@@ -907,6 +945,16 @@ mod tests {
         let ctx = basic_ctx();
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("don't know the user's name"));
+    }
+
+    #[test]
+    fn test_bootstrap_suppressed_when_user_md_has_name() {
+        let mut ctx = basic_ctx();
+        ctx.bootstrap_md = Some("FIRST_RUN_BOOTSTRAP_XYZUNIQUE".to_string());
+        ctx.user_md = Some("# User\n- Name: Jordan\n- Timezone:\n".to_string());
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("First-Run Protocol"));
+        assert!(!prompt.contains("FIRST_RUN_BOOTSTRAP_XYZUNIQUE"));
     }
 
     #[test]

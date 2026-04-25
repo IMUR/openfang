@@ -6,16 +6,18 @@ An asynchronous agent runtime, CLI, and daemon for persistent, multi-agent AI in
 
 ## Read First
 
-| File | What It Tells You |
-|------|-------------------|
-| `docs/architecture.md` | General system architecture and crate topology |
-| `crates/openfang-cli/README.md` | CLI commands and MCP bindings |
-| `crates/openfang-api/README.md` | Axum HTTP daemon routing and web streaming |
-| `crates/openfang-types/src/config.rs` | `KernelConfig` doc comments — every config field explained |
-| `crates/openfang-runtime/src/drivers/mod.rs` | `provider_defaults()` — provider wiring and resolution |
-| `crates/openfang-runtime/src/model_catalog.rs` | ~198 built-in model definitions |
-| `crates/openfang-memory/src/db.rs` | SurrealDB DDL and substrate setup |
-| `references/schema-ddl.md` | Full SurrealDB schema with field-level docs |
+
+| File                                           | What It Tells You                                          |
+| ---------------------------------------------- | ---------------------------------------------------------- |
+| `docs/architecture.md`                         | General system architecture and crate topology             |
+| `crates/openfang-cli/README.md`                | CLI commands and MCP bindings                              |
+| `crates/openfang-api/README.md`                | Axum HTTP daemon routing and web streaming                 |
+| `crates/openfang-types/src/config.rs`          | `KernelConfig` doc comments — every config field explained |
+| `crates/openfang-runtime/src/drivers/mod.rs`   | `provider_defaults()` — provider wiring and resolution     |
+| `crates/openfang-runtime/src/model_catalog.rs` | ~198 built-in model definitions                            |
+| `crates/openfang-memory/src/db.rs`             | SurrealDB DDL and substrate setup                          |
+| `references/schema-ddl.md`                     | Full SurrealDB schema with field-level docs                |
+
 
 ## Core Concepts
 
@@ -49,29 +51,39 @@ The core is **Rust-first**. These rules apply to one-off scripts (linters, teste
 3. **Markdown:** Project rules live in `.markdownlint-cli2.jsonc` at the repo root.
 4. **Tool the Tooling:** When building capabilities or bindings, adhere aggressively to the MCP specification.
 5. **Config Semantics:** `KernelConfig` uses flat maps (`provider_urls`, `provider_api_keys`), not nested provider tables. Nested `[providers.X]` blocks are silently ignored.
-6. **Known Bug — kill_agent DB deletion:** `kernel.rs:kill_agent` calls `std::mem::drop(self.memory.remove_agent(agent_id))` which drops the async future without awaiting it. The SurrealDB DELETE never runs. Agents killed via `DELETE /api/agents/{id}` return on daemon restart. Fix: use `block_in_place` as in `spawn_agent`. *(Fixed 2026-04-25 — verify across restart.)*
-7. **Use absolute paths in `config.toml`.** Rust does not expand `~`. The systemd unit sets `WorkingDirectory=%h/.openfang`, so a literal `~` creates a nested `~` directory inside `.openfang`.
-8. **`workspace/.cargo/config.toml`** sets `git-fetch-with-cli = true` so `[patch]` git dependencies fetch via system `git` and SSH agent. Required for Forgejo-hosted patches.
-9. **Standard build for this deployment** (Candle memory pipeline active):
-   ```bash
+6. **Agent manifest authority:** `~/.openfang/agents/<name>/agent.toml` is the **source of truth** for declarative manifest fields (model, tools, skills, MCP allowlists, temperature, profile, etc.). On boot, the kernel replaces the embedded manifest from disk when the template exists and persists the **normalized** result to SurrealDB as a cache. Workspace corefiles (`SOUL.md`, `AGENTS.md`, `VOICE.md`, `context.md`, …) are **prompt context**, not a parallel control plane. See `crates/openfang-kernel/src/kernel.rs` (`normalize_manifest_for_runtime`, boot restore).
+7. **Async memory I/O:** Never `std::mem::drop` an `async` `save_agent` / `delete_session` / `structured_set` future — always `.await` or use the kernel’s `run_memory_sync` bridge from synchronous code. *(Regression coverage: `agent_manifest_authority_test` + prompt bootstrap tests.)*
+8. **Use absolute paths in `config.toml`.** Rust does not expand `~`. The systemd unit sets `WorkingDirectory=%h/.openfang`, so a literal `~` creates a nested `~` directory inside `.openfang`.
+9. `**workspace/.cargo/config.toml`** sets `git-fetch-with-cli = true` so `[patch]` git dependencies fetch via system `git` and SSH agent. Required for Forgejo-hosted patches.
+10. **Standard build for this deployment** (Candle memory pipeline active):
+  ```bash
    cargo build --release --features memory-candle -p openfang-cli
-   ```
+  ```
+
+### Configuration authority (operators)
+
+- `**spawn_default_assistant_on_empty_registry**` (default `true`, `KernelConfig`) — disable to boot with an empty registry (no auto `assistant`).
+- **LLM auto-detect** on primary driver failure rewrites in-memory `default_model` only; it does not edit `config.toml` on disk (see boot log message).
+- **Memory consolidation constants** in `boot_with_config`: `min_confidence` / `decay_age_days` are fixed passed-through values to `MemorySubstrate::open_with_config` until exposed on `MemoryConfig`.
+- **Workspace `CONTEXT_FILES`** (`workspace_context.rs`) — list of files scanned for the auto workspace summary; `VOICE.md` and `context.md` are included alongside prompt_builder paths.
 
 ## Key Crate Map
 
-| Crate | Responsibility |
-|-------|---------------|
-| `openfang-types` | Config structs, shared types |
-| `openfang-runtime` | LLM drivers, model catalog, provider resolution, TTS/STT engines, agent loop |
-| `openfang-memory` | SurrealDB substrate, schema, persistence |
-| `openfang-kernel` | Agent lifecycle coordinator, scheduler, approval gates |
-| `openfang-api` | Axum REST + WebSocket daemon, embedded dashboard |
-| `openfang-cli` | CLI commands, TUI, MCP stdio server |
-| `openfang-channels` | 40 messaging channel adapters (Telegram, Discord, Slack, etc.) |
-| `openfang-wire` | OFP peer-to-peer agent networking (HMAC-SHA256 auth) |
-| `openfang-skills` | 60 bundled skills, FangHub marketplace client |
-| `openfang-desktop` | Tauri 2.0 desktop app shell |
-| `openfang-migrate` | OpenClaw YAML→TOML config migration |
+
+| Crate               | Responsibility                                                               |
+| ------------------- | ---------------------------------------------------------------------------- |
+| `openfang-types`    | Config structs, shared types                                                 |
+| `openfang-runtime`  | LLM drivers, model catalog, provider resolution, TTS/STT engines, agent loop |
+| `openfang-memory`   | SurrealDB substrate, schema, persistence                                     |
+| `openfang-kernel`   | Agent lifecycle coordinator, scheduler, approval gates                       |
+| `openfang-api`      | Axum REST + WebSocket daemon, embedded dashboard                             |
+| `openfang-cli`      | CLI commands, TUI, MCP stdio server                                          |
+| `openfang-channels` | 40 messaging channel adapters (Telegram, Discord, Slack, etc.)               |
+| `openfang-wire`     | OFP peer-to-peer agent networking (HMAC-SHA256 auth)                         |
+| `openfang-skills`   | 60 bundled skills, FangHub marketplace client                                |
+| `openfang-desktop`  | Tauri 2.0 desktop app shell                                                  |
+| `openfang-migrate`  | OpenClaw YAML→TOML config migration                                          |
+
 
 ## Streaming Path
 
@@ -80,12 +92,12 @@ The primary real-time interaction path through the system. Any work on the API, 
 1. Client sends a message (WS text frame, REST POST, or channel adapter)
 2. `kernel.send_message_streaming()` (`kernel.rs`) acquires a per-agent lock, loads the `Session` from SurrealDB, and spawns the agent loop
 3. The agent loop emits `StreamEvent` variants (`llm_driver.rs:111`) through an `mpsc` channel:
-   - `TextDelta` — incremental response text
-   - `ThinkingDelta` — reasoning (stripped by `strip_think_tags()` before display)
-   - `ToolUseStart` / `ToolInputDelta` / `ToolUseEnd` — tool call lifecycle
-   - `ToolExecutionResult` — tool output (emitted by agent loop, not LLM driver)
-   - `PhaseChange` — lifecycle indicator (thinking, tool_use, streaming)
-   - `ContentComplete` — end of response with `StopReason` and `TokenUsage`
+  - `TextDelta` — incremental response text
+  - `ThinkingDelta` — reasoning (stripped by `strip_think_tags()` before display)
+  - `ToolUseStart` / `ToolInputDelta` / `ToolUseEnd` — tool call lifecycle
+  - `ToolExecutionResult` — tool output (emitted by agent loop, not LLM driver)
+  - `PhaseChange` — lifecycle indicator (thinking, tool_use, streaming)
+  - `ContentComplete` — end of response with `StopReason` and `TokenUsage`
 4. The consumer (`ws.rs`, TUI, or channel bridge) reads events from the channel and forwards them to the client, applying debouncing and filtering as appropriate
 5. After the stream closes, the kernel writes the session back to SurrealDB (canonical session update, compaction, JSONL mirror) in a background task
 
@@ -139,3 +151,4 @@ Skills are loaded from the host's default skills directory. Use this section to 
 - `architecture` / `software-architecture` — Trade-offs and crate boundary decisions.
 - `writing-plans` / `plan-writing` — Multi-step work with clear checkpoints.
 - `mermaid-expert` — Diagrams for architecture, flows, and substrate topology.
+

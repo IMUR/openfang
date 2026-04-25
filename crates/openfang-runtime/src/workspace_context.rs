@@ -17,9 +17,11 @@ const MAX_FILE_SIZE: u64 = 32_768;
 const CONTEXT_FILES: &[&str] = &[
     "AGENTS.md",
     "SOUL.md",
+    "VOICE.md",
     "TOOLS.md",
     "IDENTITY.md",
     "HEARTBEAT.md",
+    "context.md",
 ];
 
 /// Detected project type based on marker files.
