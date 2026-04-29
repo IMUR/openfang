@@ -1,8 +1,9 @@
 ---
-date: 2026-04-26
+
+## date: 2026-04-26
+
 type: architecture
 topics: [openfang, memory-intelligence, surrealdb, architecture]
----
 
 # Memory Architecture: From Accident to Intent
 
@@ -40,23 +41,27 @@ OpenFang's memory infrastructure has three orthogonal dimensions.
 
 Five data models share one unified database at `~/.openfang/data/openfang.db/`:
 
-| Data Model    | What It Stores                | Primary Access      |
-|---------------|-------------------------------|---------------------|
-| Document      | Memory records with metadata  | Automatic recall    |
-| Key-value     | Exact-key facts               | Explicit tools      |
-| Graph         | Entities and relationships    | Recall scoring      |
-| Vector        | Mathematical embeddings       | Automatic recall    |
-| Full-text     | Word-indexed content          | Automatic recall    |
+
+| Data Model | What It Stores               | Primary Access   |
+| ---------- | ---------------------------- | ---------------- |
+| Document   | Memory records with metadata | Automatic recall |
+| Key-value  | Exact-key facts              | Explicit tools   |
+| Graph      | Entities and relationships   | Recall scoring   |
+| Vector     | Mathematical embeddings      | Automatic recall |
+| Full-text  | Word-indexed content         | Automatic recall |
+
 
 ### Dimension 2 — Static Substrate (Workspace Files)
 
 Workspace files break into three roles by ingestion path:
 
-| Role          | Files                                                              | Loaded Into                       | Cadence                             |
-|---------------|--------------------------------------------------------------------|-----------------------------------|-------------------------------------|
-| Persona       | `SOUL.md`, `IDENTITY.md`, `USER.md`, `MEMORY.md`, `BOOTSTRAP.md`   | `PromptContext` persona section   | Session start                       |
-| Context       | `AGENTS.md`, `VOICE.md`, `TOOLS.md`, `HEARTBEAT.md`, `context.md`  | Workspace context summary         | Session start; `context.md` per-turn |
-| Configuration | `agent.toml`, `config.toml`                                        | Kernel + agent runtime            | Boot                                 |
+
+| Role          | Files                                                             | Loaded Into                     | Cadence                              |
+| ------------- | ----------------------------------------------------------------- | ------------------------------- | ------------------------------------ |
+| Persona       | `SOUL.md`, `IDENTITY.md`, `USER.md`, `MEMORY.md`, `BOOTSTRAP.md`  | `PromptContext` persona section | Session start                        |
+| Context       | `AGENTS.md`, `VOICE.md`, `TOOLS.md`, `HEARTBEAT.md`, `context.md` | Workspace context summary       | Session start; `context.md` per-turn |
+| Configuration | `agent.toml`, `config.toml`                                       | Kernel + agent runtime          | Boot                                 |
+
 
 Each prompt section has an explicit byte cap (500–8000 bytes). The **file-read cap** (32 KB, in `workspace_context.rs`) and the **prompt-injection cap** (typically 8 KB, in `prompt_builder.rs`) are distinct: a file larger than the read cap is skipped; a file larger than the injection cap is truncated.
 
@@ -64,12 +69,14 @@ Each prompt section has an explicit byte cap (500–8000 bytes). The **file-read
 
 Four BERT-family models transform memory inline:
 
-| Model      | Writes To                                  | Read During              |
-|------------|--------------------------------------------|--------------------------|
-| Embedding  | Vector index                               | Automatic recall         |
-| NER        | Graph (entities + relations)               | Graph-boosted scoring    |
-| Classifier | Document metadata (`scope`, `category`)    | Scope-weighted ordering  |
-| Reranker   | (read-only)                                | Recall re-ranking        |
+
+| Model      | Writes To                               | Read During             |
+| ---------- | --------------------------------------- | ----------------------- |
+| Embedding  | Vector index                            | Automatic recall        |
+| NER        | Graph (entities + relations)            | Graph-boosted scoring   |
+| Classifier | Document metadata (`scope`, `category`) | Scope-weighted ordering |
+| Reranker   | (read-only)                             | Recall re-ranking       |
+
 
 The KV store has no intelligence model on top of it; agents write to it directly. The full-text index uses a snowball English tokenizer, not a Candle model. Every other dynamic data model is fed by exactly one intelligence model.
 
@@ -87,15 +94,17 @@ Drop "Layer 1, 2, 3." The system actually has three orthogonal axes, and any pie
 
 The whole memory system fits on a grid:
 
-| Subsystem                   | Substrate | Access        | Intelligence Backend                     |
-|-----------------------------|-----------|---------------|------------------------------------------|
-| Semantic store (`memories`) | Dynamic   | Automatic     | Embedding + Classifier + Reranker        |
-| Knowledge graph             | Dynamic   | Automatic     | NER                                      |
-| KV store                    | Dynamic   | Explicit      | None                                     |
-| Full-text index             | Dynamic   | Automatic     | None (tokenizer only)                    |
-| Persona files               | Static    | Automatic     | None                                     |
-| Context files               | Static    | Automatic     | None                                     |
-| Configuration files         | Static    | Authoritative | None                                     |
+
+| Subsystem                   | Substrate | Access        | Intelligence Backend              |
+| --------------------------- | --------- | ------------- | --------------------------------- |
+| Semantic store (`memories`) | Dynamic   | Automatic     | Embedding + Classifier + Reranker |
+| Knowledge graph             | Dynamic   | Automatic     | NER                               |
+| KV store                    | Dynamic   | Explicit      | None                              |
+| Full-text index             | Dynamic   | Automatic     | None (tokenizer only)             |
+| Persona files               | Static    | Automatic     | None                              |
+| Context files               | Static    | Automatic     | None                              |
+| Configuration files         | Static    | Authoritative | None                              |
+
 
 Every feature in the memory system has a row. New features should be placed on the grid before they're built — if a feature doesn't have a clean position, the architecture isn't ready for it.
 
@@ -134,10 +143,8 @@ The daemon holds the exclusive SurrealDB lock. External writers (cron jobs, inte
 The patterns for **bounded agent influence on authoritative files** already exist:
 
 - **HTML-comment authorship declaration** (file-level). `USER.md` carries `<!-- Updated by the agent as it learns about the user -->`; `MEMORY.md` carries `<!-- Curated knowledge the agent preserves across sessions -->`. Files without a comment are static and human-only. Standardize this across all eight corefile templates.
-
-- **`context.md` + `cache_context` manifest flag** (per-turn refresh). Implemented in `crates/openfang-runtime/src/agent_context.rs`, tracked by issue #843. Bounded, graceful on read failure, opt-out per agent. This is the canonical mechanism for "external writers update agent prompt context." Future "live data injected by external process" use cases funnel here.
-
-- **`.openfang/` directory separation** (path signals authority). Human-authored files in workspace root; system-managed sidecar state under `.openfang/`. Already enforced.
+- `**context.md` + `cache_context` manifest flag** (per-turn refresh). Implemented in `crates/openfang-runtime/src/agent_context.rs`, tracked by issue #843. Bounded, graceful on read failure, opt-out per agent. This is the canonical mechanism for "external writers update agent prompt context." Future "live data injected by external process" use cases funnel here.
+- `**.openfang/` directory separation** (path signals authority). Human-authored files in workspace root; system-managed sidecar state under `.openfang/`. Already enforced.
 
 Section-level authorship within a single file (delimited regions where the agent updates a specific block while leaving the rest untouched) is a natural future refinement, but it requires a parser that respects regions and is a meaningful jump beyond the file-level convention. File-level lands first.
 
