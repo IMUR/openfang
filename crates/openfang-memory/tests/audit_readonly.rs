@@ -1,18 +1,17 @@
+use serde_json::Value;
 use surrealdb::engine::local::SurrealKv;
 use surrealdb::Surreal;
-use serde_json::Value;
 
 #[tokio::test]
 async fn audit_live_database() -> Result<(), Box<dyn std::error::Error>> {
     // Use the ACTUAL data path from config, not in-memory
-    let db_path = std::env::var("OPENFANG_DB_PATH")
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap();
-            format!("{home}/.openfang/data/openfang.db")
-        });
-    
+    let db_path = std::env::var("OPENFANG_DB_PATH").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap();
+        format!("{home}/.openfang/data/openfang.db")
+    });
+
     eprintln!("=== AUDIT: Opening {db_path} ===");
-    
+
     let db = Surreal::new::<SurrealKv>(&db_path).await?;
     db.use_ns("openfang").use_db("agents").await?;
 
@@ -22,9 +21,16 @@ async fn audit_live_database() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. For each known table, how many records?
     let tables_to_check = [
-        "sessions", "canonical_sessions", "memories", "kv", 
-        "agents", "usage", "entities", "relations",
-        "paired_devices", "task_queue"
+        "sessions",
+        "canonical_sessions",
+        "memories",
+        "kv",
+        "agents",
+        "usage",
+        "entities",
+        "relations",
+        "paired_devices",
+        "task_queue",
     ];
     for table in tables_to_check {
         let count: Option<Value> = db
@@ -35,10 +41,7 @@ async fn audit_live_database() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 3. What indexes exist on memories?
-    let mem_info: Option<Value> = db
-        .query("INFO FOR TABLE memories")
-        .await?
-        .take(0)?;
+    let mem_info: Option<Value> = db.query("INFO FOR TABLE memories").await?.take(0)?;
     eprintln!("=== MEMORIES TABLE INFO ===\n{:#?}", mem_info);
 
     // 4. What embedding dimensions are actually stored?
@@ -63,7 +66,9 @@ async fn audit_live_database() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("=== ENTITY SAMPLES ===\n{:#?}", ent_sample);
 
     let rel_sample: Vec<Value> = db
-        .query("SELECT meta::id(id) AS id, in, out, relation_type, confidence FROM relations LIMIT 3")
+        .query(
+            "SELECT meta::id(id) AS id, in, out, relation_type, confidence FROM relations LIMIT 3",
+        )
         .await?
         .take(0)?;
     eprintln!("=== RELATION SAMPLES ===\n{:#?}", rel_sample);
@@ -91,10 +96,7 @@ async fn audit_live_database() -> Result<(), Box<dyn std::error::Error>> {
 
     // 10. Check for any DEFINE INDEX / ANALYZER already present
     for table in ["memories", "sessions", "entities", "relations", "usage"] {
-        let info: Option<Value> = db
-            .query(format!("INFO FOR TABLE {table}"))
-            .await?
-            .take(0)?;
+        let info: Option<Value> = db.query(format!("INFO FOR TABLE {table}")).await?.take(0)?;
         eprintln!("=== INFO FOR {table} ===\n{:#?}", info);
     }
 

@@ -3264,6 +3264,116 @@ pub async fn get_template(Path(name): Path<String>) -> impl IntoResponse {
 // Memory endpoints
 // ---------------------------------------------------------------------------
 
+const MEMORY_INSPECT_MAX_LIMIT: usize = 200;
+const MEMORY_INSPECT_DEFAULT_LIMIT: usize = 50;
+const MEMORY_INSPECT_SNIPPET_BYTES: usize = 1024;
+const MEMORY_INSPECT_MAX_RESPONSE_BYTES: usize = 1_000_000;
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SemanticMemoryInspectQuery {
+    scope: Option<String>,
+    category: Option<String>,
+    classification_source: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    q: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct GraphMemoryInspectQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+fn bounded_memory_inspect_limit(
+    limit: Option<usize>,
+) -> Result<usize, (StatusCode, Json<serde_json::Value>)> {
+    let limit = limit.unwrap_or(MEMORY_INSPECT_DEFAULT_LIMIT);
+    if limit > MEMORY_INSPECT_MAX_LIMIT {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("limit must be <= {MEMORY_INSPECT_MAX_LIMIT}")
+            })),
+        ));
+    }
+    Ok(limit)
+}
+
+fn validate_rfc3339_param(
+    name: &str,
+    value: Option<&String>,
+) -> Result<Option<String>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(value) = value else { return Ok(None) };
+    if chrono::DateTime::parse_from_rfc3339(value).is_err() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("{name} must be an RFC3339 timestamp")
+            })),
+        ));
+    }
+    Ok(Some(value.clone()))
+}
+
+fn resolve_memory_agent_id(
+    state: &AppState,
+    id: &str,
+) -> Result<AgentId, (StatusCode, Json<serde_json::Value>)> {
+    if let Ok(uuid) = uuid::Uuid::parse_str(id) {
+        return Ok(AgentId(uuid));
+    }
+    state
+        .kernel
+        .registry
+        .find_by_name(id)
+        .map(|entry| entry.id)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Agent not found"})),
+            )
+        })
+}
+
+fn capped_json(value: serde_json::Value) -> (StatusCode, Json<serde_json::Value>) {
+    match serde_json::to_vec(&value) {
+        Ok(bytes) if bytes.len() > MEMORY_INSPECT_MAX_RESPONSE_BYTES => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("response exceeds {MEMORY_INSPECT_MAX_RESPONSE_BYTES} bytes; narrow the query")
+            })),
+        ),
+        _ => (StatusCode::OK, Json(value)),
+    }
+}
+
+fn memory_fragment_to_inspection_json(
+    fragment: openfang_types::memory::MemoryFragment,
+) -> serde_json::Value {
+    let content = openfang_types::truncate_str(&fragment.content, MEMORY_INSPECT_SNIPPET_BYTES);
+    let category = fragment.metadata.get("category").cloned();
+    let classification_source = fragment.metadata.get("classification_source").cloned();
+    serde_json::json!({
+        "id": fragment.id.to_string(),
+        "agent_id": fragment.agent_id.0.to_string(),
+        "content": content,
+        "content_len": fragment.content.len(),
+        "truncated": content.len() < fragment.content.len(),
+        "scope": fragment.scope,
+        "category": category,
+        "classification_source": classification_source,
+        "source": fragment.source,
+        "confidence": fragment.confidence,
+        "created_at": fragment.created_at,
+        "accessed_at": fragment.accessed_at,
+        "access_count": fragment.access_count,
+        "metadata": fragment.metadata,
+    })
+}
+
 /// GET /api/memory/agents/:id/kv — List KV pairs for an agent.
 ///
 /// Note: memory_store tool writes to a shared namespace, so we read from that
@@ -3368,6 +3478,116 @@ pub async fn delete_agent_kv_key(
             )
         }
     }
+}
+
+/// GET /api/memory/agents/:id/semantic — Inspect semantic memories for an agent.
+pub async fn get_agent_semantic_memory(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<SemanticMemoryInspectQuery>,
+) -> impl IntoResponse {
+    let agent_id = match resolve_memory_agent_id(&state, &id) {
+        Ok(agent_id) => agent_id,
+        Err(response) => return response,
+    };
+    let limit = match bounded_memory_inspect_limit(query.limit) {
+        Ok(limit) => limit,
+        Err(response) => return response,
+    };
+    let since = match validate_rfc3339_param("since", query.since.as_ref()) {
+        Ok(since) => since,
+        Err(response) => return response,
+    };
+    let until = match validate_rfc3339_param("until", query.until.as_ref()) {
+        Ok(until) => until,
+        Err(response) => return response,
+    };
+
+    match state
+        .kernel
+        .memory
+        .inspect_fragments(
+            agent_id,
+            query.offset.unwrap_or(0),
+            limit,
+            query.q.as_deref(),
+            query.scope.as_deref(),
+            query.category.as_deref(),
+            query.classification_source.as_deref(),
+            since.as_deref(),
+            until.as_deref(),
+        )
+        .await
+    {
+        Ok(fragments) => {
+            let memories: Vec<_> = fragments
+                .into_iter()
+                .map(memory_fragment_to_inspection_json)
+                .collect();
+            capped_json(serde_json::json!({
+                "agent_id": agent_id.0.to_string(),
+                "offset": query.offset.unwrap_or(0),
+                "limit": limit,
+                "count": memories.len(),
+                "memories": memories,
+            }))
+        }
+        Err(e) => {
+            tracing::warn!(agent = %agent_id.0, "Semantic memory inspection failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Memory operation failed"})),
+            )
+        }
+    }
+}
+
+/// GET /api/memory/agents/:id/graph — Inspect graph entities and relations.
+pub async fn get_agent_graph_memory(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<GraphMemoryInspectQuery>,
+) -> impl IntoResponse {
+    let agent_id = match resolve_memory_agent_id(&state, &id) {
+        Ok(agent_id) => agent_id,
+        Err(response) => return response,
+    };
+    let limit = match bounded_memory_inspect_limit(query.limit) {
+        Ok(limit) => limit,
+        Err(response) => return response,
+    };
+    let offset = query.offset.unwrap_or(0);
+
+    let entities = match state.kernel.memory.list_entities(offset, limit).await {
+        Ok(entities) => entities,
+        Err(e) => {
+            tracing::warn!(agent = %agent_id.0, "Graph entity inspection failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Memory operation failed"})),
+            );
+        }
+    };
+    let relations = match state.kernel.memory.list_relations(offset, limit).await {
+        Ok(relations) => relations,
+        Err(e) => {
+            tracing::warn!(agent = %agent_id.0, "Graph relation inspection failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Memory operation failed"})),
+            );
+        }
+    };
+
+    capped_json(serde_json::json!({
+        "agent_id": agent_id.0.to_string(),
+        "offset": offset,
+        "limit": limit,
+        "entity_count": entities.len(),
+        "relation_count": relations.len(),
+        "entities": entities,
+        "relations": relations,
+    }))
 }
 
 /// POST /api/memory/backfill — Re-run NER, classification, and metadata enrichment

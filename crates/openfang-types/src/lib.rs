@@ -9,6 +9,7 @@ pub mod capability;
 pub mod commands;
 pub mod comms;
 pub mod config;
+pub mod datetime;
 pub mod error;
 pub mod event;
 pub mod manifest_signing;

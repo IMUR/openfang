@@ -66,7 +66,9 @@ struct MemoryRecord {
     scope: String,
     confidence: f32,
     metadata: HashMap<String, serde_json::Value>,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     created_at: String,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     accessed_at: String,
     access_count: u64,
     deleted: bool,
@@ -85,7 +87,9 @@ struct KnnRow {
     confidence: f32,
     #[serde(default)]
     metadata: HashMap<String, serde_json::Value>,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     created_at: String,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     accessed_at: String,
     #[serde(default)]
     access_count: u64,
@@ -111,7 +115,9 @@ struct BM25Row {
     confidence: f32,
     #[serde(default)]
     metadata: HashMap<String, serde_json::Value>,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     created_at: String,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     accessed_at: String,
     #[serde(default)]
     access_count: u64,
@@ -243,11 +249,22 @@ impl SemanticStore {
                 confidence: 1.0,
                 metadata,
                 created_at: now.clone(),
-                accessed_at: now,
+                accessed_at: now.clone(),
                 access_count: 0,
                 deleted: false,
                 embedding: embedding.map(|e| e.to_vec()),
             })
+            .await
+            .map_err(surreal_err)?;
+        self.db
+            .query(
+                "UPDATE type::record('memories', $mid)
+                 SET created_at = type::datetime($created_at),
+                     accessed_at = type::datetime($accessed_at)",
+            )
+            .bind(("mid", id.0.to_string()))
+            .bind(("created_at", now.clone()))
+            .bind(("accessed_at", now))
             .await
             .map_err(surreal_err)?;
 
@@ -299,10 +316,9 @@ impl SemanticStore {
             let _ = self
                 .db
                 .query(
-                    "UPDATE type::record('memories', $mid) SET access_count += 1, accessed_at = $now",
+                    "UPDATE type::record('memories', $mid) SET access_count += 1, accessed_at = time::now()",
                 )
                 .bind(("mid", frag.id.0.to_string()))
-                .bind(("now", Utc::now().to_rfc3339()))
                 .await;
         }
 
@@ -513,6 +529,87 @@ impl SemanticStore {
             .await
             .map_err(surreal_err)?;
 
+        let records: Vec<MemoryRecord> = result.take(0).unwrap_or_default();
+        Ok(records
+            .into_iter()
+            .filter_map(memory_record_to_fragment)
+            .collect())
+    }
+
+    /// Inspect non-deleted memory fragments for an agent without updating access stats.
+    ///
+    /// This is intended for read-only operational/API inspection. It deliberately
+    /// avoids `recall_with_embedding()` because recall mutates `access_count` and
+    /// `accessed_at` for returned fragments.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn inspect_fragments(
+        &self,
+        agent_id: AgentId,
+        offset: usize,
+        limit: usize,
+        query: Option<&str>,
+        scope: Option<&str>,
+        category: Option<&str>,
+        classification_source: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> OpenFangResult<Vec<MemoryFragment>> {
+        let mut conditions = vec!["deleted = false".to_string(), "agent_id = $aid".to_string()];
+        if scope.is_some() {
+            conditions.push("scope = $scope".to_string());
+        }
+        if category.is_some() {
+            conditions.push("metadata.category = $category".to_string());
+        }
+        if classification_source.is_some() {
+            conditions.push("metadata.classification_source = $classification_source".to_string());
+        }
+        if since.is_some() {
+            conditions.push("created_at >= $since".to_string());
+        }
+        if until.is_some() {
+            conditions.push("created_at <= $until".to_string());
+        }
+        if query.is_some() {
+            conditions.push("content CONTAINS $query".to_string());
+        }
+
+        let sql = format!(
+            "SELECT meta::id(id) AS record_key, agent_id, content, source, scope, confidence,
+                    metadata, created_at, accessed_at, access_count, deleted, embedding
+             FROM memories
+             WHERE {}
+             ORDER BY created_at DESC
+             LIMIT $lim START $off",
+            conditions.join(" AND ")
+        );
+
+        let mut q = self
+            .db
+            .query(&sql)
+            .bind(("aid", agent_id.0.to_string()))
+            .bind(("lim", limit))
+            .bind(("off", offset));
+        if let Some(scope) = scope {
+            q = q.bind(("scope", scope.to_string()));
+        }
+        if let Some(category) = category {
+            q = q.bind(("category", category.to_string()));
+        }
+        if let Some(classification_source) = classification_source {
+            q = q.bind(("classification_source", classification_source.to_string()));
+        }
+        if let Some(since) = since {
+            q = q.bind(("since", since.to_string()));
+        }
+        if let Some(until) = until {
+            q = q.bind(("until", until.to_string()));
+        }
+        if let Some(query) = query {
+            q = q.bind(("query", query.to_string()));
+        }
+
+        let mut result = q.await.map_err(surreal_err)?;
         let records: Vec<MemoryRecord> = result.take(0).unwrap_or_default();
         Ok(records
             .into_iter()

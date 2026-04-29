@@ -3,7 +3,6 @@
 //! Handles background compaction of memory: merging similar fragments,
 //! decaying confidence over time, and pruning low-value memories.
 
-use chrono::Utc;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use surrealdb::types::SurrealValue;
@@ -45,20 +44,19 @@ impl ConsolidationEngine {
         days_threshold: i64,
         decay_factor: f32,
     ) -> OpenFangResult<u64> {
-        let cutoff = (Utc::now() - chrono::Duration::days(days_threshold)).to_rfc3339();
+        let days_threshold = days_threshold.max(0);
 
         let mut result = self
             .db
-            .query(
+            .query(&format!(
                 "UPDATE memories SET confidence = confidence * $factor
                  WHERE agent_id = $aid
                    AND deleted = false
-                   AND accessed_at < $cutoff
-                 RETURN BEFORE",
-            )
+                   AND accessed_at < time::now() - {days_threshold}d
+                 RETURN BEFORE"
+            ))
             .bind(("factor", decay_factor as f64))
             .bind(("aid", agent_id.0.to_string()))
-            .bind(("cutoff", cutoff))
             .await
             .map_err(surreal_err)?;
 
@@ -122,24 +120,22 @@ impl ConsolidationEngine {
             record_key: Option<String>,
             content: String,
         }
-
-        let cutoff = (Utc::now() - chrono::Duration::hours(older_than_hours)).to_rfc3339();
+        let older_than_hours = older_than_hours.max(0);
 
         let mut result = self
             .db
-            .query(
+            .query(&format!(
                 "SELECT meta::id(id) AS record_key, content
                  FROM memories
                  WHERE agent_id = $aid
                    AND scope = 'episodic'
                    AND deleted = false
-                   AND created_at < $cutoff
+                   AND created_at < time::now() - {older_than_hours}h
                    AND (metadata.summarized_into = NONE OR !metadata.summarized_into)
                  ORDER BY created_at ASC
-                 LIMIT $lim",
-            )
+                 LIMIT $lim"
+            ))
             .bind(("aid", agent_id.0.to_string()))
-            .bind(("cutoff", cutoff))
             .bind(("lim", max_items))
             .await
             .map_err(surreal_err)?;

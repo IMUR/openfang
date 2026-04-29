@@ -11,11 +11,7 @@ fn bootstrap_user_profile_established(ctx: &PromptContext) -> bool {
     if ctx.user_name.is_some() {
         return true;
     }
-    if ctx
-        .recalled_memories
-        .iter()
-        .any(|(k, _)| k == "user_name")
-    {
+    if ctx.recalled_memories.iter().any(|(k, _)| k == "user_name") {
         return true;
     }
     if let Some(ref md) = ctx.user_md {

@@ -57,7 +57,9 @@ struct SessionRecord {
     messages: Vec<Message>,
     context_window_tokens: u64,
     label: Option<String>,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     created_at: String,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     updated_at: String,
 }
 surreal_via_json!(SessionRecord);
@@ -69,6 +71,7 @@ struct CanonicalRecord {
     messages: Vec<Message>,
     compaction_cursor: usize,
     compacted_summary: Option<String>,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     updated_at: String,
 }
 surreal_via_json!(CanonicalRecord);
@@ -79,6 +82,7 @@ struct SessionListRow {
     id: serde_json::Value,
     agent_id: String,
     messages: Vec<Message>,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     created_at: String,
     label: Option<String>,
 }
@@ -134,8 +138,19 @@ impl SessionStore {
                 context_window_tokens: session.context_window_tokens,
                 label: session.label.clone(),
                 created_at: now.clone(),
-                updated_at: now,
+                updated_at: now.clone(),
             })
+            .await
+            .map_err(surreal_err)?;
+        self.db
+            .query(
+                "UPDATE type::record('sessions', $sid)
+                 SET created_at = type::datetime($created_at),
+                     updated_at = type::datetime($updated_at)",
+            )
+            .bind(("sid", session.id.0.to_string()))
+            .bind(("created_at", now.clone()))
+            .bind(("updated_at", now))
             .await
             .map_err(surreal_err)?;
         Ok(())
@@ -218,10 +233,12 @@ impl SessionStore {
         label: Option<&str>,
     ) -> OpenFangResult<()> {
         self.db
-            .query("UPDATE type::record('sessions', $sid) SET label = $label, updated_at = $now")
+            .query(
+                "UPDATE type::record('sessions', $sid)
+                 SET label = $label, updated_at = time::now()",
+            )
             .bind(("sid", session_id.0.to_string()))
             .bind(("label", label.map(|s| s.to_string())))
-            .bind(("now", Utc::now().to_rfc3339()))
             .await
             .map_err(surreal_err)?;
         Ok(())
@@ -461,6 +478,15 @@ impl SessionStore {
                 compacted_summary: canonical.compacted_summary.clone(),
                 updated_at: canonical.updated_at.clone(),
             })
+            .await
+            .map_err(surreal_err)?;
+        self.db
+            .query(
+                "UPDATE type::record('canonical_sessions', $aid)
+                 SET updated_at = type::datetime($updated_at)",
+            )
+            .bind(("aid", canonical.agent_id.0.to_string()))
+            .bind(("updated_at", canonical.updated_at.clone()))
             .await
             .map_err(surreal_err)?;
         Ok(())

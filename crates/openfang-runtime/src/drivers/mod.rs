@@ -532,11 +532,7 @@ pub fn detect_available_provider() -> Option<(&'static str, &'static str, &'stat
             "FIREWORKS_API_KEY",
         ),
         ("xai", "grok-3-mini", "XAI_API_KEY"),
-        (
-            "perplexity",
-            "sonar-pro",
-            "PERPLEXITY_API_KEY",
-        ),
+        ("perplexity", "sonar-pro", "PERPLEXITY_API_KEY"),
         ("cohere", "command-r-plus", "COHERE_API_KEY"),
         ("novita", "moonshotai/kimi-k2.5", "NOVITA_API_KEY"),
     ];

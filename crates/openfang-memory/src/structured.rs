@@ -11,6 +11,27 @@ use surrealdb::types::SurrealValue;
 
 use crate::db::SurrealDb;
 
+macro_rules! surreal_via_json {
+    ($t:ty) => {
+        impl surrealdb::types::SurrealValue for $t {
+            fn kind_of() -> surrealdb::types::Kind {
+                surrealdb::types::Kind::Any
+            }
+
+            fn into_value(self) -> surrealdb::types::Value {
+                let json = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+                surrealdb::types::SurrealValue::into_value(json)
+            }
+
+            fn from_value(value: surrealdb::types::Value) -> Result<Self, surrealdb::types::Error> {
+                let json = value.into_json_value();
+                serde_json::from_value(json)
+                    .map_err(|e| surrealdb::types::Error::internal(e.to_string()))
+            }
+        }
+    };
+}
+
 /// Structured store backed by SurrealDB for key-value operations and agent storage.
 #[derive(Clone)]
 pub struct StructuredStore {
@@ -18,14 +39,16 @@ pub struct StructuredStore {
 }
 
 /// KV record stored in SurrealDB.
-#[derive(Debug, Serialize, Deserialize, SurrealValue)]
+#[derive(Debug, Serialize, Deserialize)]
 struct KvRecord {
     agent_id: String,
     key: String,
     value: serde_json::Value,
     version: u64,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     updated_at: String,
 }
+surreal_via_json!(KvRecord);
 
 /// KV listing row (only key + value from SELECT).
 #[derive(Debug, Deserialize, SurrealValue)]
@@ -95,8 +118,17 @@ impl StructuredStore {
                 key: key.to_string(),
                 value,
                 version: 1, // SurrealDB handles merge; we just set it
-                updated_at: now,
+                updated_at: now.clone(),
             })
+            .await
+            .map_err(surreal_err)?;
+        self.db
+            .query(
+                "UPDATE type::record('kv', $rid)
+                 SET updated_at = type::datetime($updated_at)",
+            )
+            .bind(("rid", record_id))
+            .bind(("updated_at", now))
             .await
             .map_err(surreal_err)?;
 
@@ -234,6 +266,7 @@ fn kv_id(agent_id: AgentId, key: &str) -> String {
 mod tests {
     use super::*;
     use crate::db;
+    use chrono::Utc;
 
     async fn setup() -> StructuredStore {
         let db = db::init_mem().await.unwrap();

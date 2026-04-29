@@ -11,6 +11,27 @@ use surrealdb::types::SurrealValue;
 
 use crate::db::SurrealDb;
 
+macro_rules! surreal_via_json {
+    ($t:ty) => {
+        impl surrealdb::types::SurrealValue for $t {
+            fn kind_of() -> surrealdb::types::Kind {
+                surrealdb::types::Kind::Any
+            }
+
+            fn into_value(self) -> surrealdb::types::Value {
+                let json = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+                surrealdb::types::SurrealValue::into_value(json)
+            }
+
+            fn from_value(value: surrealdb::types::Value) -> Result<Self, surrealdb::types::Error> {
+                let json = value.into_json_value();
+                serde_json::from_value(json)
+                    .map_err(|e| surrealdb::types::Error::internal(e.to_string()))
+            }
+        }
+    };
+}
+
 /// Usage store backed by SurrealDB.
 #[derive(Clone)]
 pub struct UsageStore {
@@ -18,7 +39,7 @@ pub struct UsageStore {
 }
 
 /// A single usage event record.
-#[derive(Debug, Serialize, Deserialize, SurrealValue)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UsageRecord {
     pub agent_id: String,
     pub provider: String,
@@ -27,8 +48,10 @@ pub struct UsageRecord {
     pub output_tokens: u64,
     pub cost_usd: f64,
     pub event_type: String,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     pub created_at: String,
 }
+surreal_via_json!(UsageRecord);
 
 /// Aggregated usage summary.
 #[derive(Debug, Default, Serialize, Deserialize, SurrealValue)]
@@ -38,6 +61,23 @@ pub struct UsageSummary {
     pub total_cost_usd: f64,
     pub event_count: u64,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UsageEventRow {
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
+    created_at: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: f64,
+}
+surreal_via_json!(UsageEventRow);
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FirstEventRow {
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
+    created_at: String,
+}
+surreal_via_json!(FirstEventRow);
 
 fn surreal_err(e: surrealdb::Error) -> OpenFangError {
     OpenFangError::Memory(e.to_string())
@@ -61,7 +101,8 @@ impl UsageStore {
         cost_usd: f64,
         event_type: &str,
     ) -> OpenFangResult<()> {
-        let _: Option<UsageRecord> = self
+        let now = Utc::now().to_rfc3339();
+        let record: Option<UsageRecord> = self
             .db
             .create("usage")
             .content(UsageRecord {
@@ -72,10 +113,27 @@ impl UsageStore {
                 output_tokens,
                 cost_usd,
                 event_type: event_type.to_string(),
-                created_at: Utc::now().to_rfc3339(),
+                created_at: now.clone(),
             })
             .await
             .map_err(surreal_err)?;
+        if let Some(record) = record {
+            self.db
+                .query(
+                    "UPDATE usage
+                     SET created_at = type::datetime($created_at)
+                     WHERE agent_id = $aid
+                       AND provider = $provider
+                       AND model = $model
+                       AND created_at = $created_at",
+                )
+                .bind(("created_at", record.created_at))
+                .bind(("aid", agent_id.0.to_string()))
+                .bind(("provider", provider.to_string()))
+                .bind(("model", model.to_string()))
+                .await
+                .map_err(surreal_err)?;
+        }
         Ok(())
     }
 
@@ -231,14 +289,6 @@ impl UsageStore {
             return Ok(Vec::new());
         }
 
-        #[derive(Deserialize, SurrealValue)]
-        struct UsageEventRow {
-            created_at: String,
-            input_tokens: u64,
-            output_tokens: u64,
-            cost_usd: f64,
-        }
-
         let today = Utc::now().date_naive();
         let start_date = today - chrono::Duration::days(days.saturating_sub(1) as i64);
         let since = start_date
@@ -297,11 +347,6 @@ impl UsageStore {
 
     /// Get the timestamp of the earliest recorded usage event.
     pub async fn first_event_date(&self) -> OpenFangResult<Option<String>> {
-        #[derive(Deserialize, SurrealValue)]
-        struct FirstEventRow {
-            created_at: String,
-        }
-
         let mut result = self
             .db
             .query("SELECT created_at FROM usage ORDER BY created_at ASC LIMIT 1")

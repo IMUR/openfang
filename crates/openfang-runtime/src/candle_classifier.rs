@@ -40,7 +40,7 @@ use crate::model_cache;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{linear, Linear, Module, VarBuilder};
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use candle_transformers::models::distilbert::{DistilBertModel, Config as DistilBertConfig};
+use candle_transformers::models::distilbert::{Config as DistilBertConfig, DistilBertModel};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -177,7 +177,8 @@ impl CandleClassifier {
         let nli = tokio::task::spawn_blocking(move || {
             let config_str = std::fs::read_to_string(&config_path)
                 .map_err(|e| ClassifierError::Load(format!("config.json: {e}")))?;
-            let is_distilbert = config_str.contains("\"dim\"") && config_str.contains("\"n_layers\"");
+            let is_distilbert =
+                config_str.contains("\"dim\"") && config_str.contains("\"n_layers\"");
 
             let dtype = if matches!(device_clone, Device::Cuda(_)) {
                 DType::F16
@@ -244,7 +245,10 @@ impl CandleClassifier {
                 .find(|(_, v)| v.to_uppercase() == "ENTAILMENT")
                 .and_then(|(k, _)| k.parse::<usize>().ok())
                 .unwrap_or(2);
-            info!(entailment_idx, "Resolved entailment label index from config");
+            info!(
+                entailment_idx,
+                "Resolved entailment label index from config"
+            );
 
             info!(model_id = model_id_owned, "NLI classifier model loaded");
 
@@ -496,9 +500,7 @@ mod tests {
 
         // --- Replicate the DistilBERT mask preparation from nli_score_all ---
         let ones = Tensor::ones_like(&attention_mask).expect("ones");
-        let inverted = ones
-            .broadcast_sub(&attention_mask)
-            .expect("mask inversion");
+        let inverted = ones.broadcast_sub(&attention_mask).expect("mask inversion");
         let reshaped = inverted.reshape((n, 1, 1, max_len)).expect("4D reshape");
 
         // Contract assertions
