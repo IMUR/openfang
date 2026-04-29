@@ -1,4 +1,5 @@
 # Agent Behavioral Guidelines
+<!-- Static behavioral guidelines, human-authored -->
 
 ## Core Principles
 

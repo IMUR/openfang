@@ -1,2 +1,2 @@
 # Tools & Environment
-<!-- Agent-specific environment notes (not synced) -->
+<!-- Static tool guidance, human-authored -->

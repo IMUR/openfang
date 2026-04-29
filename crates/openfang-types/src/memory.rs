@@ -91,8 +91,10 @@ pub struct MemoryFragment {
     /// Confidence score (0.0 - 1.0).
     pub confidence: f32,
     /// When this memory was created.
+    #[serde(deserialize_with = "crate::datetime::deserialize_datetime")]
     pub created_at: DateTime<Utc>,
     /// When this memory was last accessed.
+    #[serde(deserialize_with = "crate::datetime::deserialize_datetime")]
     pub accessed_at: DateTime<Utc>,
     /// How many times this memory has been accessed.
     pub access_count: u64,
@@ -112,8 +114,16 @@ pub struct MemoryFilter {
     /// Minimum confidence threshold.
     pub min_confidence: Option<f32>,
     /// Only memories created after this time.
+    #[serde(
+        default,
+        deserialize_with = "crate::datetime::deserialize_optional_datetime"
+    )]
     pub after: Option<DateTime<Utc>>,
     /// Only memories created before this time.
+    #[serde(
+        default,
+        deserialize_with = "crate::datetime::deserialize_optional_datetime"
+    )]
     pub before: Option<DateTime<Utc>>,
     /// Metadata key-value filters.
     pub metadata: HashMap<String, serde_json::Value>,
@@ -149,8 +159,10 @@ pub struct Entity {
     /// Arbitrary properties.
     pub properties: HashMap<String, serde_json::Value>,
     /// When this entity was created.
+    #[serde(deserialize_with = "crate::datetime::deserialize_datetime")]
     pub created_at: DateTime<Utc>,
     /// When this entity was last updated.
+    #[serde(deserialize_with = "crate::datetime::deserialize_datetime")]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -192,6 +204,7 @@ pub struct Relation {
     /// Confidence score (0.0 - 1.0).
     pub confidence: f32,
     /// When this relation was created.
+    #[serde(deserialize_with = "crate::datetime::deserialize_datetime")]
     pub created_at: DateTime<Utc>,
 }
 

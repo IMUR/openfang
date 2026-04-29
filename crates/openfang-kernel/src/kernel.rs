@@ -313,7 +313,7 @@ fn ensure_workspace(workspace: &Path) -> KernelResult<()> {
     Ok(())
 }
 
-/// Generate workspace identity files for an agent (SOUL.md, USER.md, TOOLS.md, MEMORY.md).
+/// Generate workspace corefiles for an agent (SOUL.md, USER.md, TOOLS.md, MEMORY.md, etc.).
 /// Uses `create_new` to never overwrite existing files (preserves user edits).
 fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
     use std::fs::OpenOptions;
@@ -321,6 +321,7 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
 
     let soul_content = format!(
         "# Soul\n\
+         <!-- Static persona, human-authored -->\n\
          You are {}. {}\n\
          Be genuinely helpful. Have opinions. Be resourceful before asking.\n\
          Treat user data with respect \u{2014} you are a guest in their life.\n",
@@ -339,12 +340,13 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
          - Preferences:\n";
 
     let tools_content = "# Tools & Environment\n\
-         <!-- Agent-specific environment notes (not synced) -->\n";
+         <!-- Static tool guidance, human-authored -->\n";
 
     let memory_content = "# Long-Term Memory\n\
          <!-- Curated knowledge the agent preserves across sessions -->\n";
 
-    let agents_content = "# Agent Behavioral Guidelines\n\n\
+    let agents_content = "# Agent Behavioral Guidelines\n\
+         <!-- Static behavioral guidelines, human-authored -->\n\n\
          ## Core Principles\n\
          - Act first, narrate second. Use tools to accomplish tasks rather than describing what you'd do.\n\
          - Batch tool calls when possible \u{2014} don't output reasoning between each call.\n\
@@ -363,7 +365,8 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
          - If a task fails, explain what went wrong and suggest alternatives.\n";
 
     let bootstrap_content = format!(
-        "# First-Run Bootstrap\n\n\
+        "# First-Run Bootstrap\n\
+         <!-- Static first-run protocol, human-authored -->\n\n\
          On your FIRST conversation with a new user, follow this protocol:\n\n\
          1. **Greet** \u{2014} Introduce yourself as {name} with a one-line summary of your specialty.\n\
          2. **Discover** \u{2014} Ask the user's name and one key preference relevant to your domain.\n\
@@ -375,7 +378,8 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
     );
 
     let identity_content = format!(
-        "---\n\
+        "<!-- Visual identity and personality at a glance. Edit these fields freely. -->\n\
+         ---\n\
          name: {name}\n\
          archetype: assistant\n\
          vibe: helpful\n\
@@ -384,8 +388,7 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
          greeting_style: warm\n\
          color:\n\
          ---\n\
-         # Identity\n\
-         <!-- Visual identity and personality at a glance. Edit these fields freely. -->\n",
+         # Identity\n",
         name = manifest.name
     );
 
@@ -403,7 +406,7 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
     let heartbeat_content = if manifest.autonomous.is_some() {
         Some(
             "# Heartbeat Checklist\n\
-             <!-- Proactive reminders to check during heartbeat cycles -->\n\n\
+             <!-- Static autonomous tick checklist, human-authored -->\n\n\
              ## Every Heartbeat\n\
              - [ ] Check for pending tasks or messages\n\
              - [ ] Review memory for stale items\n\n\
@@ -540,9 +543,7 @@ impl OpenFangKernel {
         context: &'static str,
         fut: impl std::future::Future<Output = openfang_types::error::OpenFangResult<T>>,
     ) {
-        let res = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(fut)
-        });
+        let res = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut));
         if let Err(e) = res {
             warn!("{context}: {e}");
         }
@@ -584,8 +585,7 @@ impl OpenFangKernel {
 
         let is_default_provider =
             manifest.model.provider.is_empty() || manifest.model.provider == "default";
-        let is_default_model =
-            manifest.model.model.is_empty() || manifest.model.model == "default";
+        let is_default_model = manifest.model.model.is_empty() || manifest.model.model == "default";
 
         if opts.force_kernel_default_model {
             if !dm.provider.is_empty() {
@@ -645,10 +645,11 @@ impl OpenFangKernel {
         apply_budget_defaults(&self.config.budget, &mut manifest.resources);
 
         if opts.ensure_workspace {
-            let workspace_dir = manifest
-                .workspace
-                .clone()
-                .unwrap_or_else(|| self.config.effective_workspaces_dir().join(agent_folder_name));
+            let workspace_dir = manifest.workspace.clone().unwrap_or_else(|| {
+                self.config
+                    .effective_workspaces_dir()
+                    .join(agent_folder_name)
+            });
             ensure_workspace(&workspace_dir)?;
             if manifest.generate_identity_files {
                 generate_identity_files(&workspace_dir, manifest);
@@ -3626,11 +3627,7 @@ impl OpenFangKernel {
         let key = format!("session_{date}_{slug}");
         if let Err(e) = self
             .memory
-            .structured_set(
-                agent_id,
-                &key,
-                serde_json::Value::String(summary.clone()),
-            )
+            .structured_set(agent_id, &key, serde_json::Value::String(summary.clone()))
             .await
         {
             warn!(agent_id = %agent_id, key = %key, "Failed to save session summary to structured memory: {e}");
@@ -3765,7 +3762,10 @@ impl OpenFangKernel {
 
         // Persist the updated entry
         if let Some(entry) = self.registry.get(agent_id) {
-            self.run_memory_sync("save_agent after set_agent_model", self.memory.save_agent(&entry));
+            self.run_memory_sync(
+                "save_agent after set_agent_model",
+                self.memory.save_agent(&entry),
+            );
         }
 
         // Write updated manifest to agent.toml so changes survive restart (#996, #1018)
@@ -3804,7 +3804,10 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
 
         if let Some(entry) = self.registry.get(agent_id) {
-            self.run_memory_sync("save_agent after set_agent_skills", self.memory.save_agent(&entry));
+            self.run_memory_sync(
+                "save_agent after set_agent_skills",
+                self.memory.save_agent(&entry),
+            );
         }
 
         info!(agent_id = %agent_id, skills = ?skills, "Agent skills updated");
@@ -4081,8 +4084,7 @@ impl OpenFangKernel {
 
         // Remove from persistent storage
         let _ = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(self.memory.remove_agent(agent_id))
+            tokio::runtime::Handle::current().block_on(self.memory.remove_agent(agent_id))
         });
 
         // SECURITY: Record agent kill in audit trail

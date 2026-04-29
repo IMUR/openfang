@@ -23,6 +23,7 @@ pub fn operation_cost(method: &str, path: &str) -> NonZeroU32 {
         ("GET", "/api/config") => NonZeroU32::new(2).unwrap(),
         ("GET", "/api/usage") => NonZeroU32::new(3).unwrap(),
         ("GET", p) if p.starts_with("/api/audit") => NonZeroU32::new(5).unwrap(),
+        (_, p) if p.starts_with("/api/memory/") => NonZeroU32::new(5).unwrap(),
         ("GET", p) if p.starts_with("/api/marketplace") => NonZeroU32::new(10).unwrap(),
         ("POST", "/api/agents") => NonZeroU32::new(50).unwrap(),
         ("POST", p) if p.contains("/message") => NonZeroU32::new(30).unwrap(),
@@ -103,6 +104,14 @@ mod tests {
         assert_eq!(operation_cost("GET", "/api/skills").get(), 2);
         assert_eq!(operation_cost("GET", "/api/peers").get(), 2);
         assert_eq!(operation_cost("GET", "/api/audit/recent").get(), 5);
+        assert_eq!(
+            operation_cost("GET", "/api/memory/agents/example/semantic").get(),
+            5
+        );
+        assert_eq!(
+            operation_cost("GET", "/api/memory/agents/example/graph").get(),
+            5
+        );
         assert_eq!(operation_cost("POST", "/api/skills/install").get(), 50);
         assert_eq!(operation_cost("POST", "/api/migrate").get(), 100);
     }

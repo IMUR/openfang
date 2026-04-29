@@ -67,10 +67,26 @@ struct EntityRecord {
     entity_type: EntityType,
     name: String,
     properties: std::collections::HashMap<String, serde_json::Value>,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     created_at: String,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     updated_at: String,
 }
 surreal_via_json!(EntityRecord);
+
+/// Entity row returned by read-only inspection queries.
+#[derive(Debug, Serialize, Deserialize)]
+struct EntityRow {
+    record_key: Option<String>,
+    entity_type: EntityType,
+    name: String,
+    properties: std::collections::HashMap<String, serde_json::Value>,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
+    created_at: String,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
+    updated_at: String,
+}
+surreal_via_json!(EntityRow);
 
 /// Relation record for SurrealDB persistence.
 #[derive(Debug, Serialize, Deserialize)]
@@ -78,6 +94,7 @@ struct RelationRecord {
     relation_type: RelationType,
     properties: std::collections::HashMap<String, serde_json::Value>,
     confidence: f32,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     created_at: String,
 }
 surreal_via_json!(RelationRecord);
@@ -99,6 +116,52 @@ fn surreal_err(e: surrealdb::Error) -> OpenFangError {
     OpenFangError::Memory(e.to_string())
 }
 
+fn parse_dt(s: &str) -> chrono::DateTime<Utc> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
+}
+
+fn entity_row_to_entity(row: EntityRow) -> Entity {
+    Entity {
+        id: row.record_key.unwrap_or_default(),
+        entity_type: row.entity_type,
+        name: row.name,
+        properties: row.properties,
+        created_at: parse_dt(&row.created_at),
+        updated_at: parse_dt(&row.updated_at),
+    }
+}
+
+fn graph_row_to_match(row: GraphRow) -> GraphMatch {
+    GraphMatch {
+        source: Entity {
+            id: row.source_id,
+            entity_type: row.source.entity_type,
+            name: row.source.name,
+            properties: row.source.properties,
+            created_at: parse_dt(&row.source.created_at),
+            updated_at: parse_dt(&row.source.updated_at),
+        },
+        relation: Relation {
+            source: row.relation_source,
+            relation: row.relation.relation_type,
+            target: row.relation_target,
+            properties: row.relation.properties,
+            confidence: row.relation.confidence,
+            created_at: parse_dt(&row.relation.created_at),
+        },
+        target: Entity {
+            id: row.target_id,
+            entity_type: row.target.entity_type,
+            name: row.target.name,
+            properties: row.target.properties,
+            created_at: parse_dt(&row.target.created_at),
+            updated_at: parse_dt(&row.target.updated_at),
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Traversal helper types and functions
 // ---------------------------------------------------------------------------
@@ -113,7 +176,15 @@ struct RawEntity {
     name: Option<String>,
     #[serde(default)]
     properties: std::collections::HashMap<String, serde_json::Value>,
+    #[serde(
+        default,
+        deserialize_with = "openfang_types::datetime::deserialize_optional_rfc3339_string"
+    )]
     created_at: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "openfang_types::datetime::deserialize_optional_rfc3339_string"
+    )]
     updated_at: Option<String>,
 }
 surreal_via_json!(RawEntity);
@@ -208,8 +279,19 @@ impl KnowledgeStore {
                 name: entity.name,
                 properties: entity.properties,
                 created_at: now.clone(),
-                updated_at: now,
+                updated_at: now.clone(),
             })
+            .await
+            .map_err(surreal_err)?;
+        self.db
+            .query(
+                "UPDATE type::record('entities', $id)
+                 SET created_at = type::datetime($created_at),
+                     updated_at = type::datetime($updated_at)",
+            )
+            .bind(("id", id.clone()))
+            .bind(("created_at", now.clone()))
+            .bind(("updated_at", now))
             .await
             .map_err(surreal_err)?;
 
@@ -236,7 +318,16 @@ impl KnowledgeStore {
             .bind(("rel_type", serde_json::to_value(&relation.relation).map_err(|e| OpenFangError::Serialization(e.to_string()))?))
             .bind(("props", serde_json::to_value(&relation.properties).map_err(|e| OpenFangError::Serialization(e.to_string()))?))
             .bind(("conf", relation.confidence as f64))
-            .bind(("now", now))
+            .bind(("now", now.clone()))
+            .await
+            .map_err(surreal_err)?;
+        self.db
+            .query(
+                "UPDATE type::record('relations', $id)
+                 SET created_at = type::datetime($created_at)",
+            )
+            .bind(("id", id.clone()))
+            .bind(("created_at", now))
             .await
             .map_err(surreal_err)?;
 
@@ -301,45 +392,58 @@ impl KnowledgeStore {
         let mut result = query.await.map_err(surreal_err)?;
         let rows: Vec<GraphRow> = result.take(0).unwrap_or_default();
 
-        let matches = rows
-            .into_iter()
-            .map(|row| {
-                let created = |s: &str| {
-                    chrono::DateTime::parse_from_rfc3339(s)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now())
-                };
-
-                GraphMatch {
-                    source: Entity {
-                        id: row.source_id,
-                        entity_type: row.source.entity_type,
-                        name: row.source.name,
-                        properties: row.source.properties,
-                        created_at: created(&row.source.created_at),
-                        updated_at: created(&row.source.updated_at),
-                    },
-                    relation: Relation {
-                        source: row.relation_source,
-                        relation: row.relation.relation_type,
-                        target: row.relation_target,
-                        properties: row.relation.properties,
-                        confidence: row.relation.confidence,
-                        created_at: created(&row.relation.created_at),
-                    },
-                    target: Entity {
-                        id: row.target_id,
-                        entity_type: row.target.entity_type,
-                        name: row.target.name,
-                        properties: row.target.properties,
-                        created_at: created(&row.target.created_at),
-                        updated_at: created(&row.target.updated_at),
-                    },
-                }
-            })
-            .collect();
+        let matches = rows.into_iter().map(graph_row_to_match).collect();
 
         Ok(matches)
+    }
+
+    /// List entities for read-only graph inspection.
+    pub async fn list_entities(&self, offset: usize, limit: usize) -> OpenFangResult<Vec<Entity>> {
+        let sql = "SELECT meta::id(id) AS record_key, entity_type, name, properties, created_at, updated_at
+                   FROM entities
+                   ORDER BY updated_at DESC, created_at DESC
+                   LIMIT $lim START $off";
+
+        let mut result = self
+            .db
+            .query(sql)
+            .bind(("lim", limit))
+            .bind(("off", offset))
+            .await
+            .map_err(surreal_err)?;
+        let rows: Vec<EntityRow> = result.take(0).unwrap_or_default();
+        Ok(rows.into_iter().map(entity_row_to_entity).collect())
+    }
+
+    /// List graph relations for read-only graph inspection.
+    pub async fn list_relations(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> OpenFangResult<Vec<GraphMatch>> {
+        let sql = "SELECT
+                      in.* AS source,
+                      out.* AS target,
+                      { relation_type: relation_type, properties: properties,
+                        confidence: confidence, created_at: created_at } AS relation,
+                      meta::id(in) AS source_id,
+                      meta::id(out) AS target_id,
+                      meta::id(in) AS relation_source,
+                      meta::id(out) AS relation_target,
+                      created_at AS relation_created_at
+                   FROM `relations`
+                   ORDER BY created_at DESC
+                   LIMIT $lim START $off";
+
+        let mut result = self
+            .db
+            .query(sql)
+            .bind(("lim", limit))
+            .bind(("off", offset))
+            .await
+            .map_err(surreal_err)?;
+        let rows: Vec<GraphRow> = result.take(0).unwrap_or_default();
+        Ok(rows.into_iter().map(graph_row_to_match).collect())
     }
 
     /// Multi-hop graph traversal from a source entity using SurrealDB's `->` operator.

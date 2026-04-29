@@ -1,4 +1,5 @@
 # Voice Mode
+<!-- Static voice mode rules, human-authored -->
 
 When your input begins with `[VOICE MODE]`, the user is speaking to you and your response will be spoken aloud via text-to-speech.
 

@@ -68,9 +68,7 @@ async fn disk_manifest_wins_over_stale_db_after_restart() {
         toml::from_str(&disk_manifest_toml(0.2, "minimal")).expect("parse manifest");
     manifest.mcp_servers = vec![]; // avoid validation against live MCP in test
 
-    let _id = kernel
-        .spawn_agent(manifest)
-        .expect("spawn first");
+    let _id = kernel.spawn_agent(manifest).expect("spawn first");
     kernel.shutdown();
     std::mem::drop(kernel);
 

@@ -769,6 +769,42 @@ enum MemoryCommands {
         /// Key name.
         key: String,
     },
+    /// Inspect semantic memories or graph state for an agent.
+    Inspect {
+        /// Agent name or ID.
+        #[arg(long)]
+        agent: String,
+        /// Inspect graph entities/relations instead of semantic fragments.
+        #[arg(long)]
+        graph: bool,
+        /// Filter semantic memories by scope.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Filter semantic memories by metadata.category.
+        #[arg(long)]
+        category: Option<String>,
+        /// Filter semantic memories by metadata.classification_source.
+        #[arg(long = "classification-source")]
+        classification_source: Option<String>,
+        /// Filter semantic memories created since an RFC3339 timestamp or relative duration (e.g. 1h, 2d).
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter semantic memories created until an RFC3339 timestamp or relative duration (e.g. 1h, 2d).
+        #[arg(long)]
+        until: Option<String>,
+        /// Substring query for semantic memory content.
+        #[arg(long)]
+        q: Option<String>,
+        /// Maximum records to return (max 200).
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        /// Pagination offset.
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
     /// Re-run NER, classification, and metadata enrichment on existing memories.
     Backfill {
         /// Restrict to a specific agent (name or UUID). Omit to process all agents.
@@ -1125,6 +1161,31 @@ fn main() {
             MemoryCommands::Get { agent, key, json } => cmd_memory_get(&agent, &key, json),
             MemoryCommands::Set { agent, key, value } => cmd_memory_set(&agent, &key, &value),
             MemoryCommands::Delete { agent, key } => cmd_memory_delete(&agent, &key),
+            MemoryCommands::Inspect {
+                agent,
+                graph,
+                scope,
+                category,
+                classification_source,
+                since,
+                until,
+                q,
+                limit,
+                offset,
+                json,
+            } => cmd_memory_inspect(
+                &agent,
+                graph,
+                scope.as_deref(),
+                category.as_deref(),
+                classification_source.as_deref(),
+                since.as_deref(),
+                until.as_deref(),
+                q.as_deref(),
+                limit,
+                offset,
+                json,
+            ),
             MemoryCommands::Backfill {
                 agent,
                 dry_run,
@@ -6509,6 +6570,182 @@ fn cmd_memory_delete(agent: &str, key: &str) {
         ));
     } else {
         ui::success(&format!("Deleted key '{key}' for agent '{agent}'."));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_memory_inspect(
+    agent: &str,
+    graph: bool,
+    scope: Option<&str>,
+    category: Option<&str>,
+    classification_source: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+    q: Option<&str>,
+    limit: usize,
+    offset: usize,
+    json: bool,
+) {
+    let base = require_daemon("memory inspect");
+    let client = daemon_client();
+
+    let mut params = vec![("limit", limit.to_string()), ("offset", offset.to_string())];
+    if let Some(scope) = scope {
+        params.push(("scope", scope.to_string()));
+    }
+    if let Some(category) = category {
+        params.push(("category", category.to_string()));
+    }
+    if let Some(classification_source) = classification_source {
+        params.push(("classification_source", classification_source.to_string()));
+    }
+    if let Some(since) = since {
+        params.push(("since", parse_memory_inspect_time(since)));
+    }
+    if let Some(until) = until {
+        params.push(("until", parse_memory_inspect_time(until)));
+    }
+    if let Some(q) = q {
+        params.push(("q", q.to_string()));
+    }
+
+    let endpoint = if graph { "graph" } else { "semantic" };
+    let body = daemon_json(
+        client
+            .get(format!("{base}/api/memory/agents/{agent}/{endpoint}"))
+            .query(&params)
+            .send(),
+    );
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
+        return;
+    }
+    if let Some(error) = body.get("error").and_then(|v| v.as_str()) {
+        ui::error(error);
+        return;
+    }
+    if graph {
+        print_graph_inspection(&body);
+    } else {
+        print_semantic_inspection(&body);
+    }
+}
+
+fn parse_memory_inspect_time(value: &str) -> String {
+    if chrono::DateTime::parse_from_rfc3339(value).is_ok() {
+        return value.to_string();
+    }
+
+    let (amount, unit) = value.split_at(value.len().saturating_sub(1));
+    let Ok(amount) = amount.parse::<i64>() else {
+        ui::error(&format!(
+            "Invalid time '{value}'. Use RFC3339 or a relative duration like 1h, 30m, 2d."
+        ));
+        std::process::exit(2);
+    };
+    let duration = match unit {
+        "m" => chrono::Duration::minutes(amount),
+        "h" => chrono::Duration::hours(amount),
+        "d" => chrono::Duration::days(amount),
+        _ => {
+            ui::error(&format!(
+                "Invalid time '{value}'. Use RFC3339 or a relative duration like 1h, 30m, 2d."
+            ));
+            std::process::exit(2);
+        }
+    };
+    (chrono::Utc::now() - duration).to_rfc3339()
+}
+
+fn print_semantic_inspection(body: &serde_json::Value) {
+    let memories = body
+        .get("memories")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if memories.is_empty() {
+        println!("No semantic memories matched.");
+        return;
+    }
+
+    println!(
+        "{:<25} {:<12} {:<12} {:<8} CONTENT",
+        "CREATED", "SCOPE", "CATEGORY", "SOURCE"
+    );
+    println!("{}", "-".repeat(90));
+    for memory in memories {
+        let content = memory["content"]
+            .as_str()
+            .unwrap_or("")
+            .replace(['\n', '\r'], " ");
+        let category = memory["category"].as_str().unwrap_or("-");
+        let source = memory["classification_source"].as_str().unwrap_or("-");
+        println!(
+            "{:<25} {:<12} {:<12} {:<8} {}",
+            memory["created_at"]
+                .as_str()
+                .unwrap_or("-")
+                .chars()
+                .take(25)
+                .collect::<String>(),
+            memory["scope"].as_str().unwrap_or("-"),
+            category,
+            source,
+            content.chars().take(80).collect::<String>()
+        );
+    }
+}
+
+fn print_graph_inspection(body: &serde_json::Value) {
+    let entity_count = body["entity_count"].as_u64().unwrap_or(0);
+    let relation_count = body["relation_count"].as_u64().unwrap_or(0);
+    println!("Entities: {entity_count}  Relations: {relation_count}");
+
+    if let Some(entities) = body["entities"].as_array() {
+        if !entities.is_empty() {
+            println!("\nEntities");
+            println!("{:<24} {:<18} NAME", "ID", "TYPE");
+            println!("{}", "-".repeat(70));
+            for entity in entities.iter().take(20) {
+                println!(
+                    "{:<24} {:<18} {}",
+                    entity["id"]
+                        .as_str()
+                        .unwrap_or("-")
+                        .chars()
+                        .take(24)
+                        .collect::<String>(),
+                    entity["entity_type"].as_str().unwrap_or("-"),
+                    entity["name"].as_str().unwrap_or("-")
+                );
+            }
+        }
+    }
+
+    if let Some(relations) = body["relations"].as_array() {
+        if !relations.is_empty() {
+            println!("\nRelations");
+            println!("{:<22} {:<16} TARGET", "SOURCE", "RELATION");
+            println!("{}", "-".repeat(70));
+            for relation in relations.iter().take(20) {
+                println!(
+                    "{:<22} {:<16} {}",
+                    relation["source"]["name"]
+                        .as_str()
+                        .unwrap_or("-")
+                        .chars()
+                        .take(22)
+                        .collect::<String>(),
+                    relation["relation"]["relation"].as_str().unwrap_or("-"),
+                    relation["target"]["name"].as_str().unwrap_or("-")
+                );
+            }
+        }
     }
 }
 

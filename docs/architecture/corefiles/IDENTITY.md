@@ -1,3 +1,4 @@
+<!-- Visual identity and personality at a glance. Edit these fields freely. -->
 ---
 name: 
 archetype: 
@@ -8,4 +9,3 @@ greeting_style:
 color:
 ---
 # Identity
-<!-- Visual identity and personality at a glance. Edit these fields freely. -->

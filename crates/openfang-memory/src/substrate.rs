@@ -23,25 +23,48 @@ use openfang_types::memory::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use surrealdb::types::SurrealValue;
 
 fn surreal_err(e: surrealdb::Error) -> OpenFangError {
     OpenFangError::Memory(e.to_string())
 }
 
+macro_rules! surreal_via_json {
+    ($t:ty) => {
+        impl surrealdb::types::SurrealValue for $t {
+            fn kind_of() -> surrealdb::types::Kind {
+                surrealdb::types::Kind::Any
+            }
+
+            fn into_value(self) -> surrealdb::types::Value {
+                let json = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+                surrealdb::types::SurrealValue::into_value(json)
+            }
+
+            fn from_value(value: surrealdb::types::Value) -> Result<Self, surrealdb::types::Error> {
+                let json = value.into_json_value();
+                serde_json::from_value(json)
+                    .map_err(|e| surrealdb::types::Error::internal(e.to_string()))
+            }
+        }
+    };
+}
+
 /// Paired device record for SurrealDB persistence.
-#[derive(Debug, Serialize, Deserialize, SurrealValue)]
+#[derive(Debug, Serialize, Deserialize)]
 struct PairedDeviceRecord {
     device_id: String,
     display_name: String,
     platform: String,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     paired_at: String,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     last_seen: String,
     push_token: Option<String>,
 }
+surreal_via_json!(PairedDeviceRecord);
 
 /// Task queue record for SurrealDB persistence.
-#[derive(Debug, Serialize, Deserialize, SurrealValue)]
+#[derive(Debug, Serialize, Deserialize)]
 struct TaskRecord {
     title: String,
     description: String,
@@ -49,10 +72,16 @@ struct TaskRecord {
     priority: i64,
     assigned_to: String,
     created_by: String,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     created_at: String,
+    #[serde(
+        default,
+        deserialize_with = "openfang_types::datetime::deserialize_optional_rfc3339_string"
+    )]
     completed_at: Option<String>,
     result: Option<String>,
 }
+surreal_via_json!(TaskRecord);
 
 /// The unified memory substrate. Implements the `Memory` trait by delegating
 /// to specialized stores backed by a shared SurrealDB handle.
@@ -377,6 +406,17 @@ impl MemorySubstrate {
             })
             .await
             .map_err(surreal_err)?;
+        self.db
+            .query(
+                "UPDATE type::record('paired_devices', $device_id)
+                 SET paired_at = type::datetime($paired_at),
+                     last_seen = type::datetime($last_seen)",
+            )
+            .bind(("device_id", device_id.to_string()))
+            .bind(("paired_at", paired_at.to_string()))
+            .bind(("last_seen", last_seen.to_string()))
+            .await
+            .map_err(surreal_err)?;
         Ok(())
     }
 
@@ -459,6 +499,49 @@ impl MemorySubstrate {
         limit: usize,
     ) -> OpenFangResult<Vec<openfang_types::memory::MemoryFragment>> {
         self.semantic.list_fragments(agent_id, offset, limit).await
+    }
+
+    /// Inspect non-deleted semantic fragments without mutating access stats.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn inspect_fragments(
+        &self,
+        agent_id: AgentId,
+        offset: usize,
+        limit: usize,
+        query: Option<&str>,
+        scope: Option<&str>,
+        category: Option<&str>,
+        classification_source: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> OpenFangResult<Vec<openfang_types::memory::MemoryFragment>> {
+        self.semantic
+            .inspect_fragments(
+                agent_id,
+                offset,
+                limit,
+                query,
+                scope,
+                category,
+                classification_source,
+                since,
+                until,
+            )
+            .await
+    }
+
+    /// List graph entities for read-only inspection.
+    pub async fn list_entities(&self, offset: usize, limit: usize) -> OpenFangResult<Vec<Entity>> {
+        self.knowledge.list_entities(offset, limit).await
+    }
+
+    /// List graph relations for read-only inspection.
+    pub async fn list_relations(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> OpenFangResult<Vec<GraphMatch>> {
+        self.knowledge.list_relations(offset, limit).await
     }
 
     /// Multi-hop graph traversal from a source entity (up to 3 hops).
@@ -595,10 +678,19 @@ impl MemorySubstrate {
                 priority: 0,
                 assigned_to: assigned_to.unwrap_or("").to_string(),
                 created_by: created_by.unwrap_or("").to_string(),
-                created_at: now,
+                created_at: now.clone(),
                 completed_at: None,
                 result: None,
             })
+            .await
+            .map_err(surreal_err)?;
+        self.db
+            .query(
+                "UPDATE type::record('task_queue', $id)
+                 SET created_at = type::datetime($created_at)",
+            )
+            .bind(("id", id.clone()))
+            .bind(("created_at", now))
             .await
             .map_err(surreal_err)?;
         Ok(id)
@@ -649,15 +741,13 @@ impl MemorySubstrate {
 
     /// Mark a task as completed with a result string.
     pub async fn task_complete(&self, task_id: &str, result: &str) -> OpenFangResult<()> {
-        let now = chrono::Utc::now().to_rfc3339();
         self.db
             .query(
                 "UPDATE type::record('task_queue', $tid)
-                 SET status = 'completed', result = $result, completed_at = $now",
+                 SET status = 'completed', result = $result, completed_at = time::now()",
             )
             .bind(("tid", task_id.to_string()))
             .bind(("result", result.to_string()))
-            .bind(("now", now))
             .await
             .map_err(surreal_err)?;
         Ok(())

@@ -560,13 +560,25 @@ pub async fn run_agent_loop(
                 let diff = now.signed_duration_since(m.created_at);
                 let time_str = if diff.num_days() > 0 {
                     let days = diff.num_days();
-                    if days == 1 { "1 day ago".to_string() } else { format!("{days} days ago") }
+                    if days == 1 {
+                        "1 day ago".to_string()
+                    } else {
+                        format!("{days} days ago")
+                    }
                 } else if diff.num_hours() > 0 {
                     let hours = diff.num_hours();
-                    if hours == 1 { "1 hour ago".to_string() } else { format!("{hours} hours ago") }
+                    if hours == 1 {
+                        "1 hour ago".to_string()
+                    } else {
+                        format!("{hours} hours ago")
+                    }
                 } else if diff.num_minutes() > 0 {
                     let mins = diff.num_minutes();
-                    if mins == 1 { "1 minute ago".to_string() } else { format!("{mins} minutes ago") }
+                    if mins == 1 {
+                        "1 minute ago".to_string()
+                    } else {
+                        format!("{mins} minutes ago")
+                    }
                 } else {
                     "Just now".to_string()
                 };

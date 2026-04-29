@@ -36,8 +36,8 @@ DEFINE FIELD IF NOT EXISTS agent_id ON sessions TYPE string;
 DEFINE FIELD IF NOT EXISTS messages ON sessions TYPE array;
 DEFINE FIELD IF NOT EXISTS context_window_tokens ON sessions TYPE int;
 DEFINE FIELD IF NOT EXISTS label ON sessions TYPE option<string> | null;
-DEFINE FIELD IF NOT EXISTS created_at ON sessions TYPE string;
-DEFINE FIELD IF NOT EXISTS updated_at ON sessions TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON sessions TYPE any;
+DEFINE FIELD IF NOT EXISTS updated_at ON sessions TYPE any;
 
 -- Canonical sessions table
 DEFINE TABLE IF NOT EXISTS canonical_sessions SCHEMALESS;
@@ -45,7 +45,7 @@ DEFINE FIELD IF NOT EXISTS agent_id ON canonical_sessions TYPE string;
 DEFINE FIELD IF NOT EXISTS messages ON canonical_sessions TYPE array;
 DEFINE FIELD IF NOT EXISTS compaction_cursor ON canonical_sessions TYPE int;
 DEFINE FIELD IF NOT EXISTS compacted_summary ON canonical_sessions TYPE option<string> | null;
-DEFINE FIELD IF NOT EXISTS updated_at ON canonical_sessions TYPE string;
+DEFINE FIELD IF NOT EXISTS updated_at ON canonical_sessions TYPE any;
 
 -- Memories table (semantic store)
 DEFINE TABLE IF NOT EXISTS memories SCHEMALESS;
@@ -55,8 +55,8 @@ DEFINE FIELD IF NOT EXISTS source ON memories TYPE any;
 DEFINE FIELD IF NOT EXISTS scope ON memories TYPE string;
 DEFINE FIELD IF NOT EXISTS confidence ON memories TYPE float;
 DEFINE FIELD IF NOT EXISTS metadata ON memories TYPE object FLEXIBLE;
-DEFINE FIELD IF NOT EXISTS created_at ON memories TYPE string;
-DEFINE FIELD IF NOT EXISTS accessed_at ON memories TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON memories TYPE any;
+DEFINE FIELD IF NOT EXISTS accessed_at ON memories TYPE any;
 DEFINE FIELD IF NOT EXISTS access_count ON memories TYPE int;
 DEFINE FIELD IF NOT EXISTS deleted ON memories TYPE bool;
 DEFINE FIELD IF NOT EXISTS embedding ON memories TYPE option<array<float>> | null DEFAULT NONE;
@@ -79,7 +79,7 @@ DEFINE FIELD IF NOT EXISTS agent_id ON kv TYPE string;
 DEFINE FIELD IF NOT EXISTS key ON kv TYPE string;
 DEFINE FIELD IF NOT EXISTS value ON kv TYPE any;
 DEFINE FIELD IF NOT EXISTS version ON kv TYPE int;
-DEFINE FIELD IF NOT EXISTS updated_at ON kv TYPE string;
+DEFINE FIELD IF NOT EXISTS updated_at ON kv TYPE any;
 
 -- Agents table (data is double-serialized JSON string)
 DEFINE TABLE IF NOT EXISTS agents SCHEMALESS;
@@ -95,30 +95,30 @@ DEFINE FIELD IF NOT EXISTS input_tokens ON usage TYPE int;
 DEFINE FIELD IF NOT EXISTS output_tokens ON usage TYPE int;
 DEFINE FIELD IF NOT EXISTS cost_usd ON usage TYPE float;
 DEFINE FIELD IF NOT EXISTS event_type ON usage TYPE string;
-DEFINE FIELD IF NOT EXISTS created_at ON usage TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON usage TYPE any;
 
 -- Entities table (knowledge graph nodes)
 DEFINE TABLE IF NOT EXISTS entities SCHEMALESS;
 DEFINE FIELD IF NOT EXISTS entity_type ON entities TYPE any;
 DEFINE FIELD IF NOT EXISTS name ON entities TYPE string;
 DEFINE FIELD IF NOT EXISTS properties ON entities TYPE object FLEXIBLE;
-DEFINE FIELD IF NOT EXISTS created_at ON entities TYPE string;
-DEFINE FIELD IF NOT EXISTS updated_at ON entities TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON entities TYPE any;
+DEFINE FIELD IF NOT EXISTS updated_at ON entities TYPE any;
 
 -- Relations table (knowledge graph edges)
 DEFINE TABLE IF NOT EXISTS relations TYPE RELATION SCHEMALESS;
 DEFINE FIELD IF NOT EXISTS relation_type ON relations TYPE any;
 DEFINE FIELD IF NOT EXISTS properties ON relations TYPE object FLEXIBLE;
 DEFINE FIELD IF NOT EXISTS confidence ON relations TYPE float;
-DEFINE FIELD IF NOT EXISTS created_at ON relations TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at ON relations TYPE any;
 
 -- Paired devices
 DEFINE TABLE IF NOT EXISTS paired_devices SCHEMALESS;
 DEFINE FIELD IF NOT EXISTS device_id ON paired_devices TYPE string;
 DEFINE FIELD IF NOT EXISTS display_name ON paired_devices TYPE string;
 DEFINE FIELD IF NOT EXISTS platform ON paired_devices TYPE string;
-DEFINE FIELD IF NOT EXISTS paired_at ON paired_devices TYPE string;
-DEFINE FIELD IF NOT EXISTS last_seen ON paired_devices TYPE string;
+DEFINE FIELD IF NOT EXISTS paired_at ON paired_devices TYPE any;
+DEFINE FIELD IF NOT EXISTS last_seen ON paired_devices TYPE any;
 DEFINE FIELD IF NOT EXISTS push_token ON paired_devices TYPE option<string> | null;
 
 -- Task queue
@@ -129,8 +129,8 @@ DEFINE FIELD IF NOT EXISTS status ON task_queue TYPE string;
 DEFINE FIELD IF NOT EXISTS priority ON task_queue TYPE int;
 DEFINE FIELD IF NOT EXISTS assigned_to ON task_queue TYPE string;
 DEFINE FIELD IF NOT EXISTS created_by ON task_queue TYPE string;
-DEFINE FIELD IF NOT EXISTS created_at ON task_queue TYPE string;
-DEFINE FIELD IF NOT EXISTS completed_at ON task_queue TYPE option<string> | null;
+DEFINE FIELD IF NOT EXISTS created_at ON task_queue TYPE any;
+DEFINE FIELD IF NOT EXISTS completed_at ON task_queue TYPE any;
 DEFINE FIELD IF NOT EXISTS result ON task_queue TYPE option<string> | null;
 
 -- Secondary indexes for common filter patterns

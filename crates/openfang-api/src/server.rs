@@ -322,6 +322,14 @@ pub async fn build_router(
                 .delete(routes::delete_agent_kv_key),
         )
         .route(
+            "/api/memory/agents/{id}/semantic",
+            axum::routing::get(routes::get_agent_semantic_memory),
+        )
+        .route(
+            "/api/memory/agents/{id}/graph",
+            axum::routing::get(routes::get_agent_graph_memory),
+        )
+        .route(
             "/api/memory/backfill",
             axum::routing::post(routes::memory_backfill),
         )
