@@ -45,6 +45,7 @@ Lateral crates (depended on by kernel): `openfang-channels` (40 adapters), `open
 - **Capability-based security**: Every agent operation is checked against granted capabilities before execution.
 - **Config**: `KernelConfig` in `openfang-types/src/config.rs` is the single source of truth. All config structs use `#[serde(default)]` for forward-compatible partial TOML.
 - **Candle integration** (optional `memory-candle` feature): in-process CUDA inference for embeddings, NER, reranking on local GPU. Patched `candle-kernels` for GTX 970 CC 5.2.
+- **Memory architecture vocabulary**: Use `/mnt/ops/canon/openfang/memory-intelligence.md` for the current substrate/access/intelligence framework. New docs should describe memory subsystems by storage substrate, access pattern, and intelligence backend instead of the old Layer 1/2/3 terminology.
 
 ## Code Style
 

@@ -1,4 +1,5 @@
 # First-Run Bootstrap
+<!-- Static first-run protocol, human-authored -->
 
 On your FIRST conversation with a new user, follow this protocol:
 
