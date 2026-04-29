@@ -999,7 +999,7 @@ pub async fn run_agent_loop(
                                     &interaction_text,
                                     MemorySource::Conversation,
                                     mem_scope,
-                                    HashMap::new(),
+                                    mem_meta,
                                 )
                                 .await
                             {
@@ -1018,7 +1018,7 @@ pub async fn run_agent_loop(
                             &interaction_text,
                             MemorySource::Conversation,
                             mem_scope,
-                            HashMap::new(),
+                            mem_meta,
                         )
                         .await
                     {
@@ -2484,7 +2484,7 @@ pub async fn run_agent_loop_streaming(
                                     &interaction_text,
                                     MemorySource::Conversation,
                                     mem_scope_s,
-                                    HashMap::new(),
+                                    mem_meta_s,
                                 )
                                 .await
                             {
@@ -2503,7 +2503,7 @@ pub async fn run_agent_loop_streaming(
                             &interaction_text,
                             MemorySource::Conversation,
                             mem_scope_s,
-                            HashMap::new(),
+                            mem_meta_s,
                         )
                         .await
                     {
@@ -3801,6 +3801,7 @@ pub fn deduplicate_tool_calls(response: &crate::llm_driver::CompletionResponse) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::{EmbeddingDriver, EmbeddingError};
     use crate::llm_driver::{CompletionResponse, LlmError};
     use async_trait::async_trait;
     use openfang_types::tool::ToolCall;
@@ -4062,6 +4063,21 @@ mod tests {
         }
     }
 
+    struct FailingEmbeddingDriver;
+
+    #[async_trait]
+    impl EmbeddingDriver for FailingEmbeddingDriver {
+        async fn embed(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Err(EmbeddingError::Parse(
+                "forced embedding failure".to_string(),
+            ))
+        }
+
+        fn dimensions(&self) -> usize {
+            384
+        }
+    }
+
     #[tokio::test]
     async fn test_empty_response_after_tool_use_returns_fallback() {
         let memory = openfang_memory::MemorySubstrate::open_in_memory()
@@ -4300,6 +4316,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_embedding_fallback_preserves_classification_metadata() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = openfang_memory::session::Session {
+            id: openfang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        let manifest = test_manifest();
+        let driver: Arc<dyn LlmDriver> = Arc::new(NormalDriver);
+        let embedding = FailingEmbeddingDriver;
+
+        let result = run_agent_loop(
+            &manifest,
+            "Say hello",
+            &mut session,
+            &memory,
+            driver,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&embedding),
+            #[cfg(feature = "memory-candle")]
+            None,
+            #[cfg(feature = "memory-candle")]
+            None,
+            #[cfg(feature = "memory-candle")]
+            None,
+            None,
+            None, // on_phase
+            None, // media_engine
+            None, // tts_engine
+            None, // docker_config
+            None, // hooks
+            None, // context_window_tokens
+            None, // process_manager
+            None, // user_content_blocks
+        )
+        .await
+        .expect("Loop should complete without error");
+
+        assert_eq!(result.response, "Hello from the agent!");
+        let fragments = memory
+            .inspect_fragments(agent_id, 0, 10, None, None, None, None, None, None)
+            .await
+            .expect("memory inspection should work");
+        let fragment = fragments
+            .into_iter()
+            .find(|fragment| fragment.content.contains("Hello from the agent!"))
+            .expect("interaction memory should be written");
+        assert_eq!(fragment.scope, openfang_types::memory::scope::EPISODIC);
+        assert_eq!(
+            fragment
+                .metadata
+                .get("classification_source")
+                .and_then(|value| value.as_str()),
+            Some("rule")
+        );
+        assert_eq!(
+            fragment
+                .metadata
+                .get("category")
+                .and_then(|value| value.as_str()),
+            Some(openfang_types::memory::category::FACT)
+        );
+        assert!(fragment.metadata.contains_key("session_id"));
+        assert!(fragment.metadata.contains_key("priority"));
+    }
+
+    #[tokio::test]
     async fn test_streaming_empty_response_after_tool_use_returns_fallback() {
         let memory = openfang_memory::MemorySubstrate::open_in_memory()
             .await
@@ -4359,6 +4452,85 @@ mod tests {
             "Expected fallback message in streaming, got: {:?}",
             result.response
         );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_embedding_fallback_preserves_classification_metadata() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = openfang_memory::session::Session {
+            id: openfang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        let manifest = test_manifest();
+        let driver: Arc<dyn LlmDriver> = Arc::new(NormalDriver);
+        let embedding = FailingEmbeddingDriver;
+        let (tx, _rx) = mpsc::channel(64);
+
+        let result = run_agent_loop_streaming(
+            &manifest,
+            "Say hello",
+            &mut session,
+            &memory,
+            driver,
+            &[],
+            None,
+            tx,
+            None,
+            None,
+            None,
+            None,
+            Some(&embedding),
+            #[cfg(feature = "memory-candle")]
+            None,
+            #[cfg(feature = "memory-candle")]
+            None,
+            #[cfg(feature = "memory-candle")]
+            None,
+            None,
+            None, // on_phase
+            None, // media_engine
+            None, // tts_engine
+            None, // docker_config
+            None, // hooks
+            None, // context_window_tokens
+            None, // process_manager
+            None, // user_content_blocks
+        )
+        .await
+        .expect("Streaming loop should complete without error");
+
+        assert_eq!(result.response, "Hello from the agent!");
+        let fragments = memory
+            .inspect_fragments(agent_id, 0, 10, None, None, None, None, None, None)
+            .await
+            .expect("memory inspection should work");
+        let fragment = fragments
+            .into_iter()
+            .find(|fragment| fragment.content.contains("Hello from the agent!"))
+            .expect("interaction memory should be written");
+        assert_eq!(fragment.scope, openfang_types::memory::scope::EPISODIC);
+        assert_eq!(
+            fragment
+                .metadata
+                .get("classification_source")
+                .and_then(|value| value.as_str()),
+            Some("rule")
+        );
+        assert_eq!(
+            fragment
+                .metadata
+                .get("category")
+                .and_then(|value| value.as_str()),
+            Some(openfang_types::memory::category::FACT)
+        );
+        assert!(fragment.metadata.contains_key("session_id"));
+        assert!(fragment.metadata.contains_key("priority"));
     }
 
     /// Mock driver that returns empty text on first call (EndTurn), then normal text on second.
