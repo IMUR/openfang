@@ -17,7 +17,7 @@ An asynchronous agent runtime, CLI, and daemon for persistent, multi-agent AI in
 | `crates/openfang-runtime/src/model_catalog.rs` | ~198 built-in model definitions                            |
 | `crates/openfang-memory/src/db.rs`             | SurrealDB DDL and substrate setup                          |
 | `references/schema-ddl.md`                     | Full SurrealDB schema with field-level docs                |
-| `/mnt/ops/canon/openfang/memory-intelligence.md` | Current memory architecture: substrate/access/intelligence framework |
+| `/mnt/ops/canon/openfang/memory-intelligence.md` | Current memory architecture dimensions: substrate, data model, contract, intelligence |
 
 
 ## Core Concepts
@@ -60,7 +60,7 @@ The core is **Rust-first**. These rules apply to one-off scripts (linters, teste
   ```bash
    cargo build --release --features memory-candle -p openfang-cli
   ```
-11. **Memory architecture vocabulary:** Use the canon framework in `/mnt/ops/canon/openfang/memory-intelligence.md`: every memory subsystem is described by storage substrate (dynamic SurrealDB vs static workspace files), access pattern (automatic, explicit, authoritative), and intelligence backend (embedding, NER, classifier, reranker, or none). Avoid reintroducing the old Layer 1/2/3 terminology in new docs.
+11. **Memory architecture vocabulary:** Use the dimensions framework in `/mnt/ops/canon/openfang/memory-intelligence.md`: every memory surface is described by substrate, data model, contract, and intelligence. Multi-value placements are expected. Avoid reintroducing the old Layer 1/2/3 terminology in new docs.
 12. **Memory metadata verification:** Verify semantic memory metadata through `GET /api/memory/agents/{id}/semantic` or `openfang memory inspect`, not through SurrealKV/WAL string inspection. WAL inspection is a last-resort debug tool, not a verification path.
 
 ### Configuration authority (operators)

@@ -147,9 +147,9 @@ All four GPUs on prtr are pre-Volta (CC 5.2/6.1) with no Tensor Cores. CPU infer
 
 ## Agent Interface to Memory
 
-Agents interact with the memory system through **three distinct layers**. Understanding which layer does what matters when debugging context issues or extending agent behaviour.
+Agents interact with the memory system through distinct contracts. Understanding which contract does what matters when debugging context issues or extending agent behaviour. The canonical dimensions framing lives in `/mnt/ops/canon/openfang/memory-intelligence.md`.
 
-### Layer 1 — Automatic Pre-Turn Injection (transparent, semantic store)
+### Context Contract — Automatic Pre-Turn Injection (transparent, semantic store)
 
 At the start of every turn, before the LLM is called, `agent_loop.rs` automatically runs a full recall pipeline against the user's message and appends the results to the system prompt as a `## Memory` section. The agent never explicitly requests this — it just sees recalled memories as part of its instructions.
 
@@ -161,22 +161,22 @@ The recall pipeline in order:
 4. Scope-weighted stable-sort (`semantic` first, then `declarative`, then `episodic`)
 5. Top-5 fragments injected via `prompt_builder::build_memory_section()` with semantic scope and relative timestamp metadata (e.g., `[Episodic - 3 days ago]`).
 
-This layer queries the **semantic store** (`memories` table — HNSW + BM25). It is assembled in `crates/openfang-runtime/src/prompt_builder.rs` and `agent_loop.rs`.
+This contract queries the **semantic store** (`memories` table — HNSW + BM25). It is assembled in `crates/openfang-runtime/src/prompt_builder.rs` and `agent_loop.rs`.
 
-### Layer 2 — Explicit Tool Calls (agent-driven, KV store)
+### Tool Contract — Explicit Tool Calls (agent-driven, KV store)
 
 Agents are granted up to four memory tools depending on their manifest capabilities:
 
 
 | Tool                       | Store                     | Operation                                      |
 | -------------------------- | ------------------------- | ---------------------------------------------- |
-| `memory_store(key, value)` | **KV store** (`kv` table) | Write a structured key/value fact              |
-| `memory_recall(key)`       | **KV store** (`kv` table) | Read a specific key by name                    |
+| `memory_set(key, value)`   | **KV store** (`kv` table) | Write a structured key/value fact              |
+| `memory_get(key)`          | **KV store** (`kv` table) | Read a specific key by name                    |
 | `memory_delete(key)`       | **KV store** (`kv` table) | Remove a key                                   |
 | `memory_list(namespace)`   | **KV store** (`kv` table) | Enumerate stored keys (`"self"` or `"shared"`) |
 
 
-**Critical distinction:** tool-driven memory targets the **KV store** (`structured_get` / `structured_set`), not the semantic store. The automatic pre-turn injection (Layer 1) targets the **semantic store** (HNSW/BM25). These are two completely separate SurrealDB tables with different access patterns. An agent can `memory_store` a fact via tool call and then see it surfaced automatically next turn via vector recall only if it was also written to the semantic store during the agent loop's write path — the KV store is not vectorised.
+**Critical distinction:** tool-driven exact-key memory targets the **KV store** (`structured_get` / `structured_set`), not the semantic store. Automatic pre-turn injection targets the **semantic store** (HNSW/BM25). These are two completely separate SurrealDB tables with different contracts. An agent can `memory_set` a fact via tool call and then see it surfaced automatically next turn via vector recall only if that fact is also represented in the semantic store during the agent loop's write path — the KV store is not vectorised.
 
 #### Namespace Routing
 
@@ -200,7 +200,7 @@ Every tool call passes through `KernelHandle` where the kernel enforces capabili
 ```
 tool_runner.rs                          kernel.rs
 ─────────────                           ──────────
-tool_memory_store(input, kernel, id)
+tool_memory_set(input, kernel, id)
   → kernel.memory_store(agent_id, key, value)
                                         1. Parse agent_id → AgentId
                                         2. is_system_principal(caller)?
@@ -229,7 +229,7 @@ WASM agents go through the same enforcement path: `host_functions.rs` (`host_kv_
 
 Implementation: `crates/openfang-runtime/src/tool_runner.rs` (dispatch + tool definitions), `crates/openfang-kernel/src/kernel.rs` (`KernelHandle` impl, `resolve_memory_namespace`, `is_system_principal`).
 
-Typical use: agents use `memory_store` to persist structured user preferences (`self.user_name`, `self.preferred_language`, etc.) that they want to look up by exact key in future sessions.
+Typical use: agents use `memory_set` to persist structured user preferences (`self.user_name`, `self.preferred_language`, etc.) that they want to look up by exact key in future sessions.
 
 #### Boot-time KV migrations
 
@@ -248,7 +248,7 @@ Idempotency is gated on the marker — if `__openfang_schedules_migrated_v1 == t
 
 Entries pointing at unresolved agent IDs are skipped and logged at `warn` — the migration succeeds partially rather than aborting. Successful migrations trigger `cron_scheduler.persist()`.
 
-### Layer 3 — Static Workspace Context Files (loaded at session build time)
+### Filesystem Context Contract — Static Workspace Context Files (loaded at session build time)
 
 When a session is built, the kernel loads a set of markdown files from the agent's workspace directory (`~/.openfang/workspaces/<workspace>/`) and injects them as static sections in the system prompt via `PromptContext`. These are loaded once — not queried per turn.
 
@@ -388,7 +388,7 @@ Kernel background loop (start_background_agents)
 
 ## Memory Scope Vocabulary
 
-All memories carry a `scope` field that drives weighted recall. As of the recent prompt architecture update, this scope (along with relative timestamps) is injected directly into the agent's prompt during `Layer 1` pre-turn injection, allowing the LLM to differentiate between its own raw conversation history and curated facts.
+All memories carry a `scope` field that drives weighted recall. This scope (along with relative timestamps) is injected directly into the agent's prompt during context-contract pre-turn injection, allowing the LLM to differentiate between its own raw conversation history and curated facts.
 
 
 | Scope         | Source           | Written By                          | Description                              |
@@ -440,7 +440,7 @@ OpenFangKernel
 |
 +- capabilities: CapabilityManager
 |       enforces MemoryRead / MemoryWrite per agent per key
-|       consulted by memory_store, memory_recall, memory_list, memory_delete
+|       consulted by memory_set, memory_get, memory_list, memory_delete
 |
 +- populate_knowledge_graph(agent_id, text, memory_id)
         called after agent loop returns (streaming: background spawn; non-streaming: inline)
@@ -449,8 +449,8 @@ KernelHandle (trait, defined in openfang-runtime/src/kernel_handle.rs)
 +- SYSTEM_AGENT_ID: &str = "00000000-0000-0000-0000-000000000001"
 |       system principal — bypasses per-key capability checks
 |
-+- memory_store(agent_id, key, value)    capability-checked, namespace-routed
-+- memory_recall(agent_id, key)          capability-checked, namespace-routed
++- memory_set(agent_id, key, value)      capability-checked, namespace-routed
++- memory_get(agent_id, key)             capability-checked, namespace-routed
 +- memory_list(agent_id, namespace)       capability-checked, namespace = "self" | "shared"
 +- memory_delete(agent_id, key)          capability-checked, namespace-routed
 
@@ -583,7 +583,7 @@ All four subsystems active on CPU. Verify via `/api/health/detail`.
 
 - **Candle Classifier (`distilbert`)**: The `candle_classifier` was updated to dynamically parse the architecture from `config.json` (checking for `"dim"` vs `"hidden_size"`) to support both `BertModel` and `DistilBertModel` wrappers. This resolved the "missing field hidden_size" error on boot.
 - **SurrealDB `DISTINCT` Compatibility**: The consolidation backfill query was updated from `SELECT DISTINCT agent_id FROM memories` to `SELECT agent_id FROM memories WHERE deleted = false GROUP BY agent_id` to comply with the embedded SurrealDB engine's parser, resolving `500 Internal Server Error`s during CLI backfills.
-- **The "Agent's Perspective"**: Because Layer 1 (Semantic Recall) operates completely transparently before the LLM prompt is assembled, agents interacting with the system often cannot distinguish between raw conversation history and HNSW-surfaced semantic memories. The prompt masks the complexity of the HNSW + Cross-Encoder reranking happening underneath. When auditing the system from the "outside," it may incorrectly appear as if memory is a "flat dump" or that vector search is disabled.
+- **The "Agent's Perspective"**: Because context-contract semantic recall operates completely transparently before the LLM prompt is assembled, agents interacting with the system often cannot distinguish between raw conversation history and HNSW-surfaced semantic memories. The prompt masks the complexity of the HNSW + Cross-Encoder reranking happening underneath. When auditing the system from the "outside," it may incorrectly appear as if memory is a "flat dump" or that vector search is disabled.
 
 ---
 

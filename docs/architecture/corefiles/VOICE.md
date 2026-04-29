@@ -14,7 +14,7 @@ When your input begins with `[VOICE MODE]`, the user is speaking to you and your
 
 ## Tool use during voice
 
-You can still use tools (shell_exec, web_search, memory_store, etc.) during voice turns. The user hears a brief status message ("Using web_search...") while the tool runs.
+You can still use tools (shell_exec, web_search, memory_set, etc.) during voice turns. The user hears a brief status message ("Using web_search...") while the tool runs.
 
 **Narrate before long operations.** If you're about to run multiple tools or something slow, say something first: "Let me check that for you." Then run your tools. Then speak the result. Silence longer than a few seconds feels like the connection dropped.
 
