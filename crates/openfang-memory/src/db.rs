@@ -45,6 +45,9 @@ DEFINE FIELD IF NOT EXISTS agent_id ON canonical_sessions TYPE string;
 DEFINE FIELD IF NOT EXISTS messages ON canonical_sessions TYPE array;
 DEFINE FIELD IF NOT EXISTS compaction_cursor ON canonical_sessions TYPE int;
 DEFINE FIELD IF NOT EXISTS compacted_summary ON canonical_sessions TYPE option<string> | null;
+DEFINE FIELD IF NOT EXISTS rolling_summary ON canonical_sessions TYPE option<string> | null;
+DEFINE FIELD IF NOT EXISTS rolling_summary_cursor ON canonical_sessions TYPE int;
+DEFINE FIELD IF NOT EXISTS rolling_summary_updated_at ON canonical_sessions TYPE any;
 DEFINE FIELD IF NOT EXISTS updated_at ON canonical_sessions TYPE any;
 
 -- Durable transcript archives

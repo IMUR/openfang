@@ -764,6 +764,75 @@ pub async fn compact_session(
     })
 }
 
+/// Incrementally update an existing rolling summary with new unsummarized messages.
+pub async fn update_rolling_summary(
+    driver: Arc<dyn LlmDriver>,
+    model: &str,
+    existing_summary: Option<&str>,
+    new_messages: &[Message],
+    config: &CompactionConfig,
+) -> Result<String, String> {
+    if new_messages.is_empty() {
+        return Ok(existing_summary.unwrap_or_default().to_string());
+    }
+
+    let new_context = build_conversation_text(new_messages, config);
+    let prior = existing_summary
+        .filter(|summary| !summary.trim().is_empty())
+        .unwrap_or("[No prior rolling summary]");
+    let prompt = format!(
+        "Update the rolling conversation summary.\n\n\
+         Existing summary:\n{prior}\n\n\
+         New transcript since that summary:\n{new_context}\n\n\
+         Produce one updated summary that preserves important prior facts, \
+         decisions, user preferences, constraints, and open questions. Incorporate \
+         only the new transcript information that matters. Output only the updated summary."
+    );
+
+    let request = CompletionRequest {
+        model: model.to_string(),
+        messages: vec![Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![ContentBlock::Text {
+                text: prompt,
+                provider_metadata: None,
+            }]),
+        }],
+        tools: vec![],
+        max_tokens: config.max_summary_tokens,
+        temperature: 0.2,
+        system: Some(
+            "You maintain a rolling memory summary. Preserve durable facts from the existing \
+             summary while incorporating important new transcript details."
+                .to_string(),
+        ),
+        thinking: None,
+    };
+
+    let mut last_error = String::new();
+    for attempt in 0..config.max_retries {
+        match driver.complete(request.clone()).await {
+            Ok(response) => {
+                let summary = response.text();
+                if summary.trim().is_empty() {
+                    last_error = "LLM returned empty rolling summary".to_string();
+                    warn!(attempt, "Empty rolling summary from LLM, retrying");
+                    continue;
+                }
+                return Ok(summary);
+            }
+            Err(error) => {
+                last_error = format!("Rolling summarization failed: {error}");
+                if attempt + 1 < config.max_retries {
+                    warn!(attempt, error = %error, "Rolling summarization attempt failed, retrying");
+                }
+            }
+        }
+    }
+
+    Err(last_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1016,6 +1085,52 @@ mod tests {
         assert!(result.summary.contains("Summary"));
         assert_eq!(result.chunks_used, 1);
         assert!(!result.used_fallback);
+    }
+
+    #[tokio::test]
+    async fn test_update_rolling_summary_preserves_existing_facts_and_adds_new_turns() {
+        use crate::llm_driver::{CompletionResponse, LlmError};
+        use async_trait::async_trait;
+
+        struct InspectingDriver;
+
+        #[async_trait]
+        impl LlmDriver for InspectingDriver {
+            async fn complete(
+                &self,
+                req: CompletionRequest,
+            ) -> Result<CompletionResponse, LlmError> {
+                let prompt = req.messages[0].content.text_content();
+                assert!(prompt.contains("Existing summary:"));
+                assert!(prompt.contains("User prefers concise answers"));
+                assert!(prompt.contains("New transcript since that summary:"));
+                assert!(prompt.contains("OpenFang auto summarization"));
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "User prefers concise answers. New work discussed OpenFang auto summarization.".to_string(),
+                        provider_metadata: None,
+                    }],
+                    stop_reason: openfang_types::message::StopReason::EndTurn,
+                    tool_calls: vec![],
+                    usage: TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                    },
+                })
+            }
+        }
+
+        let summary = update_rolling_summary(
+            Arc::new(InspectingDriver),
+            "test-model",
+            Some("User prefers concise answers."),
+            &[Message::user("Let's discuss OpenFang auto summarization.")],
+            &CompactionConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(summary.contains("concise answers"));
+        assert!(summary.contains("auto summarization"));
     }
 
     // --- New tests ---

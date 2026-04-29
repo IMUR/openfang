@@ -103,6 +103,8 @@ pub struct OpenFangKernel {
     >,
     /// Tracks running agent tasks for cancellation support.
     pub running_tasks: dashmap::DashMap<AgentId, tokio::task::AbortHandle>,
+    /// Tracks background rolling summary tasks so one agent/session has at most one active updater.
+    pub rolling_summary_tasks: dashmap::DashSet<String>,
     /// MCP server connections (lazily initialized at start_background_agents).
     pub mcp_connections: tokio::sync::Mutex<Vec<openfang_runtime::mcp::McpConnection>>,
     /// MCP tool definitions cache (populated after connections are established).
@@ -1404,6 +1406,7 @@ impl OpenFangKernel {
             skill_registry: std::sync::RwLock::new(skill_registry),
             skill_config_overrides: std::sync::RwLock::new(None),
             running_tasks: dashmap::DashMap::new(),
+            rolling_summary_tasks: dashmap::DashSet::new(),
             mcp_connections: tokio::sync::Mutex::new(Vec::new()),
             mcp_tools: std::sync::Mutex::new(Vec::new()),
             a2a_task_store: openfang_runtime::a2a::A2aTaskStore::default(),
@@ -2129,6 +2132,90 @@ impl OpenFangKernel {
         }
     }
 
+    fn schedule_rolling_summary_update(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        session_id: openfang_types::agent::SessionId,
+    ) {
+        let key = format!("{}:{}", agent_id.0, session_id.0);
+        if self.rolling_summary_tasks.contains(&key) {
+            return;
+        }
+        self.rolling_summary_tasks.insert(key.clone());
+        let kernel = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = kernel
+                .update_rolling_summary_if_needed(agent_id, session_id)
+                .await;
+            kernel.rolling_summary_tasks.remove(&key);
+            if let Err(error) = result {
+                warn!(%agent_id, %session_id, "Rolling summary update failed: {error}");
+            }
+        });
+    }
+
+    async fn update_rolling_summary_if_needed(
+        &self,
+        agent_id: AgentId,
+        session_id: openfang_types::agent::SessionId,
+    ) -> KernelResult<()> {
+        let threshold = self.config.memory.rolling_summary_threshold.max(1);
+        let (existing_summary, cursor, message_count) = self
+            .memory
+            .rolling_context(agent_id)
+            .await
+            .map_err(KernelError::OpenFang)?;
+        let unsummarized = message_count.saturating_sub(cursor);
+        if unsummarized < threshold {
+            return Ok(());
+        }
+        if unsummarized > threshold * 2 {
+            warn!(%agent_id, %session_id, unsummarized, threshold, "Rolling summary is stale");
+        }
+
+        let canonical = self
+            .memory
+            .canonical_messages(agent_id)
+            .await
+            .map_err(KernelError::OpenFang)?;
+        let target_cursor = canonical.len();
+        let new_messages = &canonical[cursor.min(canonical.len())..target_cursor];
+        if new_messages.is_empty() {
+            return Ok(());
+        }
+
+        let driver = Arc::clone(&self.default_driver);
+        let model = self.config.default_model.model.clone();
+        let summary = openfang_runtime::compactor::update_rolling_summary(
+            driver,
+            &model,
+            existing_summary.as_deref(),
+            new_messages,
+            &self.compaction_config(),
+        )
+        .await
+        .map_err(|e| KernelError::OpenFang(OpenFangError::Internal(e)))?;
+
+        self.memory
+            .update_rolling_summary(agent_id, &summary, target_cursor)
+            .await
+            .map_err(KernelError::OpenFang)?;
+        self.memory
+            .write_session_compaction_summary(
+                agent_id,
+                session_id,
+                &summary,
+                new_messages.len(),
+                1,
+                false,
+                "RollingBackground",
+            )
+            .await
+            .map_err(KernelError::OpenFang)?;
+        info!(%agent_id, %session_id, cursor = target_cursor, "Rolling summary updated");
+        Ok(())
+    }
+
     // -----------------------------------------------------------------
     // Core message passing
     // -----------------------------------------------------------------
@@ -2759,6 +2846,8 @@ impl OpenFangKernel {
                         });
                     }
 
+                    kernel_clone.schedule_rolling_summary_update(agent_id, session.id);
+
                     // Post-loop compaction check: if session now exceeds token threshold,
                     // trigger compaction in background for the next call.
                     {
@@ -3332,6 +3421,9 @@ impl OpenFangKernel {
         // Session summary (Phase 3b): generate a semantic summary every N turns (background).
         self.try_generate_session_summary(agent_id, session.id, &session.messages)
             .await;
+        if let Some(kernel) = self.self_handle.get().and_then(|weak| weak.upgrade()) {
+            kernel.schedule_rolling_summary_update(agent_id, session.id);
+        }
 
         if self
             .compaction_reason_for_session(agent_id, &session, &manifest.model.system_prompt)

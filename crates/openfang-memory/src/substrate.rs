@@ -397,6 +397,31 @@ impl MemorySubstrate {
         self.sessions.canonical_context(agent_id, window_size).await
     }
 
+    pub async fn rolling_context(
+        &self,
+        agent_id: AgentId,
+    ) -> OpenFangResult<(Option<String>, usize, usize)> {
+        self.sessions.rolling_context(agent_id).await
+    }
+
+    pub async fn canonical_messages(
+        &self,
+        agent_id: AgentId,
+    ) -> OpenFangResult<Vec<openfang_types::message::Message>> {
+        self.sessions.canonical_messages(agent_id).await
+    }
+
+    pub async fn update_rolling_summary(
+        &self,
+        agent_id: AgentId,
+        summary: &str,
+        cursor: usize,
+    ) -> OpenFangResult<()> {
+        self.sessions
+            .update_rolling_summary(agent_id, summary, cursor)
+            .await
+    }
+
     /// Store an LLM-generated summary.
     pub async fn store_llm_summary(
         &self,

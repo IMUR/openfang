@@ -73,10 +73,21 @@ async fn summarize_overlong_llm_context(
     session: &Session,
     messages: Vec<Message>,
     driver: Arc<dyn LlmDriver>,
+    warm_summary: Option<&str>,
     context: &str,
 ) -> Vec<Message> {
     if messages.len() <= MAX_HISTORY_MESSAGES {
         return messages;
+    }
+
+    if let Some(summary) = warm_summary.filter(|summary| !summary.trim().is_empty()) {
+        let keep = MAX_HISTORY_MESSAGES.saturating_sub(1).max(1);
+        let keep_from = messages.len().saturating_sub(keep);
+        let mut compacted = Vec::with_capacity(keep + 1);
+        compacted.push(Message::user(summary.to_string()));
+        compacted.extend(messages[keep_from..].iter().cloned());
+        let compacted = crate::session_repair::validate_and_repair(&compacted);
+        return crate::session_repair::ensure_starts_with_user(compacted);
     }
 
     let trim_count = messages.len() - MAX_HISTORY_MESSAGES;
@@ -751,6 +762,10 @@ pub async fn run_agent_loop(
         session,
         messages,
         Arc::clone(&driver),
+        manifest
+            .metadata
+            .get("canonical_context_msg")
+            .and_then(|value| value.as_str()),
         "non_streaming",
     )
     .await;
@@ -2237,6 +2252,10 @@ pub async fn run_agent_loop_streaming(
         session,
         messages,
         Arc::clone(&driver),
+        manifest
+            .metadata
+            .get("canonical_context_msg")
+            .and_then(|value| value.as_str()),
         "streaming",
     )
     .await;
@@ -4522,6 +4541,77 @@ mod tests {
             main_request.messages.len() <= MAX_HISTORY_MESSAGES,
             "main request should stay within the active history cap"
         );
+    }
+
+    #[tokio::test]
+    async fn test_overlong_context_uses_warm_summary_without_hot_path_summarizer() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = openfang_memory::session::Session {
+            id: openfang_types::agent::SessionId::new(),
+            agent_id,
+            messages: (0..25)
+                .map(|i| Message::user(format!("turn {i}")))
+                .collect(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        let mut manifest = test_manifest();
+        manifest.metadata.insert(
+            "canonical_context_msg".to_string(),
+            serde_json::json!("[Compacted session summary]\nUser prefers concise answers."),
+        );
+        let driver = Arc::new(RecordingCompactionDriver::new());
+
+        let result = run_agent_loop(
+            &manifest,
+            "new request",
+            &mut session,
+            &memory,
+            driver.clone(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            #[cfg(feature = "memory-candle")]
+            None,
+            #[cfg(feature = "memory-candle")]
+            None,
+            #[cfg(feature = "memory-candle")]
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("Loop should complete without error");
+
+        assert_eq!(result.response, "Summary of the older conversation context.");
+        let requests = driver.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "warm summary should avoid hot-path summarization call"
+        );
+        let prompt_text = requests[0]
+            .messages
+            .iter()
+            .map(|message| message.content.text_content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(prompt_text.contains("User prefers concise answers"));
+        assert!(requests[0].messages.len() <= MAX_HISTORY_MESSAGES);
     }
 
     #[tokio::test]

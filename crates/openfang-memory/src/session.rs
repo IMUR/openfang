@@ -94,6 +94,15 @@ struct CanonicalRecord {
     messages: Vec<Message>,
     compaction_cursor: usize,
     compacted_summary: Option<String>,
+    #[serde(default)]
+    rolling_summary: Option<String>,
+    #[serde(default)]
+    rolling_summary_cursor: usize,
+    #[serde(
+        default,
+        deserialize_with = "openfang_types::datetime::deserialize_optional_rfc3339_string"
+    )]
+    rolling_summary_updated_at: Option<String>,
     #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
     updated_at: String,
 }
@@ -447,6 +456,9 @@ pub struct CanonicalSession {
     pub compaction_cursor: usize,
     /// Summary of compacted (older) messages.
     pub compacted_summary: Option<String>,
+    pub rolling_summary: Option<String>,
+    pub rolling_summary_cursor: usize,
+    pub rolling_summary_updated_at: Option<String>,
     /// Last update time.
     pub updated_at: String,
 }
@@ -466,6 +478,9 @@ impl SessionStore {
                 messages: r.messages,
                 compaction_cursor: r.compaction_cursor,
                 compacted_summary: r.compacted_summary,
+                rolling_summary: r.rolling_summary,
+                rolling_summary_cursor: r.rolling_summary_cursor,
+                rolling_summary_updated_at: r.rolling_summary_updated_at,
                 updated_at: r.updated_at,
             }),
             None => {
@@ -475,6 +490,9 @@ impl SessionStore {
                     messages: Vec::new(),
                     compaction_cursor: 0,
                     compacted_summary: None,
+                    rolling_summary: None,
+                    rolling_summary_cursor: 0,
+                    rolling_summary_updated_at: None,
                     updated_at: now,
                 })
             }
@@ -549,7 +567,43 @@ impl SessionStore {
         let window = window_size.unwrap_or(DEFAULT_CANONICAL_WINDOW);
         let start = canonical.messages.len().saturating_sub(window);
         let recent = canonical.messages[start..].to_vec();
-        Ok((canonical.compacted_summary.clone(), recent))
+        Ok((
+            canonical
+                .rolling_summary
+                .clone()
+                .or(canonical.compacted_summary.clone()),
+            recent,
+        ))
+    }
+
+    pub async fn rolling_context(
+        &self,
+        agent_id: AgentId,
+    ) -> OpenFangResult<(Option<String>, usize, usize)> {
+        let canonical = self.load_canonical(agent_id).await?;
+        Ok((
+            canonical.rolling_summary,
+            canonical.rolling_summary_cursor,
+            canonical.messages.len(),
+        ))
+    }
+
+    pub async fn canonical_messages(&self, agent_id: AgentId) -> OpenFangResult<Vec<Message>> {
+        Ok(self.load_canonical(agent_id).await?.messages)
+    }
+
+    pub async fn update_rolling_summary(
+        &self,
+        agent_id: AgentId,
+        summary: &str,
+        cursor: usize,
+    ) -> OpenFangResult<()> {
+        let mut canonical = self.load_canonical(agent_id).await?;
+        canonical.rolling_summary = Some(summary.to_string());
+        canonical.rolling_summary_cursor = cursor.min(canonical.messages.len());
+        canonical.rolling_summary_updated_at = Some(Utc::now().to_rfc3339());
+        canonical.updated_at = Utc::now().to_rfc3339();
+        self.save_canonical(&canonical).await
     }
 
     /// Persist a canonical session to SurrealDB.
@@ -565,6 +619,9 @@ impl SessionStore {
                 messages: canonical.messages.clone(),
                 compaction_cursor: canonical.compaction_cursor,
                 compacted_summary: canonical.compacted_summary.clone(),
+                rolling_summary: canonical.rolling_summary.clone(),
+                rolling_summary_cursor: canonical.rolling_summary_cursor,
+                rolling_summary_updated_at: canonical.rolling_summary_updated_at.clone(),
                 updated_at: canonical.updated_at.clone(),
             })
             .await
@@ -790,6 +847,36 @@ mod tests {
             .unwrap();
 
         assert_eq!(canonical.messages.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_rolling_summary_cursor_roundtrip() {
+        let store = setup().await;
+        let agent_id = AgentId::new();
+        let messages: Vec<Message> = (0..6)
+            .map(|i| Message::user(format!("turn {i}")))
+            .collect();
+        store
+            .append_canonical(agent_id, &messages, Some(100))
+            .await
+            .unwrap();
+
+        store
+            .update_rolling_summary(agent_id, "summary of first four turns", 4)
+            .await
+            .unwrap();
+
+        let (summary, cursor, message_count) = store.rolling_context(agent_id).await.unwrap();
+        assert_eq!(summary.as_deref(), Some("summary of first four turns"));
+        assert_eq!(cursor, 4);
+        assert_eq!(message_count, 6);
+
+        store
+            .update_rolling_summary(agent_id, "overrun", 99)
+            .await
+            .unwrap();
+        let (_, cursor, message_count) = store.rolling_context(agent_id).await.unwrap();
+        assert_eq!(cursor, message_count, "cursor must not overrun messages");
     }
 
     #[tokio::test]

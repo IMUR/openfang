@@ -1680,6 +1680,8 @@ pub struct MemoryConfig {
     pub compaction_token_threshold_ratio: f64,
     /// Maximum tokens to ask the LLM for when generating compaction summaries.
     pub compaction_max_summary_tokens: u32,
+    /// Number of unsummarized canonical messages that triggers rolling summarization.
+    pub rolling_summary_threshold: usize,
     /// CUDA device index for in-process Candle memory inference (embeddings when
     /// `embedding_provider = "candle"`, and NER/rerank when their backends are `candle`).
     /// None = CPU for all Candle workloads.
@@ -1765,6 +1767,7 @@ impl Default for MemoryConfig {
             compaction_keep_recent: 10,
             compaction_token_threshold_ratio: 0.7,
             compaction_max_summary_tokens: 1024,
+            rolling_summary_threshold: 8,
             cuda_device: None,
             ner_backend: None,
             reranker_backend: None,
