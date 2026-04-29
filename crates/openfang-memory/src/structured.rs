@@ -6,6 +6,9 @@
 use chrono::Utc;
 use openfang_types::agent::{AgentEntry, AgentId};
 use openfang_types::error::{OpenFangError, OpenFangResult};
+use openfang_types::memory_dimensions::{
+    MemoryContract, MemoryDataModel, MemoryIntelligence, MemorySubstrateKind, MemorySurfaceSpec,
+};
 use serde::{Deserialize, Serialize};
 use surrealdb::types::SurrealValue;
 
@@ -37,6 +40,30 @@ macro_rules! surreal_via_json {
 pub struct StructuredStore {
     db: SurrealDb,
 }
+
+pub const KV_SURFACE: MemorySurfaceSpec = MemorySurfaceSpec {
+    id: "kv",
+    description: "Structured key-value records for explicit tools and operational state",
+    storage_tables: &["kv"],
+    substrates: &[MemorySubstrateKind::SurrealDb],
+    data_models: &[MemoryDataModel::KeyValue],
+    contracts: &[
+        MemoryContract::Tool,
+        MemoryContract::Authority,
+        MemoryContract::Operations,
+    ],
+    intelligence: &[MemoryIntelligence::None],
+};
+
+pub const AGENTS_SURFACE: MemorySurfaceSpec = MemorySurfaceSpec {
+    id: "agents",
+    description: "Runtime agent registry cache derived from agent manifests",
+    storage_tables: &["agents"],
+    substrates: &[MemorySubstrateKind::SurrealDb],
+    data_models: &[MemoryDataModel::Document],
+    contracts: &[MemoryContract::Authority, MemoryContract::Operations],
+    intelligence: &[MemoryIntelligence::None],
+};
 
 /// KV record stored in SurrealDB.
 #[derive(Debug, Serialize, Deserialize)]

@@ -14,6 +14,9 @@ use openfang_kernel::OpenFangKernel;
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
+use openfang_types::memory_dimensions::{
+    MemoryContract, MemoryDataModel, MemoryIntelligence, MemorySubstrateKind, MemorySurfaceSpec,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -43,6 +46,78 @@ pub struct AppState {
     /// Thread-safe mutable budget config. Updated via PUT /api/budget.
     /// Initialized from `kernel.config.budget` at startup.
     pub budget_config: Arc<tokio::sync::RwLock<openfang_types::config::BudgetConfig>>,
+}
+
+pub const MEMORY_ROUTE_PATHS: &[&str] = &[
+    "/api/memory/agents/{id}/kv",
+    "/api/memory/agents/{id}/kv/{key}",
+    "/api/memory/agents/{id}/semantic",
+    "/api/memory/agents/{id}/graph",
+    "/api/memory/backfill",
+];
+
+/// Operations-contract surface declarations owned by the API memory routes.
+pub fn memory_route_surface_specs() -> Vec<MemorySurfaceSpec> {
+    vec![
+        MemorySurfaceSpec {
+            id: "/api/memory/agents/{id}/kv",
+            description: "Inspect agent KV memory namespace",
+            storage_tables: &["kv"],
+            substrates: &[MemorySubstrateKind::SurrealDb],
+            data_models: &[MemoryDataModel::KeyValue],
+            contracts: &[MemoryContract::Operations],
+            intelligence: &[MemoryIntelligence::None],
+        },
+        MemorySurfaceSpec {
+            id: "/api/memory/agents/{id}/kv/{key}",
+            description: "Inspect or mutate one KV memory key",
+            storage_tables: &["kv"],
+            substrates: &[MemorySubstrateKind::SurrealDb],
+            data_models: &[MemoryDataModel::KeyValue],
+            contracts: &[MemoryContract::Operations],
+            intelligence: &[MemoryIntelligence::None],
+        },
+        MemorySurfaceSpec {
+            id: "/api/memory/agents/{id}/semantic",
+            description: "Inspect semantic memory fragments",
+            storage_tables: &["memories"],
+            substrates: &[MemorySubstrateKind::SurrealDb],
+            data_models: &[
+                MemoryDataModel::Document,
+                MemoryDataModel::Vector,
+                MemoryDataModel::FullText,
+            ],
+            contracts: &[MemoryContract::Operations],
+            intelligence: &[
+                MemoryIntelligence::Embedding,
+                MemoryIntelligence::Classifier,
+                MemoryIntelligence::Reranker,
+            ],
+        },
+        MemorySurfaceSpec {
+            id: "/api/memory/agents/{id}/graph",
+            description: "Inspect agent knowledge graph entities and relations",
+            storage_tables: &["entities", "relations"],
+            substrates: &[MemorySubstrateKind::SurrealDb],
+            data_models: &[MemoryDataModel::Graph, MemoryDataModel::Document],
+            contracts: &[MemoryContract::Operations],
+            intelligence: &[MemoryIntelligence::Ner],
+        },
+        MemorySurfaceSpec {
+            id: "/api/memory/backfill",
+            description: "Operational semantic and graph metadata enrichment",
+            storage_tables: &["memories", "entities", "relations"],
+            substrates: &[MemorySubstrateKind::SurrealDb],
+            data_models: &[
+                MemoryDataModel::Document,
+                MemoryDataModel::Graph,
+                MemoryDataModel::Vector,
+                MemoryDataModel::FullText,
+            ],
+            contracts: &[MemoryContract::Operations],
+            intelligence: &[MemoryIntelligence::Classifier, MemoryIntelligence::Ner],
+        },
+    ]
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -3558,7 +3633,12 @@ pub async fn get_agent_graph_memory(
     };
     let offset = query.offset.unwrap_or(0);
 
-    let entities = match state.kernel.memory.list_entities(offset, limit).await {
+    let entities = match state
+        .kernel
+        .memory
+        .list_entities_for_agent(agent_id, offset, limit)
+        .await
+    {
         Ok(entities) => entities,
         Err(e) => {
             tracing::warn!(agent = %agent_id.0, "Graph entity inspection failed: {e}");
@@ -3568,7 +3648,12 @@ pub async fn get_agent_graph_memory(
             );
         }
     };
-    let relations = match state.kernel.memory.list_relations(offset, limit).await {
+    let relations = match state
+        .kernel
+        .memory
+        .list_relations_for_agent(agent_id, offset, limit)
+        .await
+    {
         Ok(relations) => relations,
         Err(e) => {
             tracing::warn!(agent = %agent_id.0, "Graph relation inspection failed: {e}");
@@ -3752,14 +3837,36 @@ pub async fn memory_backfill(
                         {
                             match ner.extract_entities(&frag.content, 0.60).await {
                                 Ok(entities) if !entities.is_empty() => {
-                                    let names: Vec<serde_json::Value> = entities
-                                        .iter()
-                                        .map(|e| serde_json::json!(e.text))
-                                        .collect();
-                                    new_meta.insert(
-                                        "entities".to_string(),
-                                        serde_json::Value::Array(names),
-                                    );
+                                    let mut entity_ids: Vec<serde_json::Value> = Vec::new();
+                                    for entity in entities {
+                                        let entity_id = format!(
+                                            "{}-{}",
+                                            agent_id.0,
+                                            entity.text.to_lowercase().replace(' ', "_")
+                                        );
+                                        let graph_entity = openfang_types::memory::Entity {
+                                            id: entity_id.clone(),
+                                            agent_id: Some(agent_id),
+                                            entity_type: entity.entity_type,
+                                            name: entity.text,
+                                            properties: std::collections::HashMap::new(),
+                                            created_at: chrono::Utc::now(),
+                                            updated_at: chrono::Utc::now(),
+                                        };
+                                        if let Err(e) =
+                                            state.kernel.memory.add_entity(graph_entity).await
+                                        {
+                                            tracing::debug!(error = %e, "Backfill: failed to add graph entity");
+                                            continue;
+                                        }
+                                        entity_ids.push(serde_json::json!(entity_id));
+                                    }
+                                    if !entity_ids.is_empty() {
+                                        new_meta.insert(
+                                            "entities".to_string(),
+                                            serde_json::Value::Array(entity_ids),
+                                        );
+                                    }
                                 }
                                 _ => {}
                             }
@@ -12812,6 +12919,22 @@ fn remove_toml_section(content: &str, section: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod memory_dimension_route_tests {
+    use super::*;
+
+    #[test]
+    fn memory_routes_have_operations_surface_specs() {
+        let specs = memory_route_surface_specs();
+        for path in MEMORY_ROUTE_PATHS {
+            assert!(
+                specs.iter().any(|spec| spec.id == *path),
+                "missing memory route surface spec for {path}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

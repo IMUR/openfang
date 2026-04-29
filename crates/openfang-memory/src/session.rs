@@ -7,12 +7,25 @@
 use chrono::Utc;
 use openfang_types::agent::{AgentId, SessionId};
 use openfang_types::error::{OpenFangError, OpenFangResult};
+use openfang_types::memory_dimensions::{
+    MemoryContract, MemoryDataModel, MemoryIntelligence, MemorySubstrateKind, MemorySurfaceSpec,
+};
 use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::db::SurrealDb;
+
+pub const SESSION_SURFACE: MemorySurfaceSpec = MemorySurfaceSpec {
+    id: "sessions",
+    description: "Conversation sessions and canonical compacted session context",
+    storage_tables: &["sessions", "canonical_sessions"],
+    substrates: &[MemorySubstrateKind::SurrealDb],
+    data_models: &[MemoryDataModel::Document],
+    contracts: &[MemoryContract::Context, MemoryContract::Operations],
+    intelligence: &[MemoryIntelligence::Summarizer],
+};
 
 /// Implement `SurrealValue` via serde-json round-trip for types that contain
 /// `openfang-types` structs (e.g. `Message`) which do not implement `SurrealValue`.

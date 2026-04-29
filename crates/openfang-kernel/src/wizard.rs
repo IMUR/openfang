@@ -80,7 +80,7 @@ impl SetupWizard {
                 "memory" => {
                     caps.memory_read.push("*".to_string());
                     caps.memory_write.push("*".to_string());
-                    for t in &["memory_store", "memory_recall"] {
+                    for t in &["memory_set", "memory_get"] {
                         let s = t.to_string();
                         if !caps.tools.contains(&s) {
                             caps.tools.push(s);
@@ -240,10 +240,8 @@ impl SetupWizard {
                 "- Use shell_exec to run commands. Explain destructive commands before running.",
             );
         }
-        if has("memory_store") {
-            hints.push(
-                "- Use memory_store/memory_recall to persist and retrieve important context.",
-            );
+        if has("memory_set") {
+            hints.push("- Use memory_set/memory_get to persist and retrieve exact-key context.");
         }
 
         if hints.is_empty() {
@@ -391,12 +389,12 @@ mod tests {
             .manifest
             .capabilities
             .tools
-            .contains(&"memory_store".to_string()));
+            .contains(&"memory_set".to_string()));
         assert!(plan
             .manifest
             .capabilities
             .tools
-            .contains(&"memory_recall".to_string()));
+            .contains(&"memory_get".to_string()));
     }
 
     #[test]

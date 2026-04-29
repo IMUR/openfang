@@ -345,14 +345,15 @@ pub fn build_memory_section(memories: &[(String, String)]) -> String {
     let mut out = String::from("## Memory\n");
     if memories.is_empty() {
         out.push_str(
-            "- When the user asks about something from a previous conversation, use memory_recall first.\n\
-             - Store important preferences, decisions, and context with memory_store for future use.",
+            "- When the user asks about an exact stored key, use memory_get.\n\
+             - Store important preferences, decisions, and context with memory_set for future exact-key lookup.\n\
+             - The recalled memories below are automatic semantic context; memory_get is exact-key KV lookup, not semantic search.",
         );
     } else {
         out.push_str(
             "- Use the recalled memories below to inform your responses.\n\
-             - Only call memory_recall if you need information not already shown here.\n\
-             - Store important preferences, decisions, and context with memory_store for future use.",
+             - Only call memory_get if you need an exact stored key not already shown here.\n\
+             - Store important preferences, decisions, and context with memory_set for future exact-key lookup.",
         );
         out.push_str("\n\nRecalled memories:\n");
         for (key, content) in memories.iter().take(5) {
@@ -443,7 +444,7 @@ fn build_user_section(user_name: Option<&str>) -> String {
         None => "## User Profile\n\
              You don't know the user's name yet. On your FIRST reply in this conversation, \
              warmly introduce yourself by your agent name and ask what they'd like to be called. \
-             Once they tell you, immediately use the `memory_store` tool with \
+             Once they tell you, immediately use the `memory_set` tool with \
              key \"user_name\" and their name as the value so you remember it for future sessions. \
              Keep the introduction brief — don't let it overshadow their actual request."
             .to_string(),
@@ -551,7 +552,8 @@ pub fn tool_category(name: &str) -> &'static str {
 
         "shell_exec" | "shell_background" => "Shell",
 
-        "memory_store" | "memory_recall" | "memory_delete" | "memory_list" => "Memory",
+        "memory_set" | "memory_get" | "memory_store" | "memory_recall" | "memory_delete"
+        | "memory_list" => "Memory",
 
         "agent_send" | "agent_spawn" | "agent_list" | "agent_kill" => "Agents",
 
@@ -605,8 +607,10 @@ pub fn tool_hint(name: &str) -> &'static str {
         "shell_background" => "run a command in the background",
 
         // Memory
-        "memory_store" => "save a key-value pair to memory",
-        "memory_recall" => "search memory for relevant context",
+        "memory_set" => "save a key-value pair to memory",
+        "memory_get" => "get a memory value by exact key",
+        "memory_store" => "deprecated alias for memory_set",
+        "memory_recall" => "deprecated alias for memory_get",
         "memory_delete" => "delete a memory entry",
         "memory_list" => "list stored memory keys",
 
@@ -712,8 +716,8 @@ mod tests {
                 "web_fetch".to_string(),
                 "file_read".to_string(),
                 "file_write".to_string(),
-                "memory_store".to_string(),
-                "memory_recall".to_string(),
+                "memory_set".to_string(),
+                "memory_get".to_string(),
             ],
             ..Default::default()
         }
@@ -792,6 +796,8 @@ mod tests {
         assert_eq!(tool_category("web_search"), "Web");
         assert_eq!(tool_category("browser_navigate"), "Browser");
         assert_eq!(tool_category("shell_exec"), "Shell");
+        assert_eq!(tool_category("memory_set"), "Memory");
+        assert_eq!(tool_category("memory_get"), "Memory");
         assert_eq!(tool_category("memory_store"), "Memory");
         assert_eq!(tool_category("agent_send"), "Agents");
         assert_eq!(tool_category("mcp_github_search"), "MCP");
@@ -810,7 +816,8 @@ mod tests {
     fn test_memory_section_empty() {
         let section = build_memory_section(&[]);
         assert!(section.contains("## Memory"));
-        assert!(section.contains("use memory_recall first"));
+        assert!(section.contains("use memory_get"));
+        assert!(section.contains("not semantic search"));
         assert!(!section.contains("Recalled memories"));
     }
 
@@ -826,6 +833,7 @@ mod tests {
         assert!(section.contains("[ctx] Working on Rust project"));
         assert!(section.contains("Use the recalled memories below"));
         assert!(!section.contains("use memory_recall first"));
+        assert!(section.contains("Only call memory_get"));
     }
 
     #[test]

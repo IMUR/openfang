@@ -12,9 +12,13 @@
 //!   More efficient for fan-out from a known source entity (up to 3 hops).
 
 use chrono::Utc;
+use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{
     Entity, EntityType, GraphMatch, GraphPattern, Relation, RelationType,
+};
+use openfang_types::memory_dimensions::{
+    MemoryContract, MemoryDataModel, MemoryIntelligence, MemorySubstrateKind, MemorySurfaceSpec,
 };
 
 /// A node reached during graph traversal, with the hop depth it was found at.
@@ -61,9 +65,25 @@ pub struct KnowledgeStore {
     db: SurrealDb,
 }
 
+pub const KNOWLEDGE_GRAPH_SURFACE: MemorySurfaceSpec = MemorySurfaceSpec {
+    id: "entities_relations",
+    description: "Agent-scoped knowledge graph entities and relation edges",
+    storage_tables: &["entities", "relations"],
+    substrates: &[MemorySubstrateKind::SurrealDb],
+    data_models: &[MemoryDataModel::Graph, MemoryDataModel::Document],
+    contracts: &[
+        MemoryContract::Context,
+        MemoryContract::Tool,
+        MemoryContract::Operations,
+    ],
+    intelligence: &[MemoryIntelligence::Ner],
+};
+
 /// Entity record for SurrealDB persistence.
 #[derive(Debug, Serialize, Deserialize)]
 struct EntityRecord {
+    #[serde(default)]
+    agent_id: Option<String>,
     entity_type: EntityType,
     name: String,
     properties: std::collections::HashMap<String, serde_json::Value>,
@@ -78,6 +98,8 @@ surreal_via_json!(EntityRecord);
 #[derive(Debug, Serialize, Deserialize)]
 struct EntityRow {
     record_key: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
     entity_type: EntityType,
     name: String,
     properties: std::collections::HashMap<String, serde_json::Value>,
@@ -91,6 +113,8 @@ surreal_via_json!(EntityRow);
 /// Relation record for SurrealDB persistence.
 #[derive(Debug, Serialize, Deserialize)]
 struct RelationRecord {
+    #[serde(default)]
+    agent_id: Option<String>,
     relation_type: RelationType,
     properties: std::collections::HashMap<String, serde_json::Value>,
     confidence: f32,
@@ -122,9 +146,20 @@ fn parse_dt(s: &str) -> chrono::DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
+fn parse_agent_id(value: Option<String>) -> Option<AgentId> {
+    value
+        .and_then(|id| uuid::Uuid::parse_str(&id).ok())
+        .map(AgentId)
+}
+
+fn agent_id_string(agent_id: Option<AgentId>) -> Option<String> {
+    agent_id.map(|id| id.0.to_string())
+}
+
 fn entity_row_to_entity(row: EntityRow) -> Entity {
     Entity {
         id: row.record_key.unwrap_or_default(),
+        agent_id: parse_agent_id(row.agent_id),
         entity_type: row.entity_type,
         name: row.name,
         properties: row.properties,
@@ -137,6 +172,7 @@ fn graph_row_to_match(row: GraphRow) -> GraphMatch {
     GraphMatch {
         source: Entity {
             id: row.source_id,
+            agent_id: parse_agent_id(row.source.agent_id),
             entity_type: row.source.entity_type,
             name: row.source.name,
             properties: row.source.properties,
@@ -144,6 +180,7 @@ fn graph_row_to_match(row: GraphRow) -> GraphMatch {
             updated_at: parse_dt(&row.source.updated_at),
         },
         relation: Relation {
+            agent_id: parse_agent_id(row.relation.agent_id),
             source: row.relation_source,
             relation: row.relation.relation_type,
             target: row.relation_target,
@@ -153,6 +190,7 @@ fn graph_row_to_match(row: GraphRow) -> GraphMatch {
         },
         target: Entity {
             id: row.target_id,
+            agent_id: parse_agent_id(row.target.agent_id),
             entity_type: row.target.entity_type,
             name: row.target.name,
             properties: row.target.properties,
@@ -172,6 +210,8 @@ struct RawEntity {
     /// Record ID as returned by v3 graph expansion — string like "entities:acme".
     #[serde(rename = "id")]
     raw_id: Option<serde_json::Value>,
+    #[serde(default)]
+    agent_id: Option<String>,
     entity_type: Option<EntityType>,
     name: Option<String>,
     #[serde(default)]
@@ -240,6 +280,7 @@ fn collect_hop(
         };
         let entity = Entity {
             id: eid.clone(),
+            agent_id: parse_agent_id(re.agent_id),
             entity_type: re
                 .entity_type
                 .unwrap_or(EntityType::Custom("unknown".to_string())),
@@ -275,6 +316,7 @@ impl KnowledgeStore {
             .db
             .upsert(("entities", id.as_str()))
             .content(EntityRecord {
+                agent_id: agent_id_string(entity.agent_id),
                 entity_type: entity.entity_type,
                 name: entity.name,
                 properties: entity.properties,
@@ -308,6 +350,7 @@ impl KnowledgeStore {
             .query(
                 "RELATE (type::record('entities', $source))->(type::record('relations', $id))->(type::record('entities', $target))
                  SET relation_type = $rel_type,
+                     agent_id = $agent_id,
                      properties = $props,
                      confidence = $conf,
                      created_at = $now"
@@ -315,6 +358,7 @@ impl KnowledgeStore {
             .bind(("source", relation.source.clone()))
             .bind(("target", relation.target.clone()))
             .bind(("id", id.clone()))
+            .bind(("agent_id", agent_id_string(relation.agent_id)))
             .bind(("rel_type", serde_json::to_value(&relation.relation).map_err(|e| OpenFangError::Serialization(e.to_string()))?))
             .bind(("props", serde_json::to_value(&relation.properties).map_err(|e| OpenFangError::Serialization(e.to_string()))?))
             .bind(("conf", relation.confidence as f64))
@@ -340,6 +384,10 @@ impl KnowledgeStore {
         let mut conditions = Vec::new();
         let mut bindings: Vec<(String, serde_json::Value)> = Vec::new();
 
+        if let Some(agent_id) = pattern.agent_id {
+            conditions.push("agent_id = $agent_id");
+            bindings.push(("agent_id".into(), serde_json::json!(agent_id.0.to_string())));
+        }
         if let Some(ref source) = pattern.source {
             // `in` is the source record link on the edge; compare by id string or name
             conditions.push("(meta::id(in) = $source_filter OR in.name = $source_filter)");
@@ -373,7 +421,7 @@ impl KnowledgeStore {
             "SELECT
                 in.* AS source,
                 out.* AS target,
-                {{ relation_type: relation_type, properties: properties,
+                {{ agent_id: agent_id, relation_type: relation_type, properties: properties,
                    confidence: confidence, created_at: created_at }} AS relation,
                 meta::id(in) AS source_id,
                 meta::id(out) AS target_id,
@@ -415,6 +463,31 @@ impl KnowledgeStore {
         Ok(rows.into_iter().map(entity_row_to_entity).collect())
     }
 
+    /// List entities owned by one agent for read-only graph inspection.
+    pub async fn list_entities_for_agent(
+        &self,
+        agent_id: AgentId,
+        offset: usize,
+        limit: usize,
+    ) -> OpenFangResult<Vec<Entity>> {
+        let sql = "SELECT meta::id(id) AS record_key, agent_id, entity_type, name, properties, created_at, updated_at
+                   FROM entities
+                   WHERE agent_id = $agent_id
+                   ORDER BY updated_at DESC, created_at DESC
+                   LIMIT $lim START $off";
+
+        let mut result = self
+            .db
+            .query(sql)
+            .bind(("agent_id", agent_id.0.to_string()))
+            .bind(("lim", limit))
+            .bind(("off", offset))
+            .await
+            .map_err(surreal_err)?;
+        let rows: Vec<EntityRow> = result.take(0).unwrap_or_default();
+        Ok(rows.into_iter().map(entity_row_to_entity).collect())
+    }
+
     /// List graph relations for read-only graph inspection.
     pub async fn list_relations(
         &self,
@@ -424,7 +497,7 @@ impl KnowledgeStore {
         let sql = "SELECT
                       in.* AS source,
                       out.* AS target,
-                      { relation_type: relation_type, properties: properties,
+                      { agent_id: agent_id, relation_type: relation_type, properties: properties,
                         confidence: confidence, created_at: created_at } AS relation,
                       meta::id(in) AS source_id,
                       meta::id(out) AS target_id,
@@ -438,6 +511,40 @@ impl KnowledgeStore {
         let mut result = self
             .db
             .query(sql)
+            .bind(("lim", limit))
+            .bind(("off", offset))
+            .await
+            .map_err(surreal_err)?;
+        let rows: Vec<GraphRow> = result.take(0).unwrap_or_default();
+        Ok(rows.into_iter().map(graph_row_to_match).collect())
+    }
+
+    /// List relations owned by one agent for read-only graph inspection.
+    pub async fn list_relations_for_agent(
+        &self,
+        agent_id: AgentId,
+        offset: usize,
+        limit: usize,
+    ) -> OpenFangResult<Vec<GraphMatch>> {
+        let sql = "SELECT
+                      in.* AS source,
+                      out.* AS target,
+                      { agent_id: agent_id, relation_type: relation_type, properties: properties,
+                        confidence: confidence, created_at: created_at } AS relation,
+                      meta::id(in) AS source_id,
+                      meta::id(out) AS target_id,
+                      meta::id(in) AS relation_source,
+                      meta::id(out) AS relation_target,
+                      created_at AS relation_created_at
+                   FROM `relations`
+                   WHERE agent_id = $agent_id
+                   ORDER BY created_at DESC
+                   LIMIT $lim START $off";
+
+        let mut result = self
+            .db
+            .query(sql)
+            .bind(("agent_id", agent_id.0.to_string()))
             .bind(("lim", limit))
             .bind(("off", offset))
             .await
@@ -509,6 +616,53 @@ impl KnowledgeStore {
 
         Ok(nodes)
     }
+
+    /// Multi-hop traversal constrained to relations owned by one agent.
+    pub async fn traverse_from_for_agent(
+        &self,
+        source_id: &str,
+        agent_id: AgentId,
+        max_depth: usize,
+    ) -> OpenFangResult<Vec<TraversalNode>> {
+        let depth = max_depth.clamp(1, 3);
+        let mut nodes = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut frontier = vec![source_id.to_string()];
+        seen.insert(source_id.to_string());
+
+        for hop_depth in 1..=depth {
+            let mut next_frontier = Vec::new();
+            for current in &frontier {
+                let matches = self
+                    .query_graph(GraphPattern {
+                        agent_id: Some(agent_id),
+                        source: Some(current.clone()),
+                        relation: None,
+                        target: None,
+                        max_depth: 1,
+                    })
+                    .await?;
+                for graph_match in matches {
+                    let target_id = graph_match.target.id.clone();
+                    if target_id.is_empty() || !seen.insert(target_id.clone()) {
+                        continue;
+                    }
+                    next_frontier.push(target_id);
+                    nodes.push(TraversalNode {
+                        entity: graph_match.target,
+                        depth: hop_depth,
+                        via_entity_id: current.clone(),
+                    });
+                }
+            }
+            if next_frontier.is_empty() {
+                break;
+            }
+            frontier = next_frontier;
+        }
+
+        Ok(nodes)
+    }
 }
 
 #[cfg(test)]
@@ -528,6 +682,7 @@ mod tests {
         let id = store
             .add_entity(Entity {
                 id: String::new(),
+                agent_id: None,
                 entity_type: EntityType::Person,
                 name: "Alice".to_string(),
                 properties: HashMap::new(),
@@ -546,6 +701,7 @@ mod tests {
         let alice_id = store
             .add_entity(Entity {
                 id: "alice".to_string(),
+                agent_id: None,
                 entity_type: EntityType::Person,
                 name: "Alice".to_string(),
                 properties: HashMap::new(),
@@ -558,6 +714,7 @@ mod tests {
         let acme_id = store
             .add_entity(Entity {
                 id: "acme".to_string(),
+                agent_id: None,
                 entity_type: EntityType::Organization,
                 name: "Acme Corp".to_string(),
                 properties: HashMap::new(),
@@ -569,6 +726,7 @@ mod tests {
 
         store
             .add_relation(Relation {
+                agent_id: None,
                 source: alice_id.clone(),
                 relation: RelationType::WorksAt,
                 target: acme_id.clone(),
@@ -592,11 +750,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_agent_scoped_graph_queries_do_not_cross_agents() {
+        let store = setup().await;
+        let agent_a = openfang_types::agent::AgentId::new();
+        let agent_b = openfang_types::agent::AgentId::new();
+
+        let alice_a = store
+            .add_entity(Entity {
+                id: "alice-a".to_string(),
+                agent_id: Some(agent_a),
+                entity_type: EntityType::Person,
+                name: "Alice".to_string(),
+                properties: HashMap::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        let acme_a = store
+            .add_entity(Entity {
+                id: "acme-a".to_string(),
+                agent_id: Some(agent_a),
+                entity_type: EntityType::Organization,
+                name: "Acme A".to_string(),
+                properties: HashMap::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        let alice_b = store
+            .add_entity(Entity {
+                id: "alice-b".to_string(),
+                agent_id: Some(agent_b),
+                entity_type: EntityType::Person,
+                name: "Alice".to_string(),
+                properties: HashMap::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        let acme_b = store
+            .add_entity(Entity {
+                id: "acme-b".to_string(),
+                agent_id: Some(agent_b),
+                entity_type: EntityType::Organization,
+                name: "Acme B".to_string(),
+                properties: HashMap::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        store
+            .add_relation(Relation {
+                agent_id: Some(agent_a),
+                source: alice_a.clone(),
+                relation: RelationType::WorksAt,
+                target: acme_a.clone(),
+                properties: HashMap::new(),
+                confidence: 0.9,
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        store
+            .add_relation(Relation {
+                agent_id: Some(agent_b),
+                source: alice_b,
+                relation: RelationType::WorksAt,
+                target: acme_b,
+                properties: HashMap::new(),
+                confidence: 0.9,
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let entities = store.list_entities_for_agent(agent_a, 0, 10).await.unwrap();
+        let entity_names: Vec<&str> = entities.iter().map(|entity| entity.name.as_str()).collect();
+        assert_eq!(entity_names.len(), 2);
+        assert!(entity_names.contains(&"Acme A"));
+        assert!(!entity_names.contains(&"Acme B"));
+
+        let matches = store
+            .query_graph(GraphPattern {
+                agent_id: Some(agent_a),
+                source: Some("Alice".to_string()),
+                relation: Some(RelationType::WorksAt),
+                target: None,
+                max_depth: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].target.name, "Acme A");
+
+        let nodes = store
+            .traverse_from_for_agent(&alice_a, agent_a, 1)
+            .await
+            .unwrap();
+        let traversal_names: Vec<&str> =
+            nodes.iter().map(|node| node.entity.name.as_str()).collect();
+        assert!(traversal_names.contains(&"Acme A"));
+        assert!(!traversal_names.contains(&"Acme B"));
+    }
+
+    #[tokio::test]
     async fn test_add_relation() {
         let store = setup().await;
         let alice_id = store
             .add_entity(Entity {
                 id: "alice".to_string(),
+                agent_id: None,
                 entity_type: EntityType::Person,
                 name: "Alice".to_string(),
                 properties: HashMap::new(),
@@ -608,6 +876,7 @@ mod tests {
         let company_id = store
             .add_entity(Entity {
                 id: "acme".to_string(),
+                agent_id: None,
                 entity_type: EntityType::Organization,
                 name: "Acme Corp".to_string(),
                 properties: HashMap::new(),
@@ -618,6 +887,7 @@ mod tests {
             .unwrap();
         let rel_id = store
             .add_relation(Relation {
+                agent_id: None,
                 source: alice_id,
                 relation: RelationType::WorksAt,
                 target: company_id,

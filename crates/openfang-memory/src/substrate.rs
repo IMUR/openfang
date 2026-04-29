@@ -20,9 +20,42 @@ use openfang_types::memory::{
     ConsolidationReport, Entity, ExportFormat, GraphMatch, GraphPattern, ImportReport, Memory,
     MemoryFilter, MemoryFragment, MemoryId, MemorySource, Relation,
 };
+use openfang_types::memory_dimensions::{
+    MemoryContract, MemoryDataModel, MemoryIntelligence, MemorySubstrateKind, MemorySurfaceSpec,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+pub const PAIRED_DEVICES_SURFACE: MemorySurfaceSpec = MemorySurfaceSpec {
+    id: "paired_devices",
+    description: "Operational mobile/device pairing records",
+    storage_tables: &["paired_devices"],
+    substrates: &[MemorySubstrateKind::SurrealDb],
+    data_models: &[MemoryDataModel::Document],
+    contracts: &[MemoryContract::Operations],
+    intelligence: &[MemoryIntelligence::None],
+};
+
+pub const TASK_QUEUE_SURFACE: MemorySurfaceSpec = MemorySurfaceSpec {
+    id: "task_queue",
+    description: "Operational inter-agent task queue records",
+    storage_tables: &["task_queue"],
+    substrates: &[MemorySubstrateKind::SurrealDb],
+    data_models: &[MemoryDataModel::Document],
+    contracts: &[MemoryContract::Operations, MemoryContract::Tool],
+    intelligence: &[MemoryIntelligence::None],
+};
+
+pub const PROFILE_SURFACE: MemorySurfaceSpec = MemorySurfaceSpec {
+    id: "profiles",
+    description: "Profile authority records seeded from user context and runtime state",
+    storage_tables: &["profiles"],
+    substrates: &[MemorySubstrateKind::SurrealDb],
+    data_models: &[MemoryDataModel::Document],
+    contracts: &[MemoryContract::Authority, MemoryContract::Context],
+    intelligence: &[MemoryIntelligence::None],
+};
 
 fn surreal_err(e: surrealdb::Error) -> OpenFangError {
     OpenFangError::Memory(e.to_string())
@@ -82,6 +115,14 @@ struct TaskRecord {
     result: Option<String>,
 }
 surreal_via_json!(TaskRecord);
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProfileRecord {
+    user_name: Option<String>,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
+    updated_at: String,
+}
+surreal_via_json!(ProfileRecord);
 
 /// The unified memory substrate. Implements the `Memory` trait by delegating
 /// to specialized stores backed by a shared SurrealDB handle.
@@ -160,6 +201,39 @@ impl MemorySubstrate {
     /// Get a reference to the usage store.
     pub fn usage(&self) -> &UsageStore {
         &self.usage
+    }
+
+    /// Read the global user profile name used for bootstrap/profile authority.
+    pub async fn global_profile_user_name(&self) -> OpenFangResult<Option<String>> {
+        let result: Option<ProfileRecord> = self
+            .db
+            .select(("profiles", "global"))
+            .await
+            .map_err(surreal_err)?;
+        Ok(result.and_then(|profile| profile.user_name))
+    }
+
+    /// Set the global user profile name.
+    pub async fn set_global_profile_user_name(&self, user_name: &str) -> OpenFangResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let _: Option<ProfileRecord> = self
+            .db
+            .upsert(("profiles", "global"))
+            .content(ProfileRecord {
+                user_name: Some(user_name.to_string()),
+                updated_at: now.clone(),
+            })
+            .await
+            .map_err(surreal_err)?;
+        self.db
+            .query(
+                "UPDATE type::record('profiles', 'global')
+                 SET updated_at = type::datetime($updated_at)",
+            )
+            .bind(("updated_at", now))
+            .await
+            .map_err(surreal_err)?;
+        Ok(())
     }
 
     /// Get the shared SurrealDB handle (for external store construction).
@@ -535,6 +609,18 @@ impl MemorySubstrate {
         self.knowledge.list_entities(offset, limit).await
     }
 
+    /// List graph entities for one agent.
+    pub async fn list_entities_for_agent(
+        &self,
+        agent_id: AgentId,
+        offset: usize,
+        limit: usize,
+    ) -> OpenFangResult<Vec<Entity>> {
+        self.knowledge
+            .list_entities_for_agent(agent_id, offset, limit)
+            .await
+    }
+
     /// List graph relations for read-only inspection.
     pub async fn list_relations(
         &self,
@@ -542,6 +628,18 @@ impl MemorySubstrate {
         limit: usize,
     ) -> OpenFangResult<Vec<GraphMatch>> {
         self.knowledge.list_relations(offset, limit).await
+    }
+
+    /// List graph relations for one agent.
+    pub async fn list_relations_for_agent(
+        &self,
+        agent_id: AgentId,
+        offset: usize,
+        limit: usize,
+    ) -> OpenFangResult<Vec<GraphMatch>> {
+        self.knowledge
+            .list_relations_for_agent(agent_id, offset, limit)
+            .await
     }
 
     /// Multi-hop graph traversal from a source entity (up to 3 hops).
@@ -555,6 +653,18 @@ impl MemorySubstrate {
     ) -> OpenFangResult<Vec<crate::knowledge::TraversalNode>> {
         self.knowledge
             .traverse_from(source_entity_id, max_depth)
+            .await
+    }
+
+    /// Multi-hop graph traversal from a source entity constrained to one agent.
+    pub async fn traverse_from_entity_for_agent(
+        &self,
+        source_entity_id: &str,
+        agent_id: AgentId,
+        max_depth: usize,
+    ) -> OpenFangResult<Vec<crate::knowledge::TraversalNode>> {
+        self.knowledge
+            .traverse_from_for_agent(source_entity_id, agent_id, max_depth)
             .await
     }
 
@@ -915,6 +1025,25 @@ mod tests {
             .unwrap();
         let val = substrate.get(agent_id, "key").await.unwrap();
         assert_eq!(val, Some(serde_json::json!("value")));
+    }
+
+    #[tokio::test]
+    async fn test_global_profile_user_name_roundtrip() {
+        let substrate = MemorySubstrate::open_in_memory().await.unwrap();
+
+        assert_eq!(substrate.global_profile_user_name().await.unwrap(), None);
+        substrate
+            .set_global_profile_user_name("Alice")
+            .await
+            .unwrap();
+        assert_eq!(
+            substrate
+                .global_profile_user_name()
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Alice")
+        );
     }
 
     #[tokio::test]

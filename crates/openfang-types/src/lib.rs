@@ -15,6 +15,7 @@ pub mod event;
 pub mod manifest_signing;
 pub mod media;
 pub mod memory;
+pub mod memory_dimensions;
 pub mod message;
 pub mod model_catalog;
 pub mod scheduler;

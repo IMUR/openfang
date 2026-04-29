@@ -7,6 +7,9 @@ use crate::kernel_handle::KernelHandle;
 use crate::mcp;
 use crate::web_search::{parse_ddg_results, WebToolsContext};
 use openfang_skills::registry::SkillRegistry;
+use openfang_types::memory_dimensions::{
+    MemoryContract, MemoryDataModel, MemoryIntelligence, MemorySubstrateKind, MemorySurfaceSpec,
+};
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
 use openfang_types::tool::{ToolDefinition, ToolResult};
 use openfang_types::tool_compat::normalize_tool_name;
@@ -17,6 +20,50 @@ use tracing::{debug, warn};
 
 /// Maximum inter-agent call depth to prevent infinite recursion (A->B->C->...).
 const MAX_AGENT_CALL_DEPTH: u32 = 5;
+
+const MEMORY_TOOL_SURFACE_IDS: &[&str] = &[
+    "memory_set",
+    "memory_get",
+    "memory_store",
+    "memory_recall",
+    "memory_list",
+    "memory_delete",
+];
+
+const KNOWLEDGE_TOOL_SURFACE_IDS: &[&str] = &[
+    "knowledge_add_entity",
+    "knowledge_add_relation",
+    "knowledge_query",
+];
+
+/// Tool-contract surface declarations owned by the runtime tool dispatcher.
+pub fn tool_contract_surface_specs() -> Vec<MemorySurfaceSpec> {
+    MEMORY_TOOL_SURFACE_IDS
+        .iter()
+        .map(|id| MemorySurfaceSpec {
+            id,
+            description: "Built-in key-value memory tool",
+            storage_tables: &["kv"],
+            substrates: &[MemorySubstrateKind::SurrealDb],
+            data_models: &[MemoryDataModel::KeyValue],
+            contracts: &[MemoryContract::Tool],
+            intelligence: &[MemoryIntelligence::None],
+        })
+        .chain(
+            KNOWLEDGE_TOOL_SURFACE_IDS
+                .iter()
+                .map(|id| MemorySurfaceSpec {
+                    id,
+                    description: "Built-in knowledge graph tool",
+                    storage_tables: &["entities", "relations"],
+                    substrates: &[MemorySubstrateKind::SurrealDb],
+                    data_models: &[MemoryDataModel::Graph, MemoryDataModel::Document],
+                    contracts: &[MemoryContract::Tool],
+                    intelligence: &[MemoryIntelligence::Ner],
+                }),
+        )
+        .collect()
+}
 
 /// Check if a tool name refers to a shell execution tool.
 ///
@@ -301,8 +348,8 @@ pub async fn execute_tool(
         "agent_kill" => tool_agent_kill(input, kernel),
 
         // Memory tools (capability-checked, namespace-routed)
-        "memory_store" => tool_memory_store(input, kernel, caller_agent_id),
-        "memory_recall" => tool_memory_recall(input, kernel, caller_agent_id),
+        "memory_set" | "memory_store" => tool_memory_store(input, kernel, caller_agent_id),
+        "memory_get" | "memory_recall" => tool_memory_recall(input, kernel, caller_agent_id),
         "memory_list" => tool_memory_list(input, kernel, caller_agent_id),
         "memory_delete" => tool_memory_delete(input, kernel, caller_agent_id),
 
@@ -320,9 +367,11 @@ pub async fn execute_tool(
         "schedule_delete" => tool_schedule_delete(input, kernel).await,
 
         // Knowledge graph tools
-        "knowledge_add_entity" => tool_knowledge_add_entity(input, kernel).await,
-        "knowledge_add_relation" => tool_knowledge_add_relation(input, kernel).await,
-        "knowledge_query" => tool_knowledge_query(input, kernel).await,
+        "knowledge_add_entity" => tool_knowledge_add_entity(input, kernel, caller_agent_id).await,
+        "knowledge_add_relation" => {
+            tool_knowledge_add_relation(input, kernel, caller_agent_id).await
+        }
+        "knowledge_query" => tool_knowledge_query(input, kernel, caller_agent_id).await,
 
         // Image analysis tool
         "image_analyze" => tool_image_analyze(input).await,
@@ -698,8 +747,40 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         // --- Memory tools (capability-checked, namespace-routed) ---
         ToolDefinition {
+            name: "memory_set".to_string(),
+            description: "Set an exact key-value memory entry. Keys prefixed with 'self.' are private to this agent; bare keys and 'shared.' keys are shared agent memory.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "Storage key. Use 'self.X' for private agent memory, bare keys for shared memory."
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "The value to store (JSON-encode objects/arrays, or pass a plain string)"
+                    }
+                },
+                "required": ["key", "value"]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_get".to_string(),
+            description: "Get an exact key-value memory entry by key. This is not semantic search; use the exact key you stored.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "The storage key to get. Use 'self.X' for private keys."
+                    }
+                },
+                "required": ["key"]
+            }),
+        },
+        ToolDefinition {
             name: "memory_store".to_string(),
-            description: "Store a value in memory. Keys prefixed with 'self.' are private to this agent; all other keys are shared across agents.".to_string(),
+            description: "Deprecated alias for memory_set. Set an exact key-value memory entry.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -717,7 +798,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "memory_recall".to_string(),
-            description: "Recall a value from memory by key. Respects the same 'self.' namespace convention as memory_store.".to_string(),
+            description: "Deprecated alias for memory_get. Gets an exact key-value memory entry by key; this is not semantic search.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -746,7 +827,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "memory_delete".to_string(),
-            description: "Delete a key from memory. Respects the same 'self.' namespace convention as memory_store.".to_string(),
+            description: "Delete an exact key-value memory entry. Respects the same 'self.' namespace convention as memory_set.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1943,6 +2024,7 @@ fn parse_relation_type(s: &str) -> openfang_types::memory::RelationType {
 async fn tool_knowledge_add_entity(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let name = input["name"].as_str().ok_or("Missing 'name' parameter")?;
@@ -1957,6 +2039,9 @@ async fn tool_knowledge_add_entity(
 
     let entity = openfang_types::memory::Entity {
         id: String::new(), // kernel/store assigns a real ID
+        agent_id: caller_agent_id
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .map(openfang_types::agent::AgentId),
         entity_type: parse_entity_type(entity_type_str),
         name: name.to_string(),
         properties,
@@ -1971,6 +2056,7 @@ async fn tool_knowledge_add_entity(
 async fn tool_knowledge_add_relation(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let source = input["source"]
@@ -1990,6 +2076,9 @@ async fn tool_knowledge_add_relation(
         .unwrap_or_default();
 
     let relation = openfang_types::memory::Relation {
+        agent_id: caller_agent_id
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .map(openfang_types::agent::AgentId),
         source: source.to_string(),
         relation: parse_relation_type(relation_str),
         target: target.to_string(),
@@ -2007,6 +2096,7 @@ async fn tool_knowledge_add_relation(
 async fn tool_knowledge_query(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let source = input["source"].as_str().map(|s| s.to_string());
@@ -2015,6 +2105,9 @@ async fn tool_knowledge_query(
     let max_depth = input["max_depth"].as_u64().unwrap_or(1) as u32;
 
     let pattern = openfang_types::memory::GraphPattern {
+        agent_id: caller_agent_id
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .map(openfang_types::agent::AgentId),
         source,
         relation,
         target,
@@ -3495,6 +3588,8 @@ mod tests {
         assert!(names.contains(&"agent_spawn"));
         assert!(names.contains(&"agent_list"));
         assert!(names.contains(&"agent_kill"));
+        assert!(names.contains(&"memory_set"));
+        assert!(names.contains(&"memory_get"));
         assert!(names.contains(&"memory_store"));
         assert!(names.contains(&"memory_recall"));
         // 6 collaboration tools
@@ -3543,6 +3638,23 @@ mod tests {
         assert!(names.contains(&"docker_exec"));
         // Canvas tool
         assert!(names.contains(&"canvas_present"));
+    }
+
+    #[test]
+    fn memory_and_knowledge_tools_have_surface_specs() {
+        let tools = builtin_tool_definitions();
+        let specs = tool_contract_surface_specs();
+
+        for name in tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .filter(|name| name.starts_with("memory_") || name.starts_with("knowledge_"))
+        {
+            assert!(
+                specs.iter().any(|spec| spec.id == name),
+                "missing tool contract surface spec for {name}"
+            );
+        }
     }
 
     #[test]
@@ -4367,6 +4479,7 @@ mod tests {
         created: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
         cancelled: std::sync::Mutex<Vec<String>>,
         jobs: std::sync::Mutex<Vec<serde_json::Value>>,
+        memory: std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
     }
 
     impl FakeKernelHandle {
@@ -4375,6 +4488,7 @@ mod tests {
                 created: std::sync::Mutex::new(Vec::new()),
                 cancelled: std::sync::Mutex::new(Vec::new()),
                 jobs: std::sync::Mutex::new(Vec::new()),
+                memory: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         }
 
@@ -4405,17 +4519,18 @@ mod tests {
         fn memory_store(
             &self,
             _agent_id: &str,
-            _key: &str,
-            _value: serde_json::Value,
+            key: &str,
+            value: serde_json::Value,
         ) -> Result<(), String> {
+            self.memory.lock().unwrap().insert(key.to_string(), value);
             Ok(())
         }
         fn memory_recall(
             &self,
             _agent_id: &str,
-            _key: &str,
+            key: &str,
         ) -> Result<Option<serde_json::Value>, String> {
-            Ok(None)
+            Ok(self.memory.lock().unwrap().get(key).cloned())
         }
         fn find_agents(&self, _query: &str) -> Vec<crate::kernel_handle::AgentInfo> {
             vec![]
@@ -4534,6 +4649,101 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("description"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_new_names_and_deprecated_aliases_share_kv_behavior() {
+        let fake = Arc::new(FakeKernelHandle::new());
+        let kernel: Arc<dyn crate::kernel_handle::KernelHandle> = fake;
+        let caller = Some("agent-1");
+
+        let set_result = execute_tool(
+            "set_1",
+            "memory_set",
+            &serde_json::json!({"key": "self.preference", "value": "dark"}),
+            Some(&kernel),
+            None,
+            caller,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!set_result.is_error);
+
+        let get_result = execute_tool(
+            "get_1",
+            "memory_get",
+            &serde_json::json!({"key": "self.preference"}),
+            Some(&kernel),
+            None,
+            caller,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(get_result.content.contains("dark"));
+
+        let alias_set = execute_tool(
+            "set_2",
+            "memory_store",
+            &serde_json::json!({"key": "legacy", "value": "works"}),
+            Some(&kernel),
+            None,
+            caller,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!alias_set.is_error);
+
+        let alias_get = execute_tool(
+            "get_2",
+            "memory_recall",
+            &serde_json::json!({"key": "legacy"}),
+            Some(&kernel),
+            None,
+            caller,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(alias_get.content.contains("works"));
     }
 
     #[tokio::test]

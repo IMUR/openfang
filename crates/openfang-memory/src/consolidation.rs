@@ -5,9 +5,22 @@
 
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
+use openfang_types::memory_dimensions::{
+    MemoryContract, MemoryDataModel, MemoryIntelligence, MemorySubstrateKind, MemorySurfaceSpec,
+};
 use surrealdb::types::SurrealValue;
 
 use crate::db::SurrealDb;
+
+pub const CONSOLIDATION_SURFACE: MemorySurfaceSpec = MemorySurfaceSpec {
+    id: "memory_consolidation",
+    description: "Operational decay, pruning, and summarization rewrites over memories",
+    storage_tables: &["memories"],
+    substrates: &[MemorySubstrateKind::SurrealDb],
+    data_models: &[MemoryDataModel::Document],
+    contracts: &[MemoryContract::Operations],
+    intelligence: &[MemoryIntelligence::Summarizer],
+};
 
 /// A single episodic memory item selected for L1 summarization.
 #[derive(Debug, Clone)]

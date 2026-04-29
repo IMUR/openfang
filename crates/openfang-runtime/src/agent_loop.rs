@@ -388,10 +388,19 @@ pub async fn run_agent_loop(
 
     // Graph-boosted recall: run NER on the query and promote memories that share entity overlap.
     #[cfg(feature = "memory-candle")]
+    let mut graph_query_entity_count = 0usize;
+    #[cfg(not(feature = "memory-candle"))]
+    let graph_query_entity_count = 0usize;
+    #[cfg(feature = "memory-candle")]
+    let mut graph_boosted_count = 0usize;
+    #[cfg(not(feature = "memory-candle"))]
+    let graph_boosted_count = 0usize;
+    #[cfg(feature = "memory-candle")]
     if let Some(ner) = ner_driver {
         if !memories.is_empty() {
             match ner.extract_entities(user_message, 0.60).await {
                 Ok(query_entities) if !query_entities.is_empty() => {
+                    graph_query_entity_count = query_entities.len();
                     use std::collections::HashSet;
                     let query_names: HashSet<String> = query_entities
                         .iter()
@@ -428,6 +437,7 @@ pub async fn run_agent_loop(
                         .collect();
                     scored.sort_by(|(oa, _), (ob, _)| ob.cmp(oa));
                     let boosted = scored.iter().filter(|(o, _)| *o > 0).count();
+                    graph_boosted_count = boosted;
                     memories = scored.into_iter().map(|(_, f)| f).collect();
                     debug!(
                         query_entities = query_entities.len(),
@@ -482,6 +492,9 @@ pub async fn run_agent_loop(
                 "query": user_message,
                 "result_count": memories.len(),
                 "retrieval_path": if embedding_driver.is_some() { "vector" } else { "text" },
+                "graph_query_entity_count": graph_query_entity_count,
+                "graph_boosted_count": graph_boosted_count,
+                "graph_boost_applied": graph_boosted_count > 0,
             }),
         };
         let _ = hook_reg.fire(&ctx);
@@ -1919,10 +1932,19 @@ pub async fn run_agent_loop_streaming(
 
     // Graph-boosted recall: run NER on the query and promote memories sharing entity overlap.
     #[cfg(feature = "memory-candle")]
+    let mut graph_query_entity_count_s = 0usize;
+    #[cfg(not(feature = "memory-candle"))]
+    let graph_query_entity_count_s = 0usize;
+    #[cfg(feature = "memory-candle")]
+    let mut graph_boosted_count_s = 0usize;
+    #[cfg(not(feature = "memory-candle"))]
+    let graph_boosted_count_s = 0usize;
+    #[cfg(feature = "memory-candle")]
     if let Some(ner) = ner_driver {
         if !memories.is_empty() {
             match ner.extract_entities(user_message, 0.60).await {
                 Ok(query_entities) if !query_entities.is_empty() => {
+                    graph_query_entity_count_s = query_entities.len();
                     use std::collections::HashSet;
                     let query_names: HashSet<String> = query_entities
                         .iter()
@@ -1959,6 +1981,7 @@ pub async fn run_agent_loop_streaming(
                         .collect();
                     scored.sort_by(|(oa, _), (ob, _)| ob.cmp(oa));
                     let boosted = scored.iter().filter(|(o, _)| *o > 0).count();
+                    graph_boosted_count_s = boosted;
                     memories = scored.into_iter().map(|(_, f)| f).collect();
                     debug!(
                         query_entities = query_entities.len(),
@@ -2013,6 +2036,9 @@ pub async fn run_agent_loop_streaming(
                 "query": user_message,
                 "result_count": memories.len(),
                 "retrieval_path": if embedding_driver.is_some() { "vector" } else { "text" },
+                "graph_query_entity_count": graph_query_entity_count_s,
+                "graph_boosted_count": graph_boosted_count_s,
+                "graph_boost_applied": graph_boosted_count_s > 0,
             }),
         };
         let _ = hook_reg.fire(&ctx);

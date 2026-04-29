@@ -152,6 +152,9 @@ impl MemoryFilter {
 pub struct Entity {
     /// Unique entity ID.
     pub id: String,
+    /// Agent that owns this entity. None means global/shared graph state.
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
     /// Entity type (Person, Organization, Project, etc.).
     pub entity_type: EntityType,
     /// Display name.
@@ -193,6 +196,9 @@ pub enum EntityType {
 /// A relation between two entities in the knowledge graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Relation {
+    /// Agent that owns this relation. None means global/shared graph state.
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
     /// Source entity ID.
     pub source: String,
     /// Relation type.
@@ -239,6 +245,9 @@ pub enum RelationType {
 /// A pattern for querying the knowledge graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphPattern {
+    /// Optional agent filter for graph isolation.
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
     /// Optional source entity filter.
     pub source: Option<String>,
     /// Optional relation type filter.

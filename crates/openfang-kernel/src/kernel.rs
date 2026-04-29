@@ -351,8 +351,8 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
          - Act first, narrate second. Use tools to accomplish tasks rather than describing what you'd do.\n\
          - Batch tool calls when possible \u{2014} don't output reasoning between each call.\n\
          - When a task is ambiguous, ask ONE clarifying question, not five.\n\
-         - Store important context in memory (memory_store) proactively.\n\
-         - Search memory (memory_recall) before asking the user for context they may have given before.\n\n\
+         - Store important context in exact-key memory (memory_set) proactively.\n\
+         - Use memory_get only for exact keys you already know; automatic semantic recall is injected separately.\n\n\
          ## Tool Usage Protocols\n\
          - file_read BEFORE file_write \u{2014} always understand what exists.\n\
          - web_search for current info, web_fetch for specific URLs.\n\
@@ -370,7 +370,7 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
          On your FIRST conversation with a new user, follow this protocol:\n\n\
          1. **Greet** \u{2014} Introduce yourself as {name} with a one-line summary of your specialty.\n\
          2. **Discover** \u{2014} Ask the user's name and one key preference relevant to your domain.\n\
-         3. **Store** \u{2014} Use memory_store to save: user_name, their preference, and today's date as first_interaction.\n\
+         3. **Store** \u{2014} Use memory_set to save: user_name, their preference, and today's date as first_interaction.\n\
          4. **Orient** \u{2014} Briefly explain what you can help with (2-3 bullet points, not a wall of text).\n\
          5. **Serve** \u{2014} If the user included a request in their first message, handle it immediately after steps 1-3.\n\n\
          After bootstrap, this protocol is complete. Focus entirely on the user's needs.\n",
@@ -1823,6 +1823,7 @@ impl OpenFangKernel {
                         );
                         let e = Entity {
                             id: entity_id.clone(),
+                            agent_id: Some(agent_id),
                             entity_type: entity.entity_type.clone(),
                             name: entity.text.clone(),
                             properties: std::collections::HashMap::new(),
@@ -2475,13 +2476,15 @@ impl OpenFangKernel {
         {
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
             let shared_id = shared_memory_agent_id();
-            let user_name = self
+            let profile_user_name = self.memory.global_profile_user_name().await.ok().flatten();
+            let shared_user_name = self
                 .memory
                 .structured_get(shared_id, "user_name")
                 .await
                 .ok()
                 .flatten()
                 .and_then(|v: serde_json::Value| v.as_str().map(String::from));
+            let user_name = profile_user_name.or(shared_user_name);
 
             let peer_agents: Vec<(String, String, String)> = self
                 .registry
@@ -3086,13 +3089,15 @@ impl OpenFangKernel {
         {
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
             let shared_id = shared_memory_agent_id();
-            let user_name = self
+            let profile_user_name = self.memory.global_profile_user_name().await.ok().flatten();
+            let shared_user_name = self
                 .memory
                 .structured_get(shared_id, "user_name")
                 .await
                 .ok()
                 .flatten()
                 .and_then(|v| v.as_str().map(String::from));
+            let user_name = profile_user_name.or(shared_user_name);
 
             let peer_agents: Vec<(String, String, String)> = self
                 .registry
@@ -3979,6 +3984,11 @@ impl OpenFangKernel {
         // Store the LLM summary in the canonical session
         self.memory
             .store_llm_summary(agent_id, &result.summary, result.kept_messages.clone())
+            .await
+            .map_err(KernelError::OpenFang)?;
+        let _summary_memory_id = self
+            .memory
+            .write_l1_summary(agent_id, &result.summary, Vec::new())
             .await
             .map_err(KernelError::OpenFang)?;
 
@@ -6948,18 +6958,99 @@ fn is_system_principal(id: AgentId) -> bool {
     id == shared_memory_agent_id()
 }
 
-/// Route a memory key to the correct storage namespace.
-///
-/// Keys prefixed with `self.` are stored under the calling agent's own ID,
-/// giving each agent a private KV partition.  All other keys (including bare
-/// keys and `shared.*`) go to the fixed shared namespace for cross-agent
-/// coordination.
-fn resolve_memory_namespace(key: &str, caller_id: AgentId) -> AgentId {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryKeyContract {
+    PrivateTool,
+    SharedTool,
+    Operations,
+    Runtime,
+    ProfileReserved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemoryKeySpec {
+    contract: MemoryKeyContract,
+    storage_id: AgentId,
+    reserved: bool,
+}
+
+const RESERVED_MEMORY_PREFIXES: &[(&str, MemoryKeyContract)] = &[
+    ("ops.", MemoryKeyContract::Operations),
+    ("runtime.", MemoryKeyContract::Runtime),
+    ("profile.", MemoryKeyContract::ProfileReserved),
+];
+
+fn classify_memory_key(key: &str, caller_id: AgentId) -> MemoryKeySpec {
     if key.starts_with("self.") {
-        caller_id
-    } else {
-        shared_memory_agent_id()
+        return MemoryKeySpec {
+            contract: MemoryKeyContract::PrivateTool,
+            storage_id: caller_id,
+            reserved: false,
+        };
     }
+
+    if let Some((_, contract)) = RESERVED_MEMORY_PREFIXES
+        .iter()
+        .find(|(prefix, _)| key.starts_with(prefix))
+    {
+        return MemoryKeySpec {
+            contract: *contract,
+            storage_id: shared_memory_agent_id(),
+            reserved: true,
+        };
+    }
+
+    MemoryKeySpec {
+        contract: MemoryKeyContract::SharedTool,
+        storage_id: shared_memory_agent_id(),
+        reserved: false,
+    }
+}
+
+fn memory_key_contract_capability(contract: MemoryKeyContract) -> &'static str {
+    match contract {
+        MemoryKeyContract::PrivateTool | MemoryKeyContract::SharedTool => "*",
+        MemoryKeyContract::Operations => "ops.*",
+        MemoryKeyContract::Runtime => "runtime.*",
+        MemoryKeyContract::ProfileReserved => "profile.*",
+    }
+}
+
+fn has_explicit_memory_contract_grant(
+    grants: &[Capability],
+    write: bool,
+    contract: MemoryKeyContract,
+    key: &str,
+) -> bool {
+    let contract_pattern = memory_key_contract_capability(contract);
+    grants.iter().any(|capability| match capability {
+        Capability::MemoryRead(pattern) if !write => pattern == key || pattern == contract_pattern,
+        Capability::MemoryWrite(pattern) if write => pattern == key || pattern == contract_pattern,
+        _ => false,
+    })
+}
+
+fn ensure_reserved_memory_key_allowed(
+    capabilities: &CapabilityManager,
+    caller_id: AgentId,
+    spec: &MemoryKeySpec,
+    key: &str,
+    write: bool,
+) -> Result<(), String> {
+    if !spec.reserved || is_system_principal(caller_id) {
+        return Ok(());
+    }
+
+    let grants = capabilities.list(caller_id);
+    if has_explicit_memory_contract_grant(&grants, write, spec.contract, key) {
+        return Ok(());
+    }
+
+    let contract = memory_key_contract_capability(spec.contract);
+    let operation = if write { "write" } else { "read" };
+    Err(format!(
+        "Memory {operation} denied for reserved key '{key}'; grant '{contract}' or the exact key explicitly"
+    ))
 }
 
 /// Sanitize a human-readable string into a valid `CronJob.name`.
@@ -7255,12 +7346,29 @@ impl KernelHandle for OpenFangKernel {
             }
         }
 
-        let storage_id = resolve_memory_namespace(key, caller_id);
-        tokio::task::block_in_place(|| {
+        let spec = classify_memory_key(key, caller_id);
+        ensure_reserved_memory_key_allowed(&self.capabilities, caller_id, &spec, key, true)?;
+        let storage_id = spec.storage_id;
+        let profile_user_name = if key == "user_name" {
+            value.as_str().map(String::from)
+        } else {
+            None
+        };
+        let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(self.memory.structured_set(storage_id, key, value))
         })
-        .map_err(|e| format!("Memory store failed: {e}"))
+        .map_err(|e| format!("Memory store failed: {e}"));
+        if result.is_ok() {
+            if let Some(name) = profile_user_name {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(self.memory.set_global_profile_user_name(&name))
+                })
+                .map_err(|e| format!("Profile update failed: {e}"))?;
+            }
+        }
+        result
     }
 
     fn memory_recall(
@@ -7281,7 +7389,9 @@ impl KernelHandle for OpenFangKernel {
             }
         }
 
-        let storage_id = resolve_memory_namespace(key, caller_id);
+        let spec = classify_memory_key(key, caller_id);
+        ensure_reserved_memory_key_allowed(&self.capabilities, caller_id, &spec, key, false)?;
+        let storage_id = spec.storage_id;
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(self.memory.structured_get(storage_id, key))
         })
@@ -7336,7 +7446,9 @@ impl KernelHandle for OpenFangKernel {
             }
         }
 
-        let storage_id = resolve_memory_namespace(key, caller_id);
+        let spec = classify_memory_key(key, caller_id);
+        ensure_reserved_memory_key_allowed(&self.capabilities, caller_id, &spec, key, true)?;
+        let storage_id = spec.storage_id;
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(self.memory.structured_delete(storage_id, key))
@@ -8060,6 +8172,66 @@ mod tests {
         assert!(caps.contains(&Capability::ToolInvoke("file_read".to_string())));
         assert!(caps.contains(&Capability::AgentSpawn));
         assert_eq!(caps.len(), 3); // 2 tools + agent_spawn
+    }
+
+    #[test]
+    fn memory_key_classifier_routes_private_shared_and_reserved_keys() {
+        let caller = AgentId::new();
+        let private = classify_memory_key("self.user_name", caller);
+        assert_eq!(private.contract, MemoryKeyContract::PrivateTool);
+        assert_eq!(private.storage_id, caller);
+        assert!(!private.reserved);
+
+        let shared = classify_memory_key("shared.topic", caller);
+        assert_eq!(shared.contract, MemoryKeyContract::SharedTool);
+        assert_eq!(shared.storage_id, shared_memory_agent_id());
+        assert!(!shared.reserved);
+
+        let ops = classify_memory_key("ops.migration.done", caller);
+        assert_eq!(ops.contract, MemoryKeyContract::Operations);
+        assert_eq!(ops.storage_id, shared_memory_agent_id());
+        assert!(ops.reserved);
+    }
+
+    #[test]
+    fn wildcard_memory_capability_does_not_grant_reserved_key_contract() {
+        let mgr = CapabilityManager::new();
+        let caller = AgentId::new();
+        mgr.grant(
+            caller,
+            vec![
+                Capability::MemoryRead("*".to_string()),
+                Capability::MemoryWrite("*".to_string()),
+            ],
+        );
+        let spec = classify_memory_key("ops.migration.done", caller);
+
+        assert!(ensure_reserved_memory_key_allowed(
+            &mgr,
+            caller,
+            &spec,
+            "ops.migration.done",
+            true
+        )
+        .is_err());
+        assert!(ensure_reserved_memory_key_allowed(
+            &mgr,
+            caller,
+            &spec,
+            "ops.migration.done",
+            false
+        )
+        .is_err());
+
+        mgr.grant(caller, vec![Capability::MemoryWrite("ops.*".to_string())]);
+        assert!(ensure_reserved_memory_key_allowed(
+            &mgr,
+            caller,
+            &spec,
+            "ops.migration.done",
+            true
+        )
+        .is_ok());
     }
 
     fn test_manifest(name: &str, description: &str, tags: Vec<String>) -> AgentManifest {

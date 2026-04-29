@@ -19,8 +19,8 @@ pub fn map_tool_name(openclaw_name: &str) -> Option<&'static str> {
         "WebSearch" | "web_search" => Some("web_search"),
         "WebFetch" | "fetch_url" | "web_fetch" => Some("web_fetch"),
         "browser_navigate" => Some("browser_navigate"),
-        "memory_search" | "memory_recall" => Some("memory_recall"),
-        "memory_save" | "memory_store" => Some("memory_store"),
+        "memory_search" | "memory_recall" | "memory_get" => Some("memory_get"),
+        "memory_save" | "memory_store" | "memory_set" => Some("memory_set"),
         "sessions_send" | "agent_message" => Some("agent_send"),
         "sessions_list" | "agents_list" | "agent_list" => Some("agent_list"),
         "sessions_spawn" => Some("agent_send"),
@@ -60,6 +60,8 @@ pub fn is_known_openfang_tool(name: &str) -> bool {
             | "web_search"
             | "web_fetch"
             | "browser_navigate"
+            | "memory_get"
+            | "memory_set"
             | "memory_recall"
             | "memory_store"
             | "agent_send"
@@ -114,10 +116,12 @@ mod tests {
         assert_eq!(map_tool_name("web_fetch"), Some("web_fetch"));
         assert_eq!(map_tool_name("web_search"), Some("web_search"));
         assert_eq!(map_tool_name("browser_navigate"), Some("browser_navigate"));
-        assert_eq!(map_tool_name("memory_search"), Some("memory_recall"));
-        assert_eq!(map_tool_name("memory_recall"), Some("memory_recall"));
-        assert_eq!(map_tool_name("memory_save"), Some("memory_store"));
-        assert_eq!(map_tool_name("memory_store"), Some("memory_store"));
+        assert_eq!(map_tool_name("memory_search"), Some("memory_get"));
+        assert_eq!(map_tool_name("memory_recall"), Some("memory_get"));
+        assert_eq!(map_tool_name("memory_get"), Some("memory_get"));
+        assert_eq!(map_tool_name("memory_save"), Some("memory_set"));
+        assert_eq!(map_tool_name("memory_store"), Some("memory_set"));
+        assert_eq!(map_tool_name("memory_set"), Some("memory_set"));
         assert_eq!(map_tool_name("sessions_send"), Some("agent_send"));
         assert_eq!(map_tool_name("agent_message"), Some("agent_send"));
         assert_eq!(map_tool_name("sessions_list"), Some("agent_list"));
@@ -184,6 +188,8 @@ mod tests {
             "web_search",
             "web_fetch",
             "browser_navigate",
+            "memory_get",
+            "memory_set",
             "memory_recall",
             "memory_store",
             "agent_send",

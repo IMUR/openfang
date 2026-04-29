@@ -99,6 +99,7 @@ DEFINE FIELD IF NOT EXISTS created_at ON usage TYPE any;
 
 -- Entities table (knowledge graph nodes)
 DEFINE TABLE IF NOT EXISTS entities SCHEMALESS;
+DEFINE FIELD IF NOT EXISTS agent_id ON entities TYPE option<string> | null;
 DEFINE FIELD IF NOT EXISTS entity_type ON entities TYPE any;
 DEFINE FIELD IF NOT EXISTS name ON entities TYPE string;
 DEFINE FIELD IF NOT EXISTS properties ON entities TYPE object FLEXIBLE;
@@ -107,6 +108,7 @@ DEFINE FIELD IF NOT EXISTS updated_at ON entities TYPE any;
 
 -- Relations table (knowledge graph edges)
 DEFINE TABLE IF NOT EXISTS relations TYPE RELATION SCHEMALESS;
+DEFINE FIELD IF NOT EXISTS agent_id ON relations TYPE option<string> | null;
 DEFINE FIELD IF NOT EXISTS relation_type ON relations TYPE any;
 DEFINE FIELD IF NOT EXISTS properties ON relations TYPE object FLEXIBLE;
 DEFINE FIELD IF NOT EXISTS confidence ON relations TYPE float;
@@ -120,6 +122,11 @@ DEFINE FIELD IF NOT EXISTS platform ON paired_devices TYPE string;
 DEFINE FIELD IF NOT EXISTS paired_at ON paired_devices TYPE any;
 DEFINE FIELD IF NOT EXISTS last_seen ON paired_devices TYPE any;
 DEFINE FIELD IF NOT EXISTS push_token ON paired_devices TYPE option<string> | null;
+
+-- Profile authority
+DEFINE TABLE IF NOT EXISTS profiles SCHEMALESS;
+DEFINE FIELD IF NOT EXISTS user_name ON profiles TYPE option<string> | null;
+DEFINE FIELD IF NOT EXISTS updated_at ON profiles TYPE any;
 
 -- Task queue
 DEFINE TABLE IF NOT EXISTS task_queue SCHEMALESS;

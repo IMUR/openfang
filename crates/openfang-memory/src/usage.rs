@@ -5,11 +5,24 @@
 use chrono::Utc;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
+use openfang_types::memory_dimensions::{
+    MemoryContract, MemoryDataModel, MemoryIntelligence, MemorySubstrateKind, MemorySurfaceSpec,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use surrealdb::types::SurrealValue;
 
 use crate::db::SurrealDb;
+
+pub const USAGE_SURFACE: MemorySurfaceSpec = MemorySurfaceSpec {
+    id: "usage",
+    description: "Token and cost usage events",
+    storage_tables: &["usage"],
+    substrates: &[MemorySubstrateKind::SurrealDb],
+    data_models: &[MemoryDataModel::Document],
+    contracts: &[MemoryContract::Operations],
+    intelligence: &[MemoryIntelligence::None],
+};
 
 macro_rules! surreal_via_json {
     ($t:ty) => {

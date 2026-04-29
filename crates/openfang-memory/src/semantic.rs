@@ -21,6 +21,9 @@ use chrono::Utc;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{MemoryFilter, MemoryFragment, MemoryId, MemorySource};
+use openfang_types::memory_dimensions::{
+    MemoryContract, MemoryDataModel, MemoryIntelligence, MemorySubstrateKind, MemorySurfaceSpec,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::debug;
@@ -53,6 +56,25 @@ macro_rules! surreal_via_json {
 pub struct SemanticStore {
     db: SurrealDb,
 }
+
+pub const MEMORY_SURFACE: MemorySurfaceSpec = MemorySurfaceSpec {
+    id: "memories",
+    description: "Semantic memory fragments with document, vector, and full-text retrieval",
+    storage_tables: &["memories"],
+    substrates: &[MemorySubstrateKind::SurrealDb],
+    data_models: &[
+        MemoryDataModel::Document,
+        MemoryDataModel::Vector,
+        MemoryDataModel::FullText,
+    ],
+    contracts: &[MemoryContract::Context, MemoryContract::Operations],
+    intelligence: &[
+        MemoryIntelligence::Embedding,
+        MemoryIntelligence::Classifier,
+        MemoryIntelligence::Reranker,
+        MemoryIntelligence::FullTextTokenizer,
+    ],
+};
 
 /// Memory record as persisted in SurrealDB.
 #[derive(Debug, Serialize, Deserialize)]
