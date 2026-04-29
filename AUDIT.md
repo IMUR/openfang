@@ -175,5 +175,5 @@ Before merging any new tool that makes HTTP calls:
 
 ## Environment Notes
 
-- `openfang-desktop` requires `pango` system headers (GTK). Not available on `prtr`. Excluded from `cargo test` with `--exclude openfang-desktop`. Build the desktop crate only on a machine with GTK dev packages installed.
+- `openfang-desktop` requires `pango` system headers (GTK). Excluded from `cargo test` with `--exclude openfang-desktop` on hosts without GTK dev packages installed.
 - `TAVILY_API_KEY`, `ELEVENLABS_API_KEY`, and provider-specific keys must be in the environment for integration tests. Unit tests mock these paths.

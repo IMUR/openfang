@@ -1,2 +1,0 @@
-Only thing I'd add: once add-schema-ddl lands and you have DEFINE INDEX ... HNSW DIMENSION N DIST COSINE in db::init(), you need to know what embedding dimension your system is actually using. That number has to match exactly or the index silently does nothing. Worth confirming that before the agent writes the DDL — check what model generates the embeddings and what dimension it outputs. If it's, say, 1536 from OpenAI or 1024 from Mistral, the DIMENSION in the DDL needs to match.
-Otherwise this plan is ready to execute. Ship it.

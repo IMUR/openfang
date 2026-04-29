@@ -32,30 +32,11 @@ Health detail includes `memory_candle_binary: true|false` so operators know whet
 
 ---
 
-## Machine GPU Allocation
+## Compute Allocation
 
-### prtr (Projector)
+Memory intelligence runs on **CPU** with AVX-512 — all Candle BERT models load FP32 in-process with `cuda_device` omitted. CUDA is compile-time disabled in this deployment (`candle-core` built without the `cuda` feature) since the host GPUs are pre-Volta (CC < 7.0) and lack Tensor Cores. CPU inference measures 5–15ms per embedding.
 
-
-| GPU         | VRAM             | CC  | Role                                  | Status |
-| ----------- | ---------------- | --- | ------------------------------------- | ------ |
-| GTX 970 #0  | 4GB (3.5GB fast) | 5.2 | Unassigned                            | Idle   |
-| GTX 1080 #1 | 8GB              | 6.1 | Freed (prev. Whisper+Kokoro, retired) | Idle   |
-| GTX 1080 #2 | 8GB              | 6.1 | Ollama LLMs                           | Active |
-| GTX 970 #3  | 4GB (3.5GB fast) | 5.2 | Unassigned                            | Idle   |
-
-
-### drtr (Director)
-
-
-| GPU      | VRAM | CC           | Role                                                   | Status              |
-| -------- | ---- | ------------ | ------------------------------------------------------ | ------------------- |
-| RTX 2080 | 8GB  | 7.5 (Turing) | **Voice pipeline** (Chatterbox 3.2GB + Parakeet 1.4GB) | Active, ~4.6GB used |
-
-
-Memory intelligence runs on **CPU** (i9-9900X with AVX-512). All Candle BERT models load FP32 in-process with `cuda_device` omitted.
-
-All four prtr GPUs are **Maxwell/Pascal** (pre-Volta, CC 5.2-6.1). None have Tensor Cores. Candle CUDA is compile-time disabled (`candle-core` built without the `cuda` feature). The `rtr/candle-kernels` patch repo on Forgejo still exists but is no longer referenced in `Cargo.toml`.
+Voice (STT/TTS) runs on a separate node with a Turing-class GPU (RTX 2080), reachable as a network service.
 
 ---
 
@@ -139,15 +120,15 @@ The kernel holds optional `Arc<>` handles (`ner_driver`, `reranker`, `classifier
 
 ### CUDA Status
 
-CUDA is **compile-time disabled** — `candle-core` is built without the `cuda` feature, so no CUDA kernels are compiled and `candle-kernels` is not a dependency. This eliminates the previous requirement for a pre-Volta kernel patch (`rtr/candle-kernels` on Forgejo). The patch repo still exists but is no longer referenced in `Cargo.toml`.
+CUDA is **compile-time disabled** — `candle-core` is built without the `cuda` feature, so no CUDA kernels are compiled and `candle-kernels` is not a dependency. This eliminates the previous requirement for a pre-Volta kernel patch.
 
-All four GPUs on prtr are pre-Volta (CC 5.2/6.1) with no Tensor Cores. CPU inference via AVX-512 is 5-15ms per embedding — adequate for the current workload. To re-enable CUDA in the future (e.g. with an SM 7.0+ GPU), add `features = ["cuda"]` back to the `candle-core` workspace dependency.
+In this deployment all available GPUs are pre-Volta (CC 5.2/6.1) with no Tensor Cores. CPU inference via AVX-512 is 5-15ms per embedding — adequate for the current workload. To re-enable CUDA in the future (e.g. with an SM 7.0+ GPU), add `features = ["cuda"]` back to the `candle-core` workspace dependency.
 
 ---
 
 ## Agent Interface to Memory
 
-Agents interact with the memory system through distinct contracts. Understanding which contract does what matters when debugging context issues or extending agent behaviour. The canonical dimensions framing lives in `/mnt/ops/canon/openfang/memory-intelligence.md`.
+Agents interact with the memory system through distinct contracts. Understanding which contract does what matters when debugging context issues or extending agent behaviour.
 
 ### Context Contract — Automatic Pre-Turn Injection (transparent, semantic store)
 

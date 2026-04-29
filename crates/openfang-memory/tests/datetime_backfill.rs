@@ -158,7 +158,7 @@ async fn datetime_backfill_queries_convert_strings() {
 }
 
 #[tokio::test]
-#[ignore = "requires stopped daemon and OPENFANG_BACKFILL_DB=/home/prtr/.openfang/data/openfang.db"]
+#[ignore = "requires stopped daemon and OPENFANG_BACKFILL_DB=$HOME/.openfang/data/openfang.db"]
 async fn datetime_backfill_live_database() {
     let db_path = std::env::var("OPENFANG_BACKFILL_DB")
         .expect("set OPENFANG_BACKFILL_DB to the stopped live database path");

@@ -128,7 +128,7 @@ Either the rule needs to formalize that breadth, or `USER.md` needs a clean cont
 
 ### 1. Drop the historical layering. Use the three axes.
 
-Stop calling memory subsystems Layer 1, 2, 3. Adopt the substrate / access / intelligence framing above. Update the canon docs (`/mnt/ops/canon/openfang/memory-intelligence.md`) to describe each subsystem by its position on each axis. The seventeen-section prompt assembly in `prompt_builder.rs` is the existing implementation — document what it actually does, in the vocabulary it already implies.
+Stop calling memory subsystems Layer 1, 2, 3. Adopt the substrate / access / intelligence framing above. Update the canon docs to describe each subsystem by its position on each axis. The seventeen-section prompt assembly in `prompt_builder.rs` is the existing implementation — document what it actually does, in the vocabulary it already implies.
 
 ### 2. Codify authority with a clear lock boundary.
 

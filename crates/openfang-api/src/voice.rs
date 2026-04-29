@@ -533,7 +533,7 @@ pub fn encode_pcm_to_frames(pcm: &[i16], use_opus: bool) -> Vec<Vec<u8>> {
 // STT Client
 // ---------------------------------------------------------------------------
 
-/// HTTP client for the Parakeet TDT STT service (drtr:7733, `/v1/audio/transcriptions`).
+/// HTTP client for the Parakeet TDT STT service (`/v1/audio/transcriptions`).
 pub struct SttClient {
     endpoint: String,
     model: String,
@@ -592,7 +592,7 @@ impl SttClient {
 // TTS Client
 // ---------------------------------------------------------------------------
 
-/// HTTP client for the Chatterbox-Turbo TTS service (drtr:7744, `/v1/audio/speech`).
+/// HTTP client for the Chatterbox-Turbo TTS service (`/v1/audio/speech`).
 pub struct TtsClient {
     endpoint: String,
     voice: String,

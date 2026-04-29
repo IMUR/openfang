@@ -73,7 +73,7 @@ Cross-agent state and user preferences:
 ### Value formats are inconsistent
 
 - Some values are JSON arrays: `["Bridging human-AI gap...", "North Star as..."]`
-- Some are structured objects: `{"Projector": "prtr", ...}`
+- Some are structured objects: `{"name": "host-a", ...}`
 - Some are free text paragraphs (the cassette architecture entry is a full markdown doc)
 - Some are single values: dates, counts, status strings
 

@@ -60,7 +60,7 @@ chrono-tz = "0.10"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 # ML Inference (Candle — in-process BERT on CUDA, GTX 970 #0)
-# candle-kernels is patched at git.ism.la/rtr/candle-kernels to skip WMMA MoE
+# candle-kernels is patched in a private fork to skip WMMA MoE
 # kernels on pre-Volta GPUs (CC < 7.0). GTX 970 is CC 5.2, GTX 1080 is CC 6.1.
 # candle-onnx: requires protoc; re-enable for Phase 2 (Liquid LFM2 ONNX models).
 candle-core = { version = "0.10" }

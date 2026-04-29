@@ -75,7 +75,7 @@ This gives the team a coherent vocabulary for *why* a piece of state lives where
 
 ### 1. Drop the historical layering. Use behavior.
 
-Stop calling memory subsystems Layer 1, 2, 3. Adopt the storage / access framing above. Update the canon docs (`/mnt/ops/canon/openfang/memory-intelligence.md`) to describe each subsystem by its position on both axes. The fifteen-section prompt assembly in `prompt_builder.rs` is the existing implementation — document what it actually does, in the vocabulary it already implies.
+Stop calling memory subsystems Layer 1, 2, 3. Adopt the storage / access framing above. Update the canon docs to describe each subsystem by its position on both axes. The fifteen-section prompt assembly in `prompt_builder.rs` is the existing implementation — document what it actually does, in the vocabulary it already implies.
 
 ### 2. Codify authority with controlled influence.
 
