@@ -1672,6 +1672,14 @@ pub struct MemoryConfig {
     /// How often to run memory consolidation (hours). 0 = disabled.
     #[serde(default = "default_consolidation_interval")]
     pub consolidation_interval_hours: u64,
+    /// Compact active sessions when message count exceeds this threshold.
+    pub compaction_threshold: usize,
+    /// Number of recent messages to keep verbatim after compaction.
+    pub compaction_keep_recent: usize,
+    /// Compact active sessions when estimated tokens exceed this fraction of model context.
+    pub compaction_token_threshold_ratio: f64,
+    /// Maximum tokens to ask the LLM for when generating compaction summaries.
+    pub compaction_max_summary_tokens: u32,
     /// CUDA device index for in-process Candle memory inference (embeddings when
     /// `embedding_provider = "candle"`, and NER/rerank when their backends are `candle`).
     /// None = CPU for all Candle workloads.
@@ -1753,6 +1761,10 @@ impl Default for MemoryConfig {
             embedding_provider: None,
             embedding_api_key_env: None,
             consolidation_interval_hours: default_consolidation_interval(),
+            compaction_threshold: 30,
+            compaction_keep_recent: 10,
+            compaction_token_threshold_ratio: 0.7,
+            compaction_max_summary_tokens: 1024,
             cuda_device: None,
             ner_backend: None,
             reranker_backend: None,

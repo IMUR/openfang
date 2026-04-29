@@ -14,6 +14,7 @@ use openfang_kernel::OpenFangKernel;
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
+#[cfg(feature = "memory-candle")]
 use openfang_types::memory::Memory;
 use openfang_types::memory_dimensions::{
     MemoryContract, MemoryDataModel, MemoryIntelligence, MemorySubstrateKind, MemorySurfaceSpec,

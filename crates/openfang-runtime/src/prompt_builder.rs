@@ -335,7 +335,12 @@ pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
     ctx.canonical_context
         .as_ref()
         .filter(|c| !c.is_empty())
-        .map(|c| format!("[Previous conversation context]\n{}", cap_str(c, 500)))
+        .map(|c| {
+            format!(
+                "[Compacted session summary]\n{}\n\n[Note: this is a summary of older transcript context, not exact-key KV memory and not raw verbatim turns.]",
+                cap_str(c, 500)
+            )
+        })
 }
 
 /// Build the memory section (Section 4).
@@ -973,7 +978,10 @@ mod tests {
         // But should be available via build_canonical_context_message
         let msg = build_canonical_context_message(&ctx);
         assert!(msg.is_some());
-        assert!(msg.unwrap().contains("Rust async patterns"));
+        let msg = msg.unwrap();
+        assert!(msg.contains("Compacted session summary"));
+        assert!(msg.contains("older transcript context"));
+        assert!(msg.contains("Rust async patterns"));
     }
 
     #[test]

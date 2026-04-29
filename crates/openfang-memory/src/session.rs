@@ -27,6 +27,16 @@ pub const SESSION_SURFACE: MemorySurfaceSpec = MemorySurfaceSpec {
     intelligence: &[MemoryIntelligence::Summarizer],
 };
 
+pub const TRANSCRIPT_ARCHIVE_SURFACE: MemorySurfaceSpec = MemorySurfaceSpec {
+    id: "transcript_archives",
+    description: "Durable transcript snapshots retained before active session compaction",
+    storage_tables: &["transcript_archives"],
+    substrates: &[MemorySubstrateKind::SurrealDb],
+    data_models: &[MemoryDataModel::Document],
+    contracts: &[MemoryContract::Operations, MemoryContract::Context],
+    intelligence: &[MemoryIntelligence::None],
+};
+
 /// Implement `SurrealValue` via serde-json round-trip for types that contain
 /// `openfang-types` structs (e.g. `Message`) which do not implement `SurrealValue`.
 macro_rules! surreal_via_json {
@@ -88,6 +98,17 @@ struct CanonicalRecord {
     updated_at: String,
 }
 surreal_via_json!(CanonicalRecord);
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TranscriptArchiveRecord {
+    agent_id: String,
+    session_id: String,
+    reason: String,
+    messages: Vec<Message>,
+    #[serde(deserialize_with = "openfang_types::datetime::deserialize_rfc3339_string")]
+    archived_at: String,
+}
+surreal_via_json!(TranscriptArchiveRecord);
 
 /// Session listing row.
 #[derive(Debug, Serialize, Deserialize)]
@@ -347,6 +368,61 @@ impl SessionStore {
         canonical.compaction_cursor = 0;
         canonical.updated_at = Utc::now().to_rfc3339();
         self.save_canonical(&canonical).await
+    }
+
+    /// Archive a full transcript snapshot before active session compaction.
+    pub async fn archive_transcript(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        messages: &[Message],
+        reason: &str,
+    ) -> OpenFangResult<String> {
+        let archive_id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let _: Option<TranscriptArchiveRecord> = self
+            .db
+            .upsert(("transcript_archives", archive_id.as_str()))
+            .content(TranscriptArchiveRecord {
+                agent_id: agent_id.0.to_string(),
+                session_id: session_id.0.to_string(),
+                reason: reason.to_string(),
+                messages: messages.to_vec(),
+                archived_at: now.clone(),
+            })
+            .await
+            .map_err(surreal_err)?;
+        self.db
+            .query(
+                "UPDATE type::record('transcript_archives', $id)
+                 SET archived_at = type::datetime($archived_at)",
+            )
+            .bind(("id", archive_id.clone()))
+            .bind(("archived_at", now))
+            .await
+            .map_err(surreal_err)?;
+        Ok(archive_id)
+    }
+
+    /// Return the most recent transcript archive for a session.
+    pub async fn latest_transcript_archive(
+        &self,
+        session_id: SessionId,
+    ) -> OpenFangResult<Option<Vec<Message>>> {
+        let mut result = self
+            .db
+            .query(
+                "SELECT agent_id, session_id, reason, messages, archived_at
+                 FROM transcript_archives
+                 WHERE session_id = $session_id
+                 ORDER BY archived_at DESC
+                 LIMIT 1",
+            )
+            .bind(("session_id", session_id.0.to_string()))
+            .await
+            .map_err(surreal_err)?;
+        let records: Vec<TranscriptArchiveRecord> = result.take(0).unwrap_or_default();
+        Ok(records.into_iter().next().map(|record| record.messages))
     }
 }
 

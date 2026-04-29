@@ -47,6 +47,14 @@ DEFINE FIELD IF NOT EXISTS compaction_cursor ON canonical_sessions TYPE int;
 DEFINE FIELD IF NOT EXISTS compacted_summary ON canonical_sessions TYPE option<string> | null;
 DEFINE FIELD IF NOT EXISTS updated_at ON canonical_sessions TYPE any;
 
+-- Durable transcript archives
+DEFINE TABLE IF NOT EXISTS transcript_archives SCHEMALESS;
+DEFINE FIELD IF NOT EXISTS agent_id ON transcript_archives TYPE string;
+DEFINE FIELD IF NOT EXISTS session_id ON transcript_archives TYPE string;
+DEFINE FIELD IF NOT EXISTS reason ON transcript_archives TYPE string;
+DEFINE FIELD IF NOT EXISTS messages ON transcript_archives TYPE array;
+DEFINE FIELD IF NOT EXISTS archived_at ON transcript_archives TYPE any;
+
 -- Memories table (semantic store)
 DEFINE TABLE IF NOT EXISTS memories SCHEMALESS;
 DEFINE FIELD IF NOT EXISTS agent_id ON memories TYPE string;

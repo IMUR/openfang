@@ -67,6 +67,85 @@ const MAX_CONTINUATIONS: u32 = 5;
 /// Maximum message history size before auto-trimming to prevent context overflow.
 const MAX_HISTORY_MESSAGES: usize = 20;
 
+async fn summarize_overlong_llm_context(
+    agent_name: &str,
+    model: &str,
+    session: &Session,
+    messages: Vec<Message>,
+    driver: Arc<dyn LlmDriver>,
+    context: &str,
+) -> Vec<Message> {
+    if messages.len() <= MAX_HISTORY_MESSAGES {
+        return messages;
+    }
+
+    let trim_count = messages.len() - MAX_HISTORY_MESSAGES;
+    warn!(
+        agent = %agent_name,
+        total_messages = messages.len(),
+        trimming = trim_count,
+        context,
+        "Summarizing old messages before active context trim"
+    );
+
+    let config = crate::compactor::CompactionConfig {
+        threshold: MAX_HISTORY_MESSAGES,
+        keep_recent: MAX_HISTORY_MESSAGES.saturating_sub(1).max(1),
+        ..crate::compactor::CompactionConfig::default()
+    };
+    let temp_session = Session {
+        id: session.id,
+        agent_id: session.agent_id,
+        messages: messages.clone(),
+        context_window_tokens: session.context_window_tokens,
+        label: session.label.clone(),
+    };
+
+    match crate::compactor::compact_session(driver, model, &temp_session, &config).await {
+        Ok(result) if result.compacted_count > 0 && !result.summary.trim().is_empty() => {
+            let mut compacted = Vec::with_capacity(result.kept_messages.len() + 1);
+            compacted.push(Message::user(format!(
+                "[Compacted earlier conversation summary]\n{}",
+                result.summary.trim()
+            )));
+            compacted.extend(result.kept_messages);
+            if compacted.len() > MAX_HISTORY_MESSAGES {
+                let keep_from = compacted.len().saturating_sub(MAX_HISTORY_MESSAGES);
+                compacted.drain(..keep_from);
+            }
+            let compacted = crate::session_repair::validate_and_repair(&compacted);
+            crate::session_repair::ensure_starts_with_user(compacted)
+        }
+        Ok(_) => messages,
+        Err(error) => {
+            warn!(
+                agent = %agent_name,
+                %error,
+                "Summarization failed; using explicit emergency trim marker"
+            );
+            emergency_trim_llm_context(messages)
+        }
+    }
+}
+
+fn emergency_trim_llm_context(mut messages: Vec<Message>) -> Vec<Message> {
+    if messages.len() <= MAX_HISTORY_MESSAGES {
+        return messages;
+    }
+    let keep = MAX_HISTORY_MESSAGES.saturating_sub(1).max(1);
+    let removed = messages.len().saturating_sub(keep);
+    let keep_from = messages.len().saturating_sub(keep);
+    messages.drain(..keep_from);
+    messages.insert(
+        0,
+        Message::user(format!(
+            "[System: {removed} earlier messages were removed after automatic summarization failed. The conversation continues from here.]"
+        )),
+    );
+    let messages = crate::session_repair::validate_and_repair(&messages);
+    crate::session_repair::ensure_starts_with_user(messages)
+}
+
 /// Detect when the LLM claims to have performed an action (sent, posted, emailed)
 /// without actually calling any tools. Prevents hallucinated completions.
 fn phantom_action_detected(text: &str) -> bool {
@@ -666,27 +745,15 @@ pub async fn run_agent_loop(
     // EndTurn iteration has empty text).
     let mut accumulated_text = String::new();
 
-    // Safety valve: trim excessively long message histories to prevent context overflow.
-    // The full compaction system handles sophisticated summarization, but this prevents
-    // the catastrophic case where 200+ messages cause instant context overflow.
-    if messages.len() > MAX_HISTORY_MESSAGES {
-        let trim_count = messages.len() - MAX_HISTORY_MESSAGES;
-        warn!(
-            agent = %manifest.name,
-            total_messages = messages.len(),
-            trimming = trim_count,
-            "Trimming old messages to prevent context overflow"
-        );
-        messages.drain(..trim_count);
-        // Re-validate after trimming: the drain may have split a ToolUse/ToolResult
-        // pair across the cut boundary, leaving orphaned blocks that cause the LLM
-        // to return empty responses (input_tokens=0).
-        messages = crate::session_repair::validate_and_repair(&messages);
-        // Ensure history starts with a user turn: trimming may have left an
-        // assistant turn at position 0, which strict providers (e.g. Gemini)
-        // reject with INVALID_ARGUMENT on function-call turns.
-        messages = crate::session_repair::ensure_starts_with_user(messages);
-    }
+    messages = summarize_overlong_llm_context(
+        &manifest.name,
+        &manifest.model.model,
+        session,
+        messages,
+        Arc::clone(&driver),
+        "non_streaming",
+    )
+    .await;
 
     // Use autonomous config max_iterations if set, else default
     let max_iterations = manifest
@@ -2164,25 +2231,15 @@ pub async fn run_agent_loop_streaming(
     let final_response;
     let mut accumulated_text = String::new();
 
-    // Safety valve: trim excessively long message histories to prevent context overflow.
-    if messages.len() > MAX_HISTORY_MESSAGES {
-        let trim_count = messages.len() - MAX_HISTORY_MESSAGES;
-        warn!(
-            agent = %manifest.name,
-            total_messages = messages.len(),
-            trimming = trim_count,
-            "Trimming old messages to prevent context overflow (streaming)"
-        );
-        messages.drain(..trim_count);
-        // Re-validate after trimming: the drain may have split a ToolUse/ToolResult
-        // pair across the cut boundary, leaving orphaned blocks that cause the LLM
-        // to return empty responses (input_tokens=0).
-        messages = crate::session_repair::validate_and_repair(&messages);
-        // Ensure history starts with a user turn: trimming may have left an
-        // assistant turn at position 0, which strict providers (e.g. Gemini)
-        // reject with INVALID_ARGUMENT on function-call turns.
-        messages = crate::session_repair::ensure_starts_with_user(messages);
-    }
+    messages = summarize_overlong_llm_context(
+        &manifest.name,
+        &manifest.model.model,
+        session,
+        messages,
+        Arc::clone(&driver),
+        "streaming",
+    )
+    .await;
 
     // Use autonomous config max_iterations if set, else default
     let max_iterations = manifest
@@ -4089,6 +4146,52 @@ mod tests {
         }
     }
 
+    struct RecordingCompactionDriver {
+        requests: std::sync::Mutex<Vec<CompletionRequest>>,
+        call_count: AtomicU32,
+    }
+
+    impl RecordingCompactionDriver {
+        fn new() -> Self {
+            Self {
+                requests: std::sync::Mutex::new(Vec::new()),
+                call_count: AtomicU32::new(0),
+            }
+        }
+
+        fn requests(&self) -> Vec<CompletionRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmDriver for RecordingCompactionDriver {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            let call = self.call_count.fetch_add(1, Ordering::Relaxed);
+            self.requests.lock().unwrap().push(request);
+            let text = if call == 0 {
+                "Summary of the older conversation context.".to_string()
+            } else {
+                "Main response after auto compaction.".to_string()
+            };
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text,
+                    provider_metadata: None,
+                }],
+                stop_reason: StopReason::EndTurn,
+                tool_calls: vec![],
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 8,
+                },
+            })
+        }
+    }
+
     struct FailingEmbeddingDriver;
 
     #[async_trait]
@@ -4342,6 +4445,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_overlong_context_is_summarized_before_llm_request() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = openfang_memory::session::Session {
+            id: openfang_types::agent::SessionId::new(),
+            agent_id,
+            messages: (0..25)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        Message::user(format!("old user turn {i}"))
+                    } else {
+                        Message::assistant(format!("old assistant turn {i}"))
+                    }
+                })
+                .collect(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        let manifest = test_manifest();
+        let driver = Arc::new(RecordingCompactionDriver::new());
+
+        let result = run_agent_loop(
+            &manifest,
+            "new request",
+            &mut session,
+            &memory,
+            driver.clone(),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            #[cfg(feature = "memory-candle")]
+            None,
+            #[cfg(feature = "memory-candle")]
+            None,
+            #[cfg(feature = "memory-candle")]
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("Loop should complete without error");
+
+        assert_eq!(result.response, "Main response after auto compaction.");
+        let requests = driver.requests();
+        assert!(
+            requests.len() >= 2,
+            "expected one compaction request and one main LLM request"
+        );
+        let main_request = requests.last().unwrap();
+        let prompt_text = main_request
+            .messages
+            .iter()
+            .map(|message| message.content.text_content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(prompt_text.contains("Summary of the older conversation context."));
+        assert!(
+            prompt_text.contains("[Compacted earlier conversation summary]"),
+            "main request should make summarized context explicit"
+        );
+        assert!(
+            main_request.messages.len() <= MAX_HISTORY_MESSAGES,
+            "main request should stay within the active history cap"
+        );
+    }
+
+    #[tokio::test]
     async fn test_embedding_fallback_preserves_classification_metadata() {
         let memory = openfang_memory::MemorySubstrate::open_in_memory()
             .await
@@ -4557,6 +4740,82 @@ mod tests {
         );
         assert!(fragment.metadata.contains_key("session_id"));
         assert!(fragment.metadata.contains_key("priority"));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_overlong_context_is_summarized_before_llm_request() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory()
+            .await
+            .unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = openfang_memory::session::Session {
+            id: openfang_types::agent::SessionId::new(),
+            agent_id,
+            messages: (0..25)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        Message::user(format!("old user turn {i}"))
+                    } else {
+                        Message::assistant(format!("old assistant turn {i}"))
+                    }
+                })
+                .collect(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        let manifest = test_manifest();
+        let driver = Arc::new(RecordingCompactionDriver::new());
+        let (tx, _rx) = mpsc::channel(64);
+
+        let result = run_agent_loop_streaming(
+            &manifest,
+            "new request",
+            &mut session,
+            &memory,
+            driver.clone(),
+            &[],
+            None,
+            tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            #[cfg(feature = "memory-candle")]
+            None,
+            #[cfg(feature = "memory-candle")]
+            None,
+            #[cfg(feature = "memory-candle")]
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("Streaming loop should complete without error");
+
+        assert_eq!(result.response, "Main response after auto compaction.");
+        let requests = driver.requests();
+        assert!(
+            requests.len() >= 2,
+            "expected one compaction request and one main LLM request"
+        );
+        let main_request = requests.last().unwrap();
+        let prompt_text = main_request
+            .messages
+            .iter()
+            .map(|message| message.content.text_content())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(prompt_text.contains("Summary of the older conversation context."));
+        assert!(prompt_text.contains("[Compacted earlier conversation summary]"));
+        assert!(main_request.messages.len() <= MAX_HISTORY_MESSAGES);
     }
 
     /// Mock driver that returns empty text on first call (EndTurn), then normal text on second.

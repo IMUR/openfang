@@ -409,6 +409,27 @@ impl MemorySubstrate {
             .await
     }
 
+    /// Archive a full transcript snapshot before active session compaction.
+    pub async fn archive_transcript(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        messages: &[openfang_types::message::Message],
+        reason: &str,
+    ) -> OpenFangResult<String> {
+        self.sessions
+            .archive_transcript(agent_id, session_id, messages, reason)
+            .await
+    }
+
+    /// Return the most recent transcript archive for a session.
+    pub async fn latest_transcript_archive(
+        &self,
+        session_id: SessionId,
+    ) -> OpenFangResult<Option<Vec<openfang_types::message::Message>>> {
+        self.sessions.latest_transcript_archive(session_id).await
+    }
+
     /// Write a human-readable JSONL mirror of a session to disk.
     pub async fn write_jsonl_mirror(
         &self,
@@ -768,6 +789,54 @@ impl MemorySubstrate {
             .await
     }
 
+    /// Write a semantic memory for an LLM session-compaction summary.
+    pub async fn write_session_compaction_summary(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        summary_text: &str,
+        compacted_count: usize,
+        chunks_used: u32,
+        used_fallback: bool,
+        reason: &str,
+    ) -> OpenFangResult<MemoryId> {
+        let mut meta: HashMap<String, serde_json::Value> = HashMap::new();
+        meta.insert(
+            "session_id".to_string(),
+            serde_json::json!(session_id.0.to_string()),
+        );
+        meta.insert(
+            "summary_type".to_string(),
+            serde_json::json!("session_compaction"),
+        );
+        meta.insert(
+            "compacted_count".to_string(),
+            serde_json::json!(compacted_count),
+        );
+        meta.insert("chunks_used".to_string(), serde_json::json!(chunks_used));
+        meta.insert(
+            "used_fallback".to_string(),
+            serde_json::json!(used_fallback),
+        );
+        meta.insert("compaction_reason".to_string(), serde_json::json!(reason));
+        meta.insert("source_role".to_string(), serde_json::json!("system"));
+        meta.insert("category".to_string(), serde_json::json!("observation"));
+        meta.insert(
+            "classification_source".to_string(),
+            serde_json::json!("session_compaction"),
+        );
+
+        self.semantic
+            .remember(
+                agent_id,
+                summary_text,
+                MemorySource::System,
+                openfang_types::memory::scope::SEMANTIC,
+                meta,
+            )
+            .await
+    }
+
     /// Post a new task to the shared queue. Returns the task ID.
     pub async fn task_post(
         &self,
@@ -1044,6 +1113,94 @@ mod tests {
                 .as_deref(),
             Some("Alice")
         );
+    }
+
+    #[tokio::test]
+    async fn test_session_compaction_summary_writes_semantic_memory() {
+        let substrate = MemorySubstrate::open_in_memory().await.unwrap();
+        let agent_id = AgentId::new();
+        let session_id = SessionId::new();
+
+        substrate
+            .write_session_compaction_summary(
+                agent_id,
+                session_id,
+                "The user discussed project goals and constraints.",
+                24,
+                2,
+                false,
+                "message_count",
+            )
+            .await
+            .unwrap();
+
+        let fragments = substrate
+            .inspect_fragments(
+                agent_id,
+                0,
+                10,
+                None,
+                Some(openfang_types::memory::scope::SEMANTIC),
+                None,
+                Some("session_compaction"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fragments.len(), 1);
+        let metadata = &fragments[0].metadata;
+        assert_eq!(
+            metadata
+                .get("summary_type")
+                .and_then(|value| value.as_str()),
+            Some("session_compaction")
+        );
+        assert_eq!(
+            metadata
+                .get("compacted_count")
+                .and_then(|value| value.as_u64()),
+            Some(24)
+        );
+        assert_eq!(
+            metadata.get("chunks_used").and_then(|value| value.as_u64()),
+            Some(2)
+        );
+        assert_eq!(
+            metadata
+                .get("compaction_reason")
+                .and_then(|value| value.as_str()),
+            Some("message_count")
+        );
+        assert_eq!(
+            metadata.get("session_id").and_then(|value| value.as_str()),
+            Some(session_id.0.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transcript_archive_retains_pre_compaction_messages() {
+        let substrate = MemorySubstrate::open_in_memory().await.unwrap();
+        let agent_id = AgentId::new();
+        let session_id = SessionId::new();
+        let messages = vec![
+            openfang_types::message::Message::user("old user turn"),
+            openfang_types::message::Message::assistant("old assistant turn"),
+        ];
+
+        substrate
+            .archive_transcript(agent_id, session_id, &messages, "message_count")
+            .await
+            .unwrap();
+
+        let archived = substrate
+            .latest_transcript_archive(session_id)
+            .await
+            .unwrap()
+            .expect("archive should exist");
+        assert_eq!(archived.len(), 2);
+        assert_eq!(archived[0].content.text_content(), "old user turn");
+        assert_eq!(archived[1].content.text_content(), "old assistant turn");
     }
 
     #[tokio::test]

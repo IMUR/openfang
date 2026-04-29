@@ -31,6 +31,7 @@ pub fn memory_surface_specs() -> Vec<openfang_types::memory_dimensions::MemorySu
         structured::AGENTS_SURFACE,
         knowledge::KNOWLEDGE_GRAPH_SURFACE,
         session::SESSION_SURFACE,
+        session::TRANSCRIPT_ARCHIVE_SURFACE,
         usage::USAGE_SURFACE,
         consolidation::CONSOLIDATION_SURFACE,
         substrate::PAIRED_DEVICES_SURFACE,
@@ -48,6 +49,7 @@ mod dimension_tests {
         let ddl_tables = [
             "sessions",
             "canonical_sessions",
+            "transcript_archives",
             "memories",
             "kv",
             "agents",
